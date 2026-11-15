@@ -3,26 +3,14 @@
 Only implemented behavior and completed checks are recorded here. Client-side manual checks are identified separately.
 这里只记录已实现的行为和已完成的检查；客户端实测另行注明。
 
-## Unreleased — locked-session lifecycle / 锁屏会话生命周期
+## v0.10.6-dev
 
 ### English
 
 - Merge upstream cef6073 (#204), retaining opt-in NV12 capture, bitmap fallback, immutable capture-buffer retention and the fork lock/clipboard/display policies. Add strict CAPTURE_NV12 validation and requested/effective inspection; keep the feature off in existing configs. Upstream performance reports are not local results; merged Windows rendering is not yet manually tested.
 - Run opt-in auto-unlock after credential/ARC validation, before display synchronization and capture; wait at most 8s for the requested SCK display after confirmed unlock. Preserve skip-auth gating, serialized real submissions and the shared two-submission budget; report unsafe/budget failures explicitly.
 - Request a true immediate lock via runtime-resolved login.framework and independently confirm the lock flag within 2s. No screen-saver fallback or password-delay policy changes. Preserve display restoration, disconnect grace, safety delay and bounded reconnect hold.
-- Add regression coverage and a build-only Actions workflow that verifies packaged apps without publishing releases or uploading artifacts. Local installation and live Windows lock/reconnect validation are deferred.
-
-### 简体中文
-
-- 合入上游 cef6073（#204），保留主动开启的 NV12 捕获、位图回退和捕获缓冲区保留，同时保留本 fork 锁屏／剪贴板／显示策略。补齐 CAPTURE_NV12 严格校验和请求／有效状态检查；现有配置保持默认关闭。上游性能数据不是本机实测，合并后 Windows 显示待手动验证。
-- 主动开启的自动解锁改在凭证／ARC 校验后、显示调整与捕获前执行；确认解锁后最多等待 8 秒 SCK 显示器就绪。保留 skip-auth 限制、串行真实提交和共享两次密码预算，明确报告不安全／预算耗尽错误。
-- 运行时解析 login.framework 请求真正立即锁定，并在 2 秒内独立确认锁定标志；不回退屏保、不修改密码延迟策略。保留实体屏恢复、断线宽限、安全等待和有上限的重连保护。
-- 补充回归及只验证打包的 Actions，不发布 Release、不上传归档。本机安装与 Windows 锁屏重连实测留待后续。
-
-## v0.10.6-dev
-
-### English
-
+- Add regression coverage and a build-only Actions workflow that verifies packaged apps without publishing releases or uploading artifacts. Live Windows lock/reconnect validation of this rebuild is pending.
 - Rebuild this development release at the user's request without changing version `0.10.6`. Include upstream [#228](https://github.com/clintcan/macrdp/pull/228): Windows 10 mstsc black-screen compatibility for RemoteFX surface commands and H.264 SPS bitstream restrictions, its vendored encoder tests and CI step. Preserve the fork's clipboard maintenance/leases and use the local CLIPRDR patch in standalone server checks. Win10 client rendering still requires a post-update manual check; upstream's separate frozen-start issue #230 is not included.
 - Add a bundled sandboxed File Provider host/extension for macOS 15+, using system dataless file URLs for flat file copies of any type. Preserve screenshot PNG/DIB handling. Unavailable providers, folders and eager mode download complete files before publication; remove the sparse NSFilePresenter path.
 - Stream file contents to private staging, persist immutable metadata and incremental enumeration anchors, pin every SIZE/RANGE to its original clipboard lock, retain concurrent readers across local copies, and isolate cleanup by connection. Reject unknown locks instead of falling back to current clipboard data; drive timeout maintenance in the serving connection.
@@ -32,6 +20,10 @@ Only implemented behavior and completed checks are recorded here. Client-side ma
 
 ### 简体中文
 
+- 合入上游 cef6073（#204），保留主动开启的 NV12 捕获、位图回退和捕获缓冲区保留，同时保留本 fork 锁屏／剪贴板／显示策略。补齐 CAPTURE_NV12 严格校验和请求／有效状态检查；现有配置保持默认关闭。上游性能数据不是本机实测，合并后 Windows 显示待手动验证。
+- 主动开启的自动解锁改在凭证／ARC 校验后、显示调整与捕获前执行；确认解锁后最多等待 8 秒 SCK 显示器就绪。保留 skip-auth 限制、串行真实提交和共享两次密码预算，明确报告不安全／预算耗尽错误。
+- 运行时解析 login.framework 请求真正立即锁定，并在 2 秒内独立确认锁定标志；不回退屏保、不修改密码延迟策略。保留实体屏恢复、断线宽限、安全等待和有上限的重连保护。
+- 补充回归及只验证打包的 Actions，不发布 Release、不上传归档。此次重构建的 Windows 锁屏重连实测待验证。
 - 按用户要求保留 `0.10.6` 版本号，重新构建本开发版。包含上游 [#228](https://github.com/clintcan/macrdp/pull/228)：修复 Win10 mstsc 在 RemoteFX 指令及 H.264 参数上的黑屏兼容问题，并纳入独立编码器测试和 CI 检查；保留本 fork 的剪贴板维护和租约，独立 server 检查使用本地 CLIPRDR。更新后的 Win10 实际显示仍需客户端验证；上游独立的启动画面冻结问题 #230 尚未包含。
 - 打包 macOS 15+ 沙箱 File Provider host／扩展，普通顶层文件不分类型均可使用系统 dataless URL；保留截图 PNG／DIB 路径。扩展不可用、文件夹和主动关闭按需时先完整下载再发布，移除稀疏 NSFilePresenter 占位路径。
 - 流式写入私有临时文件，持久化不可变元数据与增量枚举锚点；每个 SIZE／RANGE 携带原始锁，保留本机复制前已有的远端读取者，按连接隔离清理。未知锁不再回退到当前剪贴板，服务循环驱动超时维护。
