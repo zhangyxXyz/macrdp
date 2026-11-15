@@ -1,0 +1,39 @@
+name: Cleanup old fork releases
+
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: Preview deletions (Git tags are always retained)
+        type: boolean
+        default: true
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: macrdp-fork-release
+  cancel-in-progress: false
+
+jobs:
+  cleanup:
+    if: github.repository == 'zhangyxXyz/macrdp' && github.ref == 'refs/heads/dev'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          persist-credentials: false
+      - name: Verify retained release before pruning owned history
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          if [ "$DRY_RUN" = true ]; then
+            python3 scripts/fork_release.py cleanup --dry-run
+          else
+            python3 scripts/fork_release.py cleanup
+          fi

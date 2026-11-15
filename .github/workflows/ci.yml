@@ -178,4 +178,4 @@ jobs:
       - run: cargo build --locked
       - run: python3 scripts/check-config-cli.py target/debug/macrdp
       - run: swift run --package-path gui --scratch-path gui/.build ConfigSupportTests
-      - run: python3 -m unittest discover -s scripts/tests -p 'test_cleanup_workflow_runs.py'
+      - run: python3 -m unittest discover -s scripts/tests

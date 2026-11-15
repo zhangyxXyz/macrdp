@@ -10,7 +10,7 @@ it does not create an independent Windows-style login session.
 ## Branches
 
 - `main`: an exact upstream `main` baseline. Synchronize upstream here without fork commits.
-- `dev`: this fork's development, documentation, CI, and build artifacts. Merge upstream changes into this branch after synchronizing `main`.
+- `dev`: this fork's development, documentation, CI, and versioned releases. Merge upstream changes into this branch after synchronizing `main`.
 
 The initial development base is upstream commit
 [`29d01ed`](https://github.com/clintcan/macrdp/commit/29d01ed72946ebde25ca08c924429b5fc37de7c5).
@@ -72,6 +72,21 @@ CLI: `--modifier-layout standard|swap-left-win-alt|swap-win-alt` and the separat
 and conflicting dedicated/extra-flag mappings fail validation. Automated checks
 cover the mapping and state transitions; this new feature has not yet been
 validated with real Windows shortcut/AltGr input.
+
+## Windows screenshot clipboard
+
+PNG/DIB image data takes priority over virtual file descriptors. When a copy
+contains only top-level image files (PNG/JPEG/BMP/TIFF/GIF/WebP), the server
+fully downloads and decodes the batch before publishing complete file URLs and
+PNG pasteboard data. Apps that read URLs directly no longer receive sparse
+placeholders. Short network reads are completed; corrupt, superseded, timed-out
+copies and local clipboard changes prevent publication.
+
+This file-image path allows up to 16 files, 50 MiB total input and total PNG
+output, 16×1024×1024 pixels per image, 8192 pixels per side and 120 seconds per
+batch. Animated image paste is a decoded still; original file bytes are retained.
+Mixed file/folder copies use the existing path. Windows screenshot-copy testing
+of this version is pending. See [changelog](CHANGELOG.md#v0105-dev).
 
 ## Build and run
 
@@ -138,7 +153,7 @@ readiness after accept was about 0.73–0.75 seconds on reconnect; this does not
 measure client-visible first-frame latency. Physical-screen transitions still
 took about 10.5 seconds. A 60 Hz mode / 60 fps target is not a sustained-fps guarantee.
 
-Local checks: 399 Rust tests passed, 7 ignored; 10 Foundation configuration
+Local checks: 412 Rust tests passed, 7 ignored; 10 Foundation configuration
 checks and 25 configuration CLI process checks passed. Hardware behavior,
 permissions, and actual client rendering still require manual validation.
 Client-following and live resizing depend on the client sending the relevant
@@ -148,8 +163,9 @@ This fork makes no additional soak-test or production-readiness claim.
 ## Actions and maintenance
 
 - `ci.yml`: Linux/macOS regression checks, configuration checks, and audit integration on `dev` changes and pull requests; also callable manually.
-- `dev-build.yml`: manual Apple Silicon build with Rust/Swift checks, both app bundles, checksum and source-commit metadata. Artifacts are retained for 14 days; it does not publish a release.
-- `release.yml`: inherited tag-based upstream release pipeline, extended to include the controller. Fork development builds use the workflow above.
+- `release.yml`: only `v*` tag pushes package Apple Silicon apps after Rust/Swift/Python checks. The tagged commit must belong to `dev`. Both apps, source metadata and checksum go directly to a draft Release; round-trip verification precedes publication. There are no intermediate Actions Artifacts. Tags containing `-` are prereleases (for example `v0.10.5-dev`). Re-run a failed tag workflow to resume its owned draft; published releases are never overwritten.
+- Release notes use the reviewed bilingual section for that exact tag in [CHANGELOG.md](CHANGELOG.md), with a direct link to the full record. Add that section before tagging.
+- `cleanup-releases.yml`: manual preview defaults on. The release pipeline also prunes after publishing: verify the newest owned release first, retain it, remove older pipeline-owned releases, keep all Git tags. Unknown releases and drafts are untouched; failed verification or concurrent edits abort cleanup. Inspired by CLIProxyAPI-Plugins. The former manual `dev-build.yml` artifact build has been removed.
 - `security.yml`: dependency checks, including `dev` dependency changes.
 - `delete-old-workflow-runs.yml`: adapted from [CLIProxyAPI-Plugins](https://github.com/zhangyxXyz/CLIProxyAPI-Plugins). Keeps each workflow's six newest runs and all runs younger than 30 days; only completed older runs are eligible. Push runs are previews; manual runs default to preview; the weekly schedule deletes eligible runs.
 

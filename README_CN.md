@@ -64,6 +64,16 @@ CLI 参数为 `--modifier-layout standard|swap-left-win-alt|swap-win-alt`，
 `--map-ctrl-to-cmd` 独立控制编辑兼容。应用配置会重启服务；未知布局以及专用字段与 Extra flags 的重复映射会被校验拒绝。
 自动检查覆盖映射和状态变化，但新增功能尚未用真实 Windows 快捷键和 AltGr 输入完成验证。
 
+## Windows 截图剪贴板
+
+PNG／DIB 图片数据优先于虚拟文件描述符。只包含顶层图片文件（PNG/JPEG/BMP/TIFF/GIF/WebP）
+时，服务端先下载并解码整个批次，再发布完整文件 URL 和 PNG 剪贴板数据，避免直接读取文件的应用
+拿到稀疏占位内容。网络短读会补齐；损坏、过期、超时或本机剪贴板已变化时不发布。
+
+该图片文件路径最多 16 个文件，源数据和 PNG 输出各合计 50 MiB，单图 16×1024×1024 像素、
+单边 8192 像素，整批超时 120 秒。动图的图片粘贴提供解码后的静态画面，文件保留原始字节。
+混合文件／文件夹仍使用原有路径。本版 Windows 截图复制待用户实测，详见[更新记录](CHANGELOG.md#v0105-dev)。
+
 ## 构建与运行
 
 当前构建产物面向 **Apple Silicon Mac**。CI 使用 Rust 1.95 和兼容 Swift 5.9+ 的 macOS SDK；
@@ -121,15 +131,16 @@ BLANK_RECOVERY=0
 这不代表客户端实际首帧显示时间。实体屏切换本身仍约需 10.5 秒。
 60Hz 模式与 60fps 目标也不等于持续帧率保证。
 
-本地检查：399 项 Rust 测试通过、7 项忽略；10 项 Foundation 配置检查与 25 项 CLI 进程检查通过。
+本地检查：412 项 Rust 测试通过、7 项忽略；10 项 Foundation 配置检查与 25 项 CLI 进程检查通过。
 硬件行为、权限和客户端实际显示仍需手动验证。跟随客户端与动态调整依赖客户端发送对应请求，
 固定 4K 的 mstsc 测试不能代表所有客户端和缩放策略。本 fork 不额外宣称长期压力测试或生产成熟度。
 
 ## Actions 与维护
 
 - `ci.yml`：`dev` 变更和 PR 执行 Linux/macOS 回归、配置检查与审计集成检查，也支持手动运行。
-- `dev-build.yml`：手动构建 Apple Silicon 版本，检查 Rust/Swift，输出两个 app、校验和与源提交信息；产物保留 14 天，不发布 Release。
-- `release.yml`：保留上游基于标签的发布流程，补充控制器产物；本 fork 的开发构建使用上一项工作流。
+- `release.yml`：只有推送 `v*` tag 才打包 Apple Silicon 应用，先通过 Rust／Swift／Python 检查，且 tag 提交必须属于 `dev`。两个 app、源提交信息与校验和直接上传草稿 Release，回读验证后发布，不使用中间 Actions Artifacts。包含 `-` 的 tag 为预发布（例如 `v0.10.5-dev`）。失败时重跑原 tag 工作流续传自有草稿；已发布版本拒绝覆盖。
+- Release notes 读取 [CHANGELOG.md](CHANGELOG.md) 中对应 tag 的双语记录，并链接到完整记录；打 tag 前必须先补齐该节。
+- `cleanup-releases.yml`：手动默认只预览。发布成功后也会自动清理：先验证最新自有 Release，保留它，删除更旧的流水线自有 Release，所有 Git tags 保留。未知来源的 Release 和草稿不动；校验失败或发现并发编辑即中止。编排参考 CLIProxyAPI-Plugins，原先手动 `dev-build.yml` 归档构建已移除。
 - `security.yml`：依赖检查，包含 `dev` 上的依赖变更。
 - `delete-old-workflow-runs.yml`：沿用 [CLIProxyAPI-Plugins](https://github.com/zhangyxXyz/CLIProxyAPI-Plugins) 的策略。每个 workflow 保留最新 6 次记录和最近 30 天的全部记录，只清理更旧且已结束的记录。push 只预览，手动默认预览，每周定时清理。
 
