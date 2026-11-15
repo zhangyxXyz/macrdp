@@ -3,30 +3,25 @@
 Only implemented behavior and completed checks are recorded here. Client-side manual checks are identified separately.
 这里只记录已实现的行为和已完成的检查；客户端实测另行注明。
 
-## Unreleased / 未发布
-
-- Merge upstream [#228](https://github.com/clintcan/macrdp/pull/228): Windows 10 mstsc black-screen compatibility for RemoteFX surface commands and H.264 SPS bitstream restrictions. Include its vendored encoder tests and CI step; keep the fork's clipboard maintenance/leases and use the local CLIPRDR patch in standalone server checks.
-- 合入上游 #228：修复 Win10 mstsc 在 RemoteFX 指令及 H.264 参数上的黑屏兼容问题，保留本 fork 的剪贴板维护和租约，并使独立 server 检查使用相同的本地 CLIPRDR。
-- **Not built or tested after this merge, at user request.** No new tag/release/install; the installed release remains `v0.10.6-dev` from `92f4c8c`.
-- **按用户要求，本次合入不构建、不运行测试。** 未新增 tag／发布／安装；本机仍为 `92f4c8c` 对应的 `v0.10.6-dev`。
-
 ## v0.10.6-dev
 
 ### English
 
+- Rebuild this development release at the user's request without changing version `0.10.6`. Include upstream [#228](https://github.com/clintcan/macrdp/pull/228): Windows 10 mstsc black-screen compatibility for RemoteFX surface commands and H.264 SPS bitstream restrictions, its vendored encoder tests and CI step. Preserve the fork's clipboard maintenance/leases and use the local CLIPRDR patch in standalone server checks. Win10 client rendering still requires a post-update manual check; upstream's separate frozen-start issue #230 is not included.
 - Add a bundled sandboxed File Provider host/extension for macOS 15+, using system dataless file URLs for flat file copies of any type. Preserve screenshot PNG/DIB handling. Unavailable providers, folders and eager mode download complete files before publication; remove the sparse NSFilePresenter path.
 - Stream file contents to private staging, persist immutable metadata and incremental enumeration anchors, pin every SIZE/RANGE to its original clipboard lock, retain concurrent readers across local copies, and isolate cleanup by connection. Reject unknown locks instead of falling back to current clipboard data; drive timeout maintenance in the serving connection.
 - Use per-process authenticated loopback IPC and documented domain configuration without App Group entitlements. Local ad-hoc host/extension loading and real dataless reads were verified; Developer ID/notarization remains unverified. Report file clipboard startup readiness, request counters and last helper error through existing stats.
 - Bound transfers to 4,096 items/catalog, 128 GiB per file, 64 provider copies, 10-minute non-current idle retention and two-hour maximum source locks. OS-downloaded files work offline; stale unmaterialized sources fail safely.
-- Verify the Rust regression suite, nine production adapter checks, and six real system checks with synthetic sources, including same-domain/same-name reconnect. Actual Windows screenshot paste and mstsc reconnect remain pending user validation. Release verification now requires both embedded File Provider executables. Notes use a short bilingual template linking to this changelog; old owned releases and their tags are pruned only after retained-release verification.
+- Verify the Rust regression suite, nine production adapter checks, and six real system checks with synthetic sources, including same-domain/same-name reconnect. The user reported successful testing of the previously installed `92f4c8c` build before this Win10 merge; this is not a manual check of the rebuilt binary. Release verification requires both embedded File Provider executables. Notes use a short bilingual template linking to this changelog; old owned releases and their tags are pruned only after retained-release verification.
 
 ### 简体中文
 
+- 按用户要求保留 `0.10.6` 版本号，重新构建本开发版。包含上游 [#228](https://github.com/clintcan/macrdp/pull/228)：修复 Win10 mstsc 在 RemoteFX 指令及 H.264 参数上的黑屏兼容问题，并纳入独立编码器测试和 CI 检查；保留本 fork 的剪贴板维护和租约，独立 server 检查使用本地 CLIPRDR。更新后的 Win10 实际显示仍需客户端验证；上游独立的启动画面冻结问题 #230 尚未包含。
 - 打包 macOS 15+ 沙箱 File Provider host／扩展，普通顶层文件不分类型均可使用系统 dataless URL；保留截图 PNG／DIB 路径。扩展不可用、文件夹和主动关闭按需时先完整下载再发布，移除稀疏 NSFilePresenter 占位路径。
 - 流式写入私有临时文件，持久化不可变元数据与增量枚举锚点；每个 SIZE／RANGE 携带原始锁，保留本机复制前已有的远端读取者，按连接隔离清理。未知锁不再回退到当前剪贴板，服务循环驱动超时维护。
 - 使用每进程鉴权的 loopback IPC 和文档化域配置，不申请 App Group entitlement。已验证本机临时签名 host／扩展加载和真实 dataless 读取；Developer ID／公证分发仍未验证。现有 stats 新增文件剪贴板启动就绪状态、请求计数和最近 helper 错误。
 - 限制单批／元数据目录 4,096 项、单文件 128 GiB、provider 64 副本、非当前副本闲置 10 分钟、源锁最长两小时；已下载系统文件可离线读取，旧未物化源安全报错。
-- 完成 Rust 回归、9 项应用侧适配层检查及 6 项合成源真实系统检查，覆盖同域同名重连。Windows 截图粘贴和 mstsc 重连仍待用户实测。发布校验新增两个内嵌 File Provider 可执行文件的存在检查。说明使用简短双语模板链接到本更新记录；验证保留版本后才清理旧自有 Release 及其 tag。
+- 完成 Rust 回归、9 项应用侧适配层检查及 6 项合成源真实系统检查，覆盖同域同名重连。用户已反馈此前安装的 `92f4c8c` 构建测试正常；这不代表已手动验证此次合入 Win10 修复后的新二进制。发布校验要求两个内嵌 File Provider 可执行文件存在。说明使用简短双语模板链接到本更新记录；验证保留版本后才清理旧自有 Release 及其 tag。
 
 ## v0.10.5-dev
 
