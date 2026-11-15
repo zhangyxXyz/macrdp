@@ -181,3 +181,13 @@ The Mac App Store is not viable for the server it controls (private
 - To auto-launch the controller at login: System Settings → General →
   Login Items → add `macrdpController.app` (the server itself already
   autostarts via its own LaunchAgent).
+
+## Remote modifier positions
+
+Input now separates modifier positions (`MODIFIER_LAYOUT`) from the existing
+Ctrl editing compatibility (`MAP_CTRL_TO_CMD`). Standard, left Win/Alt swap,
+and both-side swap are available when the server advertises `modifier_layout`.
+The left-only swap leaves right Alt unchanged; both-side swap may affect AltGr.
+Option shortcut labels display the physical keys for the selected policy.
+Physical maintenance chords remain Ctrl+Alt+G and Ctrl+Alt+Shift+R. Settings are
+staged until Apply and restart, with server validation and activation checks.

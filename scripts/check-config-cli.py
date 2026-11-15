@@ -50,6 +50,19 @@ with tempfile.TemporaryDirectory(prefix="macrdp-config-smoke-") as temporary:
     assert fixed["effective"]["vd_width"] == 3840
     assert fixed["effective"]["vd_hidpi"] == "1"
 
+    for layout in ["standard", "swap-left-win-alt", "swap-win-alt"]:
+        for compatible in [0, 1]:
+            report = validate(base + f"MODIFIER_LAYOUT={layout}\nMAP_CTRL_TO_CMD={compatible}\n")
+            assert report["effective"]["modifier_layout"] == layout
+            assert report["effective"]["map_ctrl_to_cmd"] is bool(compatible)
+    old = validate(base + "MAP_CTRL_TO_CMD=1\n")
+    assert old["effective"]["modifier_layout"] == "standard"
+    assert old["effective"]["map_ctrl_to_cmd"] is True
+    extra = validate('EXTRA_FLAGS="--modifier-layout swap-left-win-alt"\n')
+    assert extra["effective"]["modifier_layout"] == "swap-left-win-alt"
+    for invalid in ["MODIFIER_LAYOUT=swap\n", 'MODIFIER_LAYOUT=standard\nEXTRA_FLAGS="--modifier-layout standard"\n', 'MAP_CTRL_TO_CMD=0\nEXTRA_FLAGS="--map-ctrl-to-cmd"\n']:
+        validate(invalid, valid=False)
+
     follow = validate("export\t VIRTUAL_DISPLAY='1'\nVD_WIDTH=3840\nVD_HEIGHT=2160\n"
                       'VD_HIDPI="auto"\nRESOLUTION_POLICY=client\nUNKNOWN_FUTURE_KEY=keep\n')
     assert follow["effective"]["vd_hidpi"] == "auto"

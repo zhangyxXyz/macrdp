@@ -689,3 +689,16 @@ that calls `args_from_config(&path)` and prints the fields. One `cargo test` run
 settles it, which is faster than reading logs. `EXTRA_FLAGS` is appended after every
 dedicated key: an on/off flag there silently overrides its key, a duplicated valued flag
 stops startup, and `BITRATE` always wins (see packaging/README.md).
+
+## Remote modifier positions
+
+`--modifier-layout standard|swap-left-win-alt|swap-win-alt` (config
+`MODIFIER_LAYOUT`) swaps physical Windows/Alt positions before recording logical
+modifier state. Default `standard` preserves existing behavior. Left-only mode
+leaves right Alt untouched; swapping both sides can affect AltGr.
+`MAP_CTRL_TO_CMD` / `--map-ctrl-to-cmd` remains a separate editing-compatibility
+switch. With `MODIFIER_LAYOUT=swap-left-win-alt` and `MAP_CTRL_TO_CMD=0`, left
+Alt acts as Command and Ctrl remains Control. Physical maintenance chords
+Ctrl+Alt+G and Ctrl+Alt+Shift+R are unchanged. Apply requires a server restart.
+Client-intercepted shortcuts cannot be remapped by the server. See the mapping
+table and validation limits in [README](../README.md#modifier-positions-and-ctrl-shortcut-compatibility).

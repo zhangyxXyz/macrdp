@@ -226,6 +226,20 @@ final class SettingsModel: ObservableObject {
 
     // MARK: - Virtual-display resolution
 
+    var supportsModifierLayout: Bool { capabilities?.features.contains("modifier_layout") == true && capabilities?.keys.contains("MODIFIER_LAYOUT") == true }
+    var modifierLayout: String {
+        if let explicit = draft["MODIFIER_LAYOUT"] { return explicit }
+        return (try? ExtraFlags(string("EXTRA_FLAGS")))?.value("--modifier-layout") ?? "standard"
+    }
+    var modifierLayoutBinding: Binding<String> {
+        Binding(get: { self.modifierLayout }, set: { self.draft["MODIFIER_LAYOUT"] = $0 })
+    }
+    var hasKeyboardOverrides: Bool {
+        guard let flags = try? ExtraFlags(string("EXTRA_FLAGS")) else { return false }
+        return flags.contains("--modifier-layout") || flags.contains("--map-ctrl-to-cmd")
+    }
+    var optionKeyHint: String { modifierLayout == "standard" ? "Alt" : (modifierLayout == "swap-left-win-alt" ? "left Windows or right Alt" : "Windows") }
+
     var supportsDisplayPolicy: Bool { capabilities?.canConfigureDisplay == true }
     var resolutionPolicy: String {
         if let explicit = draft["RESOLUTION_POLICY"] { return explicit }

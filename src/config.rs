@@ -122,6 +122,16 @@ impl Document {
                 self.errors.push(format!("{key} must be 0 or 1"));
             }
         }
+        if let Some(value) = self.values.get("MODIFIER_LAYOUT") {
+            if !matches!(
+                value.as_str(),
+                "standard" | "swap-left-win-alt" | "swap-win-alt"
+            ) {
+                self.errors.push(
+                    "MODIFIER_LAYOUT must be standard, swap-left-win-alt, or swap-win-alt".into(),
+                );
+            }
+        }
         for key in ["VD_WIDTH", "VD_HEIGHT"] {
             if let Some(value) = self.values.get(key) {
                 if !value
@@ -177,6 +187,8 @@ impl Document {
         // A dedicated display field and an escape-hatch flag must never silently
         // disagree. Even equal duplicates are rejected: clap rejects them too.
         for (key, flag) in [
+            ("MODIFIER_LAYOUT", "--modifier-layout"),
+            ("MAP_CTRL_TO_CMD", "--map-ctrl-to-cmd"),
             ("RESOLUTION_POLICY", "--resolution-policy"),
             ("LIVE_RESIZE", "--live-resize"),
             ("VD_HIDPI", "--virtual-display-hidpi"),
@@ -309,7 +321,7 @@ pub fn capabilities() -> serde_json::Value {
     serde_json::json!({
         "schema_version": SCHEMA_VERSION, "build_commit": BUILD_COMMIT,
         "version": env!("CARGO_PKG_VERSION"),
-        "features": ["config_validation", "config_revision", "resolution_policy", "live_resize", "virtual_display_hidpi", "display_state_v2"],
+        "features": ["config_validation", "config_revision", "resolution_policy", "live_resize", "virtual_display_hidpi", "display_state_v2", "modifier_layout"],
         "supported_config_keys": SUPPORTED_KEYS,
     })
 }
@@ -380,6 +392,7 @@ pub const SUPPORTED_KEYS: &[&str] = &[
     "MAP_CTRL_TO_CMD",
     "MAX_CLIENT_SIZE",
     "MIC_DUMP",
+    "MODIFIER_LAYOUT",
     "NO_REMAP_APPS",
     "PASSWORD_FILE",
     "PRIMARY_MODE",

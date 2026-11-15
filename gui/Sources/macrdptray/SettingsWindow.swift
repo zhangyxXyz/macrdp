@@ -468,8 +468,33 @@ private struct InputTab: View {
                     + "input source is never changed.")
                     .font(.caption).foregroundColor(.secondary)
             }
-            Section("Windows shortcuts") {
-                Toggle("Remap Ctrl → Cmd (copy/paste etc.)", isOn: model.boolBinding("MAP_CTRL_TO_CMD"))
+            Section("Modifier key positions") {
+                Picker("Modifier layout", selection: model.modifierLayoutBinding) {
+                    Text("Standard: Windows → Command, Alt → Option").tag("standard")
+                    Text("Swap left Windows / Alt").tag("swap-left-win-alt")
+                    Text("Swap both Windows / Alt (advanced)").tag("swap-win-alt")
+                }
+                .disabled(!model.supportsModifierLayout)
+                Text(model.modifierLayout == "standard"
+                     ? "Ctrl → Control; Windows → Command; Alt → Option."
+                     : "Left Ctrl → Control; left Windows → Option; left Alt → Command. "
+                       + (model.modifierLayout == "swap-left-win-alt" ? "Right-side keys stay unchanged; this mode does not remap right Alt." : "Right Windows / Alt are also swapped; this can affect AltGr typing."))
+                    .font(.caption).foregroundColor(.secondary)
+                if !model.supportsModifierLayout {
+                    Text("Update the server to a build supporting modifier layouts to change this setting.")
+                        .font(.caption).foregroundColor(.secondary)
+                }
+                Text("Remote maintenance chords keep their physical keys: Ctrl+Alt+G and Ctrl+Alt+Shift+R. Apply restarts the server.")
+                    .font(.caption).foregroundColor(.secondary)
+            }
+            Section("Windows editing compatibility") {
+                if model.hasKeyboardOverrides {
+                    Text("Advanced extra flags also control keyboard mapping. Remove those overrides before applying these dedicated controls; conflicting settings are rejected.")
+                        .font(.caption).foregroundColor(.orange)
+                }
+                Toggle("Use Ctrl+C/V and other Windows editing shortcuts", isOn: model.boolBinding("MAP_CTRL_TO_CMD"))
+                Text("Independent of modifier positions. Converts selected editing shortcuts and Ctrl+click to Command; terminals and excluded apps retain Control.")
+                    .font(.caption).foregroundColor(.secondary)
                 if model.bool("MAP_CTRL_TO_CMD") {
                     ExcludeAppsView(model: model)
                 }
@@ -480,8 +505,12 @@ private struct InputTab: View {
                     .font(.caption).foregroundColor(.secondary)
             }
             Section("App switching") {
-                Toggle("Option+Tab switches apps", isOn: model.boolBinding("ALT_TAB_SWITCH"))
-                Toggle("Option+Q quits apps", isOn: model.boolBinding("ALT_Q_QUIT"))
+                Toggle("Option+Tab switches apps (\(model.optionKeyHint)+Tab)", isOn: model.boolBinding("ALT_TAB_SWITCH"))
+                Toggle("Option+Q quits apps (\(model.optionKeyHint)+Q)", isOn: model.boolBinding("ALT_Q_QUIT"))
+                if model.modifierLayout != "standard" {
+                    Text("Left Alt+Tab already sends Command+Tab. The Option shortcuts above use the Windows key after swapping. Windows may intercept some combinations before RDP receives them.")
+                        .font(.caption).foregroundColor(.secondary)
+                }
                 Toggle("App-switcher HUD overlay", isOn: model.boolBinding("APP_SWITCHER_HUD"))
                 Toggle("Un-minimize on Cmd+Tab", isOn: model.boolBinding("UNMINIMIZE"))
             }

@@ -28,6 +28,42 @@
 Display 设置页提供这些策略，并区分请求配置与实测状态。详见
 [显示配置](docs/display-settings.md)、[控制器说明](gui/README.md)和 [CLI 文档](docs/cli.md)。
 
+## 修饰键位置与 Ctrl 快捷键兼容
+
+两项设置独立存在于 **Input → Modifier key positions（修饰键位置）** 与
+**Windows editing compatibility（Windows 编辑兼容）**。
+未配置 `MODIFIER_LAYOUT` 时使用 `standard`，原有 `MAP_CTRL_TO_CMD` 的含义保持不变。
+
+| Windows 实体按键 | `standard` 标准 | `swap-left-win-alt` 仅交换左侧 | `swap-win-alt` 交换左右两侧 |
+| --- | --- | --- | --- |
+| 左 Ctrl | Control | Control | Control |
+| 左 Windows | Command | Option | Option |
+| 左 Alt | Option | Command | Command |
+| 右 Windows | Command | Command | Option |
+| 右 Alt | Option | Option | Command |
+
+推荐的 Mac 按键位置组合，让靠近空格的左 Alt 承担 Command，并保留 Ctrl：
+
+```dotenv
+MODIFIER_LAYOUT=swap-left-win-alt
+MAP_CTRL_TO_CMD=0
+```
+
+此时左 Alt+C/V 对应 Command+C/V，左 Alt+Tab 对应 Command+Tab；Ctrl+C 仍是 Control+C，
+终端中也一样。若还需要 Windows 编辑习惯，可以独立开启 `MAP_CTRL_TO_CMD=1`，
+使选定的 Ctrl 编辑快捷键和 Ctrl+点击转成 Command 等效操作，继续保留终端和应用排除规则。
+该开关不会将所有 Ctrl 组合转换为 Command。
+
+`swap-win-alt` 会额外交换右侧按键，可能影响 AltGr 输入；仅交换左侧的模式不映射右 Alt。
+位置映射作用于实际收到的 RDP 扫描码，覆盖对应的按下、松开以及键盘/鼠标修饰键状态，
+不会更改 Mac 本机键盘。客户端可能提前拦截某些组合，服务端无法恢复没有收到的事件。
+可选的 Option 快捷键按映射后的 Option 识别（交换后为 Windows 键），界面会显示对应的物理按键提示。
+维护快捷键始终保持物理 **Ctrl+Alt+G** 与 **Ctrl+Alt+Shift+R**。
+
+CLI 参数为 `--modifier-layout standard|swap-left-win-alt|swap-win-alt`，
+`--map-ctrl-to-cmd` 独立控制编辑兼容。应用配置会重启服务；未知布局以及专用字段与 Extra flags 的重复映射会被校验拒绝。
+自动检查覆盖映射和状态变化，但新增功能尚未用真实 Windows 快捷键和 AltGr 输入完成验证。
+
 ## 构建与运行
 
 当前构建产物面向 **Apple Silicon Mac**。CI 使用 Rust 1.95 和兼容 Swift 5.9+ 的 macOS SDK；
@@ -85,7 +121,7 @@ BLANK_RECOVERY=0
 这不代表客户端实际首帧显示时间。实体屏切换本身仍约需 10.5 秒。
 60Hz 模式与 60fps 目标也不等于持续帧率保证。
 
-本地检查：394 项 Rust 测试通过、7 项忽略；10 项 Foundation 配置检查与 14 项 CLI 进程检查通过。
+本地检查：399 项 Rust 测试通过、7 项忽略；10 项 Foundation 配置检查与 25 项 CLI 进程检查通过。
 硬件行为、权限和客户端实际显示仍需手动验证。跟随客户端与动态调整依赖客户端发送对应请求，
 固定 4K 的 mstsc 测试不能代表所有客户端和缩放策略。本 fork 不额外宣称长期压力测试或生产成熟度。
 

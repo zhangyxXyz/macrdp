@@ -718,8 +718,25 @@ pub fn init_focus_observer() {
 #[cfg(not(target_os = "macos"))]
 pub fn init_focus_observer() {}
 
-#[cfg(target_os = "macos")]
+mod modifiers;
+#[cfg(any(target_os = "macos", test))]
 mod scancodes;
+pub use modifiers::ModifierLayout;
+
+// Set once at startup; each input handler snapshots the layout so held keys
+// cannot change meaning between down and up. Configuration applies via restart.
+static MODIFIER_LAYOUT: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+pub fn set_modifier_layout(layout: ModifierLayout) {
+    MODIFIER_LAYOUT.store(layout as u8, std::sync::atomic::Ordering::Relaxed);
+}
+#[cfg(target_os = "macos")]
+fn modifier_layout() -> ModifierLayout {
+    match MODIFIER_LAYOUT.load(std::sync::atomic::Ordering::Relaxed) {
+        1 => ModifierLayout::SwapLeftWinAlt,
+        2 => ModifierLayout::SwapWinAlt,
+        _ => ModifierLayout::Standard,
+    }
+}
 
 // Re-export the gather-windows sweep so the capture path can trigger it
 // automatically after a live virtual-display re-mode (see
@@ -758,8 +775,6 @@ mod macos {
     const VK_5: u16 = 0x17;
     const VK_GRAVE: u16 = 0x32;
     const VK_CAPS_LOCK: u16 = 0x39;
-    const VK_G: u16 = 0x05; // kVK_ANSI_G — the on-demand "gather windows" chord
-    const VK_R: u16 = 0x0F; // kVK_ANSI_R — the on-demand "A/V resync" chord
     const VK_Q: u16 = 0x0C; // kVK_ANSI_Q — Option+Q → Cmd+Q under --alt-q-quit
     const VK_LEFT: u16 = 0x7B; // kVK_LeftArrow — step the app switcher backward while it's up
     const VK_RIGHT: u16 = 0x7C; // kVK_RightArrow — step the app switcher forward while it's up
@@ -988,6 +1003,11 @@ mod macos {
         }
     }
 
+    fn clear_modifier_pair(logical: &mut ModifierState, physical: &mut ModifierState) {
+        logical.clear_non_lock();
+        physical.clear_non_lock();
+    }
+
     pub struct Inner {
         source: CGEventSource,
         // Source for modifier FlagsChanged events. See `Inner::new`.
@@ -998,6 +1018,8 @@ mod macos {
         right_down: bool,
         middle_down: bool,
         mods: ModifierState,
+        physical_mods: ModifierState,
+        modifier_layout: super::ModifierLayout,
         // `None` → use CGDisplay::main() bounds; `Some(id)` → look up
         // that specific display. Re-queried (through a short TTL cache —
         // see `target_bounds`) so a mid-session bounds change (e.g.
@@ -1122,6 +1144,8 @@ mod macos {
                 right_down: false,
                 middle_down: false,
                 mods: ModifierState::default(),
+                physical_mods: ModifierState::default(),
+                modifier_layout: super::modifier_layout(),
                 target_display_id,
                 cached_bounds: None,
                 bounds_cached_at: Instant::now(),
@@ -1290,7 +1314,7 @@ mod macos {
 
             // Snapshot first so the log shows WHAT was stuck.
             let stuck = self.mods.cg_flags().bits();
-            self.mods.clear_non_lock();
+            clear_modifier_pair(&mut self.mods, &mut self.physical_mods);
 
             if plan.clear_gesture_state {
                 // Drop the remaining per-gesture state regardless of whether a
@@ -1363,6 +1387,12 @@ mod macos {
                 tracing::debug!(scancode, extended, down, "unmapped scancode");
                 return;
             };
+            // Keep physical state for fixed remote maintenance chords. Logical
+            // state drives every emitted keyboard/mouse event and app shortcut.
+            if ModifierState::is_modifier_vk(vk) {
+                self.physical_mods.apply(vk, down);
+                vk = self.modifier_layout.map(vk);
+            }
             self.refresh_auto_layout();
             // Every Apple layout except the US-style ones is drawn for ISO key order.
             if let (Some(iso_vk), Some(layout)) = (to_iso_key_order(vk), self.layout.as_mut()) {
@@ -1661,7 +1691,7 @@ mod macos {
         /// set of symbolic hotkeys we re-implement. Returns true if we
         /// handled it (and the caller should suppress the keystroke).
         fn try_symbolic_hotkey(&self, vk: u16) -> bool {
-            let f = self.mods.cg_flags();
+            let f = self.physical_mods.cg_flags();
             let cmd = f.contains(CGEventFlags::CGEventFlagCommand);
             let shift = f.contains(CGEventFlags::CGEventFlagShift);
             let ctrl = f.contains(CGEventFlags::CGEventFlagControl);
@@ -1674,7 +1704,8 @@ mod macos {
             // Win-key-free so mstsc forwards it, and it's not a system shortcut on
             // either OS. Only acts when there's a virtual display to gather onto;
             // runs off-thread so input never stalls.
-            if ctrl && opt && !cmd && vk == VK_G {
+            let maintenance = super::modifiers::maintenance_chord(vk, ctrl, opt, cmd, shift);
+            if maintenance == Some(super::modifiers::MaintenanceChord::Gather) {
                 if let Some(id) = self.target_display_id {
                     std::thread::spawn(move || {
                         let moved = gather_windows_onto_display(id);
@@ -1705,7 +1736,7 @@ mod macos {
             // this is Ctrl+Alt+Shift+R — Win-key-free so mstsc forwards it, and
             // not a system shortcut on either OS. Cheap atomic stores, so no
             // off-thread hop needed; the consumers act on their next poll.
-            if ctrl && opt && shift && !cmd && vk == VK_R {
+            if maintenance == Some(super::modifiers::MaintenanceChord::Resync) {
                 crate::RESYNC_VIDEO.store(true, std::sync::atomic::Ordering::Relaxed);
                 crate::RESYNC_AUDIO.store(true, std::sync::atomic::Ordering::Relaxed);
                 tracing::info!(
@@ -1713,6 +1744,12 @@ mod macos {
                 );
                 return true;
             }
+
+            // The remaining shortcuts use mapped Mac modifier semantics.
+            let cmd = self.mods.has_cmd();
+            let shift = self.mods.has_shift();
+            let ctrl = self.mods.has_ctrl();
+            let opt = self.mods.has_alt();
 
             // Opt+Tab / Opt+Shift+Tab as an alternative app-cycle trigger
             // (opt-in via --alt-tab-switch). Only plain Option (no Cmd/Ctrl) so
@@ -4654,6 +4691,91 @@ mod macos {
     #[cfg(test)]
     mod modifier_state_tests {
         use super::*;
+
+        #[test]
+        fn mapped_sides_release_independently_and_reset_clears_both_states() {
+            for layout in [
+                super::super::ModifierLayout::Standard,
+                super::super::ModifierLayout::SwapLeftWinAlt,
+                super::super::ModifierLayout::SwapWinAlt,
+            ] {
+                let mut logical = ModifierState::default();
+                let mut physical = ModifierState::default();
+                for raw in [VK_LALT, VK_RCMD, VK_LCTRL, VK_CAPS_LOCK] {
+                    physical.apply(raw, true);
+                    logical.apply(layout.map(raw), true);
+                }
+                assert!(logical.has_cmd());
+                physical.apply(VK_LALT, false);
+                logical.apply(layout.map(VK_LALT), false);
+                assert_eq!(
+                    logical.has_cmd(),
+                    layout != super::super::ModifierLayout::SwapWinAlt
+                );
+                // A reconnect/idle resync clears raw maintenance state as well
+                // as mapped event flags; Caps Lock remains a lock toggle.
+                clear_modifier_pair(&mut logical, &mut physical);
+                assert!(!logical.any_held() && !physical.any_held());
+                assert!(logical.caps_lock && physical.caps_lock);
+                assert_eq!(logical.cg_flags(), CGEventFlags::CGEventFlagAlphaShift);
+                // Late key-up after reset cannot assert a modifier again.
+                logical.apply(layout.map(VK_RCMD), false);
+                assert!(!logical.any_held());
+            }
+        }
+
+        #[test]
+        fn mouse_and_ctrl_compatibility_use_the_mapped_state_independently() {
+            for layout in [
+                super::super::ModifierLayout::Standard,
+                super::super::ModifierLayout::SwapLeftWinAlt,
+                super::super::ModifierLayout::SwapWinAlt,
+            ] {
+                for compatibility in [false, true] {
+                    let mut m = ModifierState::default();
+                    m.apply(layout.map(VK_LCTRL), true);
+                    assert_eq!(
+                        super::super::should_remap_click(
+                            compatibility,
+                            m.has_ctrl(),
+                            m.has_cmd(),
+                            m.has_alt(),
+                            false
+                        ),
+                        compatibility
+                    );
+                    assert!(
+                        !super::super::should_remap_click(
+                            compatibility,
+                            m.has_ctrl(),
+                            m.has_cmd(),
+                            m.has_alt(),
+                            true
+                        ),
+                        "terminal/excluded app"
+                    );
+                    m.apply(layout.map(VK_LALT), true);
+                    // With Alt/Win held, the Ctrl shortcut compatibility must
+                    // never perform a second transformation on this chord.
+                    assert!(!super::super::should_remap_click(
+                        compatibility,
+                        m.has_ctrl(),
+                        m.has_cmd(),
+                        m.has_alt(),
+                        false
+                    ));
+                    let flags = m.cg_flags();
+                    assert_eq!(
+                        flags.contains(CGEventFlags::CGEventFlagCommand),
+                        layout != super::super::ModifierLayout::Standard
+                    );
+                    assert_eq!(
+                        flags.contains(CGEventFlags::CGEventFlagAlternate),
+                        layout == super::super::ModifierLayout::Standard
+                    );
+                }
+            }
+        }
 
         /// The stale-modifier resync must drop every HELD modifier but leave
         /// Caps Lock alone — it's a toggle reconciled by `synchronize()`, and

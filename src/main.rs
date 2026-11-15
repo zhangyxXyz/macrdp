@@ -820,11 +820,15 @@ struct Args {
     #[arg(long = "app-switcher-hud")]
     app_switcher_hud: bool,
 
+    /// Modifier key positions, independent of Ctrl editing-shortcut compatibility.
+    #[arg(long, value_enum, default_value = "standard")]
+    modifier_layout: input::ModifierLayout,
+
     /// Remap a curated set of Windows editing shortcuts from Ctrl to Cmd so
     /// Windows muscle memory drives macOS: Ctrl+C/V/X/A/Z/S/F/N/T/W/O/P/R/G (and
     /// Shift variants, e.g. Ctrl+Shift+Z → Cmd+Shift+Z redo) fire as the Cmd
     /// equivalent. Off by default (then Ctrl reaches remote apps unchanged, so
-    /// macOS shortcuts need Cmd, i.e. the client's Windows/Super key). Cmd+Q is
+    /// macOS shortcuts need Cmd, from the key selected by --modifier-layout). Cmd+Q is
     /// deliberately NOT produced (Q is excluded); nav keys are untouched. Always
     /// suppressed when a terminal is frontmost so Ctrl+C stays SIGINT. macOS-only.
     #[arg(long = "map-ctrl-to-cmd")]
@@ -2709,6 +2713,8 @@ fn effective_config(args: &Args, document: &config::Document) -> serde_json::Val
     serde_json::json!({
         "resolution_policy": if client_resolution_enabled(args) { "client" } else { "fixed" },
         "live_resize": args.live_resize.unwrap_or(true),
+        "modifier_layout": args.modifier_layout.as_str(),
+        "map_ctrl_to_cmd": args.map_ctrl_to_cmd,
         "virtual_display": args.virtual_display,
         "vd_width": args.width, "vd_height": args.height,
         "vd_hidpi": match args.virtual_display_hidpi { None => "0", Some(VdHidpiArg::On) => "1", Some(VdHidpiArg::Auto) => "auto" },
@@ -2870,6 +2876,9 @@ fn args_from_config_values(path: &Path, document: &config::Document) -> Result<A
     }
     if on("STATS_ENDPOINT", false) {
         argv.push("--stats-endpoint".into());
+    }
+    if let Some(layout) = cfg.get("MODIFIER_LAYOUT") {
+        argv.extend(["--modifier-layout".into(), layout.clone()]);
     }
     if on("MAP_CTRL_TO_CMD", false) {
         argv.push("--map-ctrl-to-cmd".into());
@@ -3607,6 +3616,12 @@ async fn async_main(mut args: Args, document: Option<config::Document>) -> Resul
     crate::input::set_alt_space_spotlight(args.alt_space_spotlight);
     crate::input::set_alt_q_quit(args.alt_q_quit);
     crate::input::set_app_switcher_hud(args.app_switcher_hud);
+    crate::input::set_modifier_layout(args.modifier_layout);
+    info!(
+        modifier_layout = args.modifier_layout.as_str(),
+        map_ctrl_to_cmd = args.map_ctrl_to_cmd,
+        "remote keyboard policies configured"
+    );
     crate::input::set_map_ctrl_to_cmd(args.map_ctrl_to_cmd);
     crate::input::set_no_remap_apps(args.no_remap_apps.clone());
     crate::input::set_reverse_scroll(args.reverse_scroll);

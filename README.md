@@ -31,6 +31,48 @@ The Display panel exposes these policies and separates requested settings from
 measured state. See [display settings](docs/display-settings.md),
 [controller guide](gui/README.md), and [CLI reference](docs/cli.md).
 
+## Modifier positions and Ctrl shortcut compatibility
+
+These are independent settings in **Input → Modifier key positions** and
+**Windows editing compatibility**. Missing `MODIFIER_LAYOUT` means `standard`;
+existing `MAP_CTRL_TO_CMD` settings keep their meaning.
+
+| Physical Windows key | `standard` | `swap-left-win-alt` | `swap-win-alt` |
+| --- | --- | --- | --- |
+| Left Ctrl | Control | Control | Control |
+| Left Windows | Command | Option | Option |
+| Left Alt | Option | Command | Command |
+| Right Windows | Command | Command | Option |
+| Right Alt | Option | Option | Command |
+
+To put Command next to the space bar while preserving Ctrl:
+
+```dotenv
+MODIFIER_LAYOUT=swap-left-win-alt
+MAP_CTRL_TO_CMD=0
+```
+
+Left Alt+C/V then sends Command+C/V, and left Alt+Tab sends Command+Tab.
+Ctrl+C stays Control+C, including in terminals. Independently enable
+`MAP_CTRL_TO_CMD=1` to keep selected Windows editing shortcuts and Ctrl+click
+as Command equivalents, with the existing terminal/application exclusions.
+This compatibility mode does not turn every Ctrl combination into Command.
+
+`swap-win-alt` also swaps the right keys and may interfere with AltGr text input;
+the left-only mode leaves right Alt unchanged. Mapping applies to received RDP
+scancodes, including matching releases and keyboard/mouse modifier flags.
+It does not remap the local Mac keyboard. Clients may intercept combinations
+before sending them; server mapping cannot recover events it never receives.
+Option-based optional app shortcuts follow the mapped Option key (Windows after
+swapping); the UI shows the physical key hints. Maintenance shortcuts keep
+physical **Ctrl+Alt+G** and **Ctrl+Alt+Shift+R** in every mode.
+
+CLI: `--modifier-layout standard|swap-left-win-alt|swap-win-alt` and the separate
+`--map-ctrl-to-cmd`. Applying changes restarts the server. Unknown layout values
+and conflicting dedicated/extra-flag mappings fail validation. Automated checks
+cover the mapping and state transitions; this new feature has not yet been
+validated with real Windows shortcut/AltGr input.
+
 ## Build and run
 
 The current artifact target is **Apple Silicon macOS**. Rust 1.95 and a Swift 5.9+
@@ -96,8 +138,8 @@ readiness after accept was about 0.73–0.75 seconds on reconnect; this does not
 measure client-visible first-frame latency. Physical-screen transitions still
 took about 10.5 seconds. A 60 Hz mode / 60 fps target is not a sustained-fps guarantee.
 
-Local checks: 394 Rust tests passed, 7 ignored; 10 Foundation configuration
-checks and 14 configuration CLI process checks passed. Hardware behavior,
+Local checks: 399 Rust tests passed, 7 ignored; 10 Foundation configuration
+checks and 25 configuration CLI process checks passed. Hardware behavior,
 permissions, and actual client rendering still require manual validation.
 Client-following and live resizing depend on the client sending the relevant
 requests; fixed 4K mstsc checks do not validate every client or scale policy.
