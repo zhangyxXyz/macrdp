@@ -46,6 +46,7 @@ mod rdpdr;
 mod reaper;
 #[cfg(target_os = "macos")]
 mod runloop_thread;
+mod session_lock;
 mod shield;
 mod stats;
 mod switcher_hud;
@@ -415,23 +416,17 @@ struct Args {
     restore_windows_on_disconnect: bool,
 
     /// Lock the local macOS session when the last RDP client genuinely
-    /// disconnects (opt-in; only meaningful with --detach-primary/
-    /// --capture-primary/--shield-primary). Fires via `open
-    /// ScreenSaverEngine.app` after the existing disconnect-confirmation
-    /// grace PLUS an additional tunable safety buffer
-    /// (MACRDP_LOCK_ON_DISCONNECT_DELAY_MS / config
-    /// LOCK_ON_DISCONNECT_DELAY_MS, default ~25s total) to reduce — not
-    /// eliminate — the chance of locking mid a blank-recovery self-heal
-    /// reconnect. Only an actual password-required lock if the account has
-    /// "require password" set to Immediately; otherwise this just starts
-    /// the screensaver. Heuristic, not a guarantee; see
-    /// docs/known-quirks.md. Never fires on server shutdown/kill, only on a
-    /// genuine watcher-observed last-client-disconnect. macOS-only.
+    /// disconnects (opt-in; needs --detach-primary/--capture-primary/--shield-primary).
+    /// Uses an immediate lock request plus system-state confirmation, without
+    /// changing the screen-saver password delay or falling back to a screen saver.
+    /// Existing display restoration, disconnect grace and safety buffer remain
+    /// (MACRDP_LOCK_ON_DISCONNECT_DELAY_MS, default 22500ms extra); a reconnect
+    /// may hold the timer briefly. Does not fire on server shutdown. macOS-only.
     #[arg(long)]
     lock_on_disconnect: bool,
 
     /// EXPERIMENTAL, opt-in. Type the account password into the lock screen
-    /// when an RDP client connects while the local session is locked — any
+    /// after RDP credential/ARC validation, before capture, when locked — any
     /// lock, any cause (a --lock-on-disconnect lock, one set manually, or
     /// macOS's own idle policy), not just one this project set. Off unless
     /// passed (config AUTO_UNLOCK=1); a no-op when the screen isn't locked,
@@ -1495,82 +1490,18 @@ fn lock_on_disconnect_delay_ms() -> u64 {
     )
 }
 
-/// Lock the local macOS session by launching `ScreenSaverEngine.app`
-/// (no special TCC/entitlement needed beyond what `open` itself needs).
-/// **Note the older `CGSession -suspend` menu-extra trick documented widely
-/// online does NOT work here** — as of macOS 26 the `Menu Extras/User.menu`
-/// bundle that historically shipped `CGSession` no longer exists (confirmed
-/// live: only `AirPort.menu`/`VPN.menu`/etc. remain under `Menu Extras/`).
-/// `open -a ScreenSaverEngine` engages the screensaver, which macOS then
-/// treats as an actual password-required lock **only if the account has
-/// "require password" set to Immediately** (`sysadminctl -screenLock
-/// status`) — macrdp does not check or change that setting (changing
-/// security settings is out of scope), so this is a best-effort action: on
-/// an account configured with a delayed password requirement, this merely
-/// starts the screensaver rather than truly locking. Returns whether the
-/// launch command itself succeeded (best-effort — we can't independently
-/// confirm the screen actually locked, only that `open` didn't fail).
-#[cfg(target_os = "macos")]
+/// Request and independently confirm an immediate password-required lock.
 fn lock_session() -> bool {
-    const SCREEN_SAVER_ENGINE: &str = "/System/Library/CoreServices/ScreenSaverEngine.app";
-    if !std::path::Path::new(SCREEN_SAVER_ENGINE).exists() {
-        tracing::warn!(
-            path = SCREEN_SAVER_ENGINE,
-            "lock-on-disconnect: ScreenSaverEngine not found — cannot lock the screen"
-        );
-        return false;
-    }
-    match std::process::Command::new("/usr/bin/open")
-        .arg(SCREEN_SAVER_ENGINE)
-        .status()
-    {
-        Ok(status) if status.success() => true,
-        Ok(status) => {
-            tracing::warn!(
-                ?status,
-                "lock-on-disconnect: open ScreenSaverEngine.app exited non-zero"
-            );
-            false
+    match session_lock::lock_now() {
+        Ok(()) => {
+            info!("lock-on-disconnect: local session lock confirmed");
+            true
         }
-        Err(e) => {
-            tracing::warn!("lock-on-disconnect: failed to launch ScreenSaverEngine.app: {e}");
+        Err(error) => {
+            warn!(%error, "lock-on-disconnect: lock not confirmed");
             false
         }
     }
-}
-#[cfg(not(target_os = "macos"))]
-fn lock_session() -> bool {
-    false
-}
-
-/// Best-effort check of whether this account's "require password after
-/// sleep or screen saver begins" delay is set to Immediately —
-/// `--lock-on-disconnect`'s `open ScreenSaverEngine.app` is only a true,
-/// password-required lock under that setting; otherwise it just starts the
-/// screen saver, so the flag's name would silently overpromise. Returns
-/// `None` when the check itself couldn't be run (parse the output loosely
-/// rather than fail the whole startup over a diagnostic). macrdp
-/// deliberately does not check or change this setting on its own — see
-/// docs/known-quirks.md.
-#[cfg(target_os = "macos")]
-fn screen_lock_delay_is_immediate() -> Option<bool> {
-    let output = std::process::Command::new("/usr/sbin/sysadminctl")
-        .args(["-screenLock", "status"])
-        .output()
-        .ok()?;
-    // sysadminctl logs its answer to stderr via NSLog, e.g. "screenLock
-    // delay is immediate" or "screenLock delay is N seconds" — match
-    // loosely rather than parse a brittle exact format.
-    let text = String::from_utf8_lossy(&output.stdout).to_ascii_lowercase()
-        + &String::from_utf8_lossy(&output.stderr).to_ascii_lowercase();
-    if !output.status.success() || text.trim().is_empty() {
-        return None;
-    }
-    Some(text.contains("immediate"))
-}
-#[cfg(not(target_os = "macos"))]
-fn screen_lock_delay_is_immediate() -> Option<bool> {
-    None
 }
 
 /// Bumped on every disconnect edge that arms a `--lock-on-disconnect` lock, so
@@ -1701,6 +1632,9 @@ fn alert_auto_unlock_gave_up() {}
 ///    make the field accept a submit.
 #[cfg(target_os = "macos")]
 fn attempt_auto_unlock(password: &str) -> AutoUnlockOutcome {
+    // Serialize real password submissions, including future alternate callers.
+    static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _serial = SERIAL.lock().unwrap_or_else(|error| error.into_inner());
     use core_graphics::event::{CGEvent, CGEventFlags, CGEventTapLocation, CGEventType};
     use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
 
@@ -2013,11 +1947,6 @@ fn spawn_primary_overlay_watcher<T: Send + 'static>(
     // REACTIVATION_GRACE poll above), holding it while a reconnect is still
     // handshaking (see lock_activity). None = feature off.
     lock_on_disconnect: Option<Arc<lock_activity::ConnectionActivity>>,
-    // (--auto-unlock) When true, try to unlock the local session on
-    // reconnect using the exact same validated credential used for RDP
-    // auth. A no-op if the screen isn't locked.
-    password: Arc<Zeroizing<String>>,
-    auto_unlock: bool,
 ) {
     tokio::spawn(async move {
         use std::sync::atomic::Ordering;
@@ -2147,60 +2076,6 @@ fn spawn_primary_overlay_watcher<T: Send + 'static>(
                                             "restore-windows: gathered windows onto the \
                                              virtual display on connect"
                                         );
-                                    }
-                                });
-                            }
-                            // Auto-unlock: if the screen happens to be locked
-                            // (for any reason — a lock-on-disconnect lock, one
-                            // set manually, or macOS's own idle policy), try to
-                            // unlock it now that a client is connected. No-op
-                            // instantly if it isn't locked. Off-thread so the
-                            // watcher loop isn't blocked by the settle delays
-                            // inside attempt_auto_unlock.
-                            if auto_unlock {
-                                let password = Arc::clone(&password);
-                                let current_tracker = tracker.clone();
-                                let current_transitions = transitions.clone();
-                                std::thread::spawn(move || {
-                                    if current_transitions.is_stopping()
-                                        || current_tracker.count.load(Ordering::SeqCst) == 0
-                                    {
-                                        return;
-                                    }
-                                    use std::sync::atomic::Ordering as AtomicOrdering;
-                                    match attempt_auto_unlock(password.as_str()) {
-                                        AutoUnlockOutcome::NotLocked
-                                        | AutoUnlockOutcome::SkippedUnsafe => {}
-                                        AutoUnlockOutcome::Unlocked => {
-                                            info!(label, "auto-unlock: succeeded");
-                                        }
-                                        AutoUnlockOutcome::BudgetExhausted => {
-                                            // Fire the loud alert exactly once per lock
-                                            // cycle — a client that keeps reconnecting
-                                            // while still locked and out of budget would
-                                            // otherwise re-trigger it on every attempt.
-                                            if !AUTO_UNLOCK_GAVE_UP
-                                                .swap(true, AtomicOrdering::SeqCst)
-                                            {
-                                                error!(
-                                                    label,
-                                                    max = AUTO_UNLOCK_MAX_SUBMISSIONS,
-                                                    "auto-unlock: exhausted its submission \
-                                                     budget for this lock without \
-                                                     unlocking the screen — giving up \
-                                                     until it's unlocked another way (or \
-                                                     macrdp restarts), to avoid tripping \
-                                                     macOS's password-retry lockout"
-                                                );
-                                                alert_auto_unlock_gave_up();
-                                            } else {
-                                                warn!(
-                                                    label,
-                                                    "auto-unlock: still locked and out of \
-                                                     submission budget for this lock"
-                                                );
-                                            }
-                                        }
                                     }
                                 });
                             }
@@ -2521,7 +2396,10 @@ fn spawn_primary_overlay_watcher<T: Send + 'static>(
                                     AUTO_UNLOCK_SUBMISSIONS.store(0, AtomicOrdering::SeqCst);
                                     AUTO_UNLOCK_GAVE_UP.store(false, AtomicOrdering::SeqCst);
                                 }
-                                info!(label, "lock-on-disconnect: locking the local session");
+                                info!(
+                                    label,
+                                    "lock-on-disconnect: requesting immediate session lock"
+                                );
                                 if !lock_session() {
                                     warn!(
                                         label,
@@ -3130,31 +3008,8 @@ async fn async_main(mut args: Args, document: Option<config::Document>) -> Resul
         warn!(
             "--restore-windows-on-disconnect / --lock-on-disconnect / \
              --auto-unlock have no effect without --detach-primary, \
-             --capture-primary or --shield-primary (they need the headless \
-             session watcher); ignoring"
+             --capture-primary or --shield-primary (unsupported display mode); ignoring"
         );
-    }
-    if args.lock_on_disconnect {
-        match screen_lock_delay_is_immediate() {
-            Some(false) => warn!(
-                "--lock-on-disconnect is set, but this account's \"require \
-                 password after sleep or screen saver begins\" delay is not \
-                 Immediately — `open ScreenSaverEngine.app` will start the \
-                 screen saver without actually requiring a password to get \
-                 back in, so the Mac won't really be locked. Set it with \
-                 System Settings, or `sudo sysadminctl -screenLock \
-                 immediate -password <password>`; macrdp does not change \
-                 this setting itself."
-            ),
-            Some(true) => {}
-            None => warn!(
-                "--lock-on-disconnect is set, but macrdp couldn't confirm \
-                 this account's screen-lock delay is Immediately (the \
-                 `sysadminctl -screenLock status` check failed) — if it \
-                 isn't, the Mac won't really be locked. See \
-                 docs/known-quirks.md."
-            ),
-        }
     }
 
     // Shared slots so the signal handler and the session-transition
@@ -3389,7 +3244,11 @@ async fn async_main(mut args: Args, document: Option<config::Document>) -> Resul
     // additionally skipped entirely under --skip-auth, since in that mode
     // `password` was never validated by PAM and isn't trustworthy to
     // auto-type (see attempt_auto_unlock's docs).
-    let auto_unlock = args.auto_unlock && !args.skip_auth;
+    let auto_unlock = session_lock::auto_unlock_enabled(
+        args.auto_unlock,
+        args.skip_auth,
+        args.detach_primary || args.capture_primary || args.shield_primary,
+    );
     if args.auto_unlock && args.skip_auth {
         warn!("--auto-unlock has no effect under --skip-auth; ignoring");
     }
@@ -3410,8 +3269,6 @@ async fn async_main(mut args: Args, document: Option<config::Document>) -> Resul
             args.restore_windows_on_disconnect,
             physical_main_id,
             lock_activity.clone(),
-            Arc::clone(&password),
-            auto_unlock,
         );
     } else if args.capture_primary {
         let vd_id = virtual_display
@@ -3430,8 +3287,6 @@ async fn async_main(mut args: Args, document: Option<config::Document>) -> Resul
             args.restore_windows_on_disconnect,
             physical_main_id,
             lock_activity.clone(),
-            Arc::clone(&password),
-            auto_unlock,
         );
     } else if args.shield_primary {
         let vd_id = virtual_display
@@ -3450,8 +3305,6 @@ async fn async_main(mut args: Args, document: Option<config::Document>) -> Resul
             args.restore_windows_on_disconnect,
             physical_main_id,
             lock_activity.clone(),
-            Arc::clone(&password),
-            auto_unlock,
         );
     } else if args.make_primary {
         let vd_id = virtual_display
@@ -3737,7 +3590,25 @@ async fn async_main(mut args: Args, document: Option<config::Document>) -> Resul
     let display_suppressed = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
     let display_lifecycle = Arc::new(capture::DisplayLifecycle::new());
+    let preparation = auto_unlock.then(|| {
+        let password = Arc::clone(&password);
+        session_lock::CapturePreparation::new(move || {
+            match attempt_auto_unlock(password.as_str()) {
+                AutoUnlockOutcome::NotLocked => Ok(false),
+                AutoUnlockOutcome::Unlocked => { info!("auto-unlock: succeeded before capture"); Ok(true) }
+                AutoUnlockOutcome::SkippedUnsafe => anyhow::bail!("auto-unlock: unsafe or unknown lock state; capture was not started"),
+                AutoUnlockOutcome::BudgetExhausted => {
+                    if !AUTO_UNLOCK_GAVE_UP.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                        error!("auto-unlock: submission budget exhausted before capture; unlock locally to reset");
+                        alert_auto_unlock_gave_up();
+                    }
+                    anyhow::bail!("auto-unlock: submission budget exhausted; capture was not started")
+                }
+            }
+        })
+    });
     let display = CaptureDisplay {
+        preparation,
         desktop_size: desktop_size.clone(),
         auto_size,
         live_resize: args.live_resize.unwrap_or(true),

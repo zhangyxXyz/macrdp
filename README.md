@@ -81,6 +81,31 @@ and conflicting dedicated/extra-flag mappings fail validation. Automated checks
 cover the mapping and state transitions; this new feature has not yet been
 validated with real Windows shortcut/AltGr input.
 
+## Locked connections and disconnect locking
+
+With a headless display mode and `AUTO_UNLOCK=1`, the fork prepares the desktop
+**after RDP credential/ARC validation and before ScreenCaptureKit capture**.
+This removes the circular dependency where a locked/display-asleep Mac reported
+`SCK sees: []` and disconnected before the session watcher could unlock it.
+After a confirmed unlock, capture waits at most 8 seconds for its requested
+display. Unsafe/unknown lock state and exhausted password-submission budget stop
+capture with a diagnostic; the two-submission limit remains shared and serialized.
+`AUTO_UNLOCK` remains opt-in and is disabled with `--skip-auth`.
+
+`LOCK_ON_DISCONNECT=1` now requests an immediate password-required session lock
+via runtime-resolved private login.framework and confirms the system lock flag
+for up to 2 seconds. It does not depend on the screen-saver password delay,
+change security preferences, or silently fall back to a screen saver. Missing API,
+request errors and unconfirmed lock state are reported as failures. The existing
+physical-display restoration, disconnect grace, safety delay and bounded
+reconnect hold remain; **disconnect locking is delayed, not instantaneous**.
+Auto-unlock affects the physical desktop, and these private macOS APIs may change.
+
+Regression tests cover preparation ordering/failure, serialization, display
+selection, lock confirmation and existing reconnect/budget policy. **The rebuilt
+version has not yet been installed or tested with Windows on a locked Mac.**
+Build verification does not grant TCC permissions or change the running app.
+
 ## Windows clipboard images and files
 
 PNG/DIB screenshot data takes priority over virtual file descriptors. The image

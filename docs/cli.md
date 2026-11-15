@@ -207,21 +207,14 @@ MACRDP_MODS_RESYNC_IDLE_MS=10000  # env-only: after this many ms with no input,
 --lock-on-disconnect      # EXPERIMENTAL. Lock the local macOS session when the last
                           #   RDP client genuinely disconnects (opt-in; needs
                           #   --detach-primary/--capture-primary/--shield-primary).
-                          #   Fires via `open ScreenSaverEngine.app` after the
-                          #   existing disconnect-confirmation grace PLUS an extra
-                          #   tunable safety buffer (default ~25s total) to reduce
-                          #   the chance of locking mid a blank-recovery self-heal
-                          #   reconnect, which can legitimately take up to ~12-15s.
-                          #   NOTE: the older `CGSession -suspend` menu-extra trick
-                          #   no longer exists as of macOS 26 — ScreenSaverEngine is
-                          #   the current mechanism, and it's only an actual
-                          #   password-required lock if the account has "require
-                          #   password" set to Immediately (`sysadminctl
-                          #   -screenLock status`) — macrdp doesn't check or change
-                          #   that setting, but warns at startup if it isn't. This is
-                          #   a heuristic timer, not a guarantee — see the
-                          #   lock-on-disconnect note in known-quirks.md. Never fires
-                          #   on server shutdown/kill, only on a genuine
+                          #   Uses runtime-resolved SACLockScreenImmediate and
+                          #   confirms the system lock flag (up to 2s). No screen-
+                          #   saver fallback; missing API/request/confirmation is
+                          #   logged as failure. Does not change the account's
+                          #   password-delay policy. Retains the disconnect grace,
+                          #   physical-display restoration and safety buffer (~25s
+                          #   plus restoration time), with bounded reconnect hold.
+                          #   Never fires on server shutdown/kill, only a genuine
                           #   last-client-disconnect. Config: LOCK_ON_DISCONNECT.
                           #   A client still reconnecting when the timer ends
                           #   holds the lock until it connects (capped at 30 s,
@@ -240,7 +233,9 @@ MACRDP_MODS_RESYNC_IDLE_MS=10000  # env-only: after this many ms with no input,
                           #   typing the same password already validated by PAM at
                           #   startup and proven by this connection's own RDP auth.
                           #   Needs one of the three headless modes above (same
-                          #   watcher). Off by default: the effect lands on the
+                          #   policy). Runs after credential/ARC validation, BEFORE
+                          #   capture enumeration; after an unlock, waits at most
+                          #   8s for the requested SCK display. Off by default: the effect lands on the
                           #   PHYSICAL machine — once it fires, anyone standing at
                           #   that Mac has a live desktop, and it undoes a lock it
                           #   did not set (someone may have locked it deliberately).

@@ -386,6 +386,8 @@ impl RdpServerDisplayUpdates for CountedUpdates {
 }
 
 pub struct CaptureDisplay {
+    /// Opt-in preparation, reached only after RDP authentication/ARC validation.
+    pub preparation: Option<crate::session_lock::CapturePreparation>,
     /// Session desktop size — shared with the input handler and the H.264
     /// pipeline so all three stay in sync when `auto_size` adopts the
     /// client's requested resolution.
@@ -863,6 +865,18 @@ impl RdpServerDisplay for CaptureDisplay {
     }
 
     async fn updates(&mut self) -> ServerResult<Box<dyn RdpServerDisplayUpdates>> {
+        if let Some(preparation) = &self.preparation {
+            let unlocked = preparation.run().await.map_err(|error| {
+                ServerError::reason("prepare authenticated capture", format!("{error:#}"))
+            })?;
+            if unlocked {
+                crate::session_lock::wait_for_display(self.display_id)
+                    .await
+                    .map_err(|error| {
+                        ServerError::reason("display readiness after unlock", format!("{error:#}"))
+                    })?;
+            }
+        }
         // `sync_virtual_display` is a sync block (no awaits) so the display
         // mutex guard never lives across an await point (Send bound on the
         // returned future).

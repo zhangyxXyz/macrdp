@@ -14,6 +14,9 @@ src/auth_guard.rs Connection-level auth hardening (Tier 1.2): per-source-IP
                   (reuses ironrdp-server's existing ConnectionHandler seam).
                   Lockout is heuristic (errored/short ⇒ failure, clean long
                   session resets) so a benign disconnect never locks anyone out.
+src/session_lock.rs  Opt-in pre-capture blocking preparation, bounded post-unlock
+                  SCK readiness, runtime login.framework immediate locking and
+                  independent lock-state confirmation. No screen-saver fallback.
 src/capture.rs    ScreenCaptureKit → BgrA32 BitmapUpdate, dirty-rect driven
 src/cursor.rs     NSCursor → RGBAPointer, hashed for change detection
 src/input.rs      RDP scancodes/mouse PDUs → CGEvent synthesis (US ANSI by

@@ -3,6 +3,20 @@
 Only implemented behavior and completed checks are recorded here. Client-side manual checks are identified separately.
 这里只记录已实现的行为和已完成的检查；客户端实测另行注明。
 
+## Unreleased — locked-session lifecycle / 锁屏会话生命周期
+
+### English
+
+- Run opt-in auto-unlock after credential/ARC validation, before display synchronization and capture; wait at most 8s for the requested SCK display after confirmed unlock. Preserve skip-auth gating, serialized real submissions and the shared two-submission budget; report unsafe/budget failures explicitly.
+- Request a true immediate lock via runtime-resolved login.framework and independently confirm the lock flag within 2s. No screen-saver fallback or password-delay policy changes. Preserve display restoration, disconnect grace, safety delay and bounded reconnect hold.
+- Add regression coverage and a build-only Actions workflow that verifies packaged apps without publishing releases or uploading artifacts. Local installation and live Windows lock/reconnect validation are deferred.
+
+### 简体中文
+
+- 主动开启的自动解锁改在凭证／ARC 校验后、显示调整与捕获前执行；确认解锁后最多等待 8 秒 SCK 显示器就绪。保留 skip-auth 限制、串行真实提交和共享两次密码预算，明确报告不安全／预算耗尽错误。
+- 运行时解析 login.framework 请求真正立即锁定，并在 2 秒内独立确认锁定标志；不回退屏保、不修改密码延迟策略。保留实体屏恢复、断线宽限、安全等待和有上限的重连保护。
+- 补充回归及只验证打包的 Actions，不发布 Release、不上传归档。本机安装与 Windows 锁屏重连实测留待后续。
+
 ## v0.10.6-dev
 
 ### English

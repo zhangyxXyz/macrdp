@@ -442,10 +442,11 @@ private struct DisplayTab: View {
                         .font(.caption).foregroundColor(.orange)
                         .lineLimit(nil).fixedSize(horizontal: false, vertical: true)
                 }
-                Text("Locking starts the screen saver about 25 s after you leave; it's only a real lock "
-                    + "if “Require password after screen saver begins” is set to Immediately "
-                    + "(Lock Screen settings). Automatic unlock types your account password into the "
-                    + "lock screen — while it's unlocked, anyone at the Mac has your desktop.")
+                Text("Locking waits for physical-display restoration and the disconnect safety delay "
+                    + "(about 25 s plus restoration time), then requests a password-required lock. "
+                    + "The screen-saver password delay is unchanged; failures are recorded in the log. "
+                    + "Automatic unlock runs after authentication, before capture, and types your account "
+                    + "password — while unlocked, anyone at the Mac has your desktop.")
                     .font(.caption).foregroundColor(.secondary)
                         .lineLimit(nil).fixedSize(horizontal: false, vertical: true)
             }
