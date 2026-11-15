@@ -73,20 +73,46 @@ and conflicting dedicated/extra-flag mappings fail validation. Automated checks
 cover the mapping and state transitions; this new feature has not yet been
 validated with real Windows shortcut/AltGr input.
 
-## Windows screenshot clipboard
+## Windows clipboard images and files
 
-PNG/DIB image data takes priority over virtual file descriptors. When a copy
-contains only top-level image files (PNG/JPEG/BMP/TIFF/GIF/WebP), the server
-fully downloads and decodes the batch before publishing complete file URLs and
-PNG pasteboard data. Apps that read URLs directly no longer receive sparse
-placeholders. Short network reads are completed; corrupt, superseded, timed-out
-copies and local clipboard changes prevent publication.
+PNG/DIB screenshot data takes priority over virtual file descriptors. The image
+codecs validate complete payloads and retain the existing PNG/DIB fallbacks.
 
-This file-image path allows up to 16 files, 50 MiB total input and total PNG
-output, 16×1024×1024 pixels per image, 8192 pixels per side and 120 seconds per
-batch. Animated image paste is a decoded still; original file bytes are retained.
-Mixed file/folder copies use the existing path. Windows screenshot-copy testing
-of this version is pending. See [changelog](CHANGELOG.md#v0105-dev).
+Bundled macOS 15+ builds now include a sandboxed **macrdp Files** helper and
+File Provider extension. Enable it in **System Settings → General → Login Items
+& Extensions → File Providers**, then restart macrdp. Flat file copies of any
+type can publish genuine system dataless URLs: directly reading/copying the file
+triggers its download. Each copy has its own immutable session/copy/lock identity
+and directory, so same-name reconnects cannot silently substitute new content.
+No App Group or Developer ID certificate is required for the tested local path;
+ad-hoc signing is still not notarized distribution validation.
+
+The source broker listens only on loopback, uses a per-process random token
+passed in domain configuration, and requests serial 128 KiB ranges with the
+original lock. The extension streams into private files and returns a URL only
+when complete. Incremental metadata anchors survive extension restarts. New
+copies lose the previous copy's right to publish without cancelling its existing
+readers. Unsupported/unavailable provider paths, older macOS, `--no-lazy-paste`,
+and folders use a **complete-file** fallback; sparse presenter placeholders are
+no longer published. File-only image fallback also provides decoded PNG data
+within its existing image safety limits.
+
+Bounds: 4,096 items per batch/catalog, 128 GiB per file; the provider broker keeps
+at most 64 copies, retires non-current copies after 10 minutes idle, and source
+locks expire after at most two hours. Recopy an expired source. File transfers
+require negotiated clipboard locking. These bounds may also reject overly large
+or ambiguous copies; a failed transfer never publishes a zero-filled substitute.
+Downloaded OS files remain readable offline; unmaterialized disconnected files
+fail rather than reading a new session's bytes. The domain is removed at server
+shutdown; definitely dead owners are reaped at the next startup.
+
+Automated checks include the Rust suite, nine adapter/IPC checks (including a
+>16 MiB streamed file), and six real File Provider checks with synthetic bytes:
+zero-range dataless metadata, direct hydration, offline reads, disconnected reads,
+same-domain/same-name reconnect, and stale URL rejection. Real Windows screenshot
+copy and mstsc reconnect of this release are **pending user testing**. See
+[implementation and checks](native/file-provider/README.md) and
+[changelog](CHANGELOG.md#v0106-dev).
 
 ## Build and run
 
@@ -163,9 +189,9 @@ This fork makes no additional soak-test or production-readiness claim.
 ## Actions and maintenance
 
 - `ci.yml`: Linux/macOS regression checks, configuration checks, and audit integration on `dev` changes and pull requests; also callable manually.
-- `release.yml`: only `v*` tag pushes package Apple Silicon apps after Rust/Swift/Python checks. The tagged commit must belong to `dev`. Both apps, source metadata and checksum go directly to a draft Release; round-trip verification precedes publication. There are no intermediate Actions Artifacts. Tags containing `-` are prereleases (for example `v0.10.5-dev`). Re-run a failed tag workflow to resume its owned draft; published releases are never overwritten.
-- Release notes use the reviewed bilingual section for that exact tag in [CHANGELOG.md](CHANGELOG.md), with a direct link to the full record. Add that section before tagging.
-- `cleanup-releases.yml`: manual preview defaults on. The release pipeline also prunes after publishing: verify the newest owned release first, retain it, remove older pipeline-owned releases, keep all Git tags. Unknown releases and drafts are untouched; failed verification or concurrent edits abort cleanup. Inspired by CLIProxyAPI-Plugins. The former manual `dev-build.yml` artifact build has been removed.
+- `release.yml`: only `v*` tag pushes package Apple Silicon apps after Rust/Swift/Python checks. The tagged commit must belong to `dev`. Both apps, source metadata and checksum go directly to a draft Release; round-trip verification precedes publication. There are no intermediate Actions Artifacts. Tags containing `-` are prereleases (for example `v0.10.6-dev`). Re-run a failed tag workflow to resume its owned draft; published releases are never overwritten.
+- Release notes use the [short bilingual template](packaging/RELEASE_NOTES.md) and link to that version in [CHANGELOG.md](CHANGELOG.md). Add the changelog section before tagging; the full section is not duplicated in release notes.
+- `cleanup-releases.yml`: manual preview defaults on. The release pipeline also prunes after publishing: verify the newest owned release first, retain it, remove older pipeline-owned releases and their matching tags. Unknown releases and drafts are untouched; failed verification or concurrent edits abort cleanup. Inspired by CLIProxyAPI-Plugins. The former manual `dev-build.yml` artifact build has been removed.
 - `security.yml`: dependency checks, including `dev` dependency changes.
 - `delete-old-workflow-runs.yml`: adapted from [CLIProxyAPI-Plugins](https://github.com/zhangyxXyz/CLIProxyAPI-Plugins). Keeps each workflow's six newest runs and all runs younger than 30 days; only completed older runs are eligible. Push runs are previews; manual runs default to preview; the weekly schedule deletes eligible runs.
 

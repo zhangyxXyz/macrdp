@@ -434,8 +434,6 @@ pub struct MacCliprdr {
     /// `on_file_contents_response` dispatches incoming bytes through this;
     /// each in-flight download task holds the matching receiver. See
     /// `src/file_promise.rs`.
-    #[cfg(target_os = "macos")]
-    download_router: crate::file_promise::DownloadRouter,
     /// Most recently-allocated temp directory holding downloaded remote
     /// files. The download task swaps it on each new remote copy and
     /// removes the previous tree to keep /tmp tidy.
@@ -489,6 +487,7 @@ pub struct MacCliprdr {
 #[cfg(target_os = "macos")]
 impl MacCliprdr {
     pub fn new(lazy_paste: bool, rich_clipboard: bool) -> Self {
+        crate::file_provider::start_if_bundled();
         let paste_temp_dir = Arc::new(Mutex::new(None));
         let self_change_count = Arc::new(std::sync::atomic::AtomicI64::new(-1));
         // Publish to the process-global so the signal-exit watcher in
@@ -501,7 +500,6 @@ impl MacCliprdr {
         Self {
             sender: Arc::new(Mutex::new(None)),
             file_paths: Arc::new(Mutex::new(Vec::new())),
-            download_router: crate::file_promise::DownloadRouter::default(),
             paste_temp_dir,
             self_change_count,
             remote_write_cc: Arc::new(std::sync::atomic::AtomicI64::new(-1)),
@@ -727,7 +725,7 @@ impl CliprdrBackendFactory for MacCliprdr {
             active_backends: self.active_backends.clone(),
             file_paths: self.file_paths.clone(),
             #[cfg(target_os = "macos")]
-            download_router: self.download_router.clone(),
+            download_router: crate::file_promise::DownloadRouter::default(),
             #[cfg(target_os = "macos")]
             paste_temp_dir: self.paste_temp_dir.clone(),
             #[cfg(target_os = "macos")]
@@ -740,6 +738,11 @@ impl CliprdrBackendFactory for MacCliprdr {
             image_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             #[cfg(target_os = "macos")]
             image_ticket: None,
+            #[cfg(target_os = "macos")]
+            file_session: crate::file_provider::random_id(),
+            #[cfg(target_os = "macos")]
+            session_alive: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            current_remote_lock: None,
             advertise_state: self.advertise_state.clone(),
             #[cfg(target_os = "macos")]
             lazy_paste: self.lazy_paste,
@@ -834,6 +837,11 @@ struct MacCliprdrBackend {
     // client list arrives (MS-RDPECLIP 1.3.2.1), so a live copy can't be
     // mistaken for it.
     initial_remote_copy_pending: bool,
+    #[cfg(target_os = "macos")]
+    file_session: String,
+    #[cfg(target_os = "macos")]
+    session_alive: Arc<std::sync::atomic::AtomicBool>,
+    current_remote_lock: Option<u32>,
 }
 
 /// Drop runs when the RDP connection ends and ironrdp_server releases
@@ -864,6 +872,10 @@ impl Drop for MacCliprdrBackend {
         // Still pending means `on_ready` never fired: no client list was handled.
         #[cfg(target_os = "macos")]
         if !self.initial_advertise_pending {
+            self.session_alive
+                .store(false, std::sync::atomic::Ordering::Release);
+            self.download_router.cancel_all();
+            crate::file_provider::disconnect(&self.file_session);
             self.invalidate_image_copy();
             crate::file_promise_lazy::cleanup_on_disconnect(
                 &self.paste_temp_dir,
@@ -1211,6 +1223,8 @@ impl CliprdrBackend for MacCliprdrBackend {
     }
 
     fn on_ready(&mut self) {
+        #[cfg(target_os = "macos")]
+        crate::file_provider::activate(&self.file_session);
         if self.initial_advertise_pending {
             self.initial_advertise_pending = false;
             debug!(
@@ -1286,6 +1300,9 @@ impl CliprdrBackend for MacCliprdrBackend {
     }
 
     fn on_remote_copy(&mut self, available_formats: &[ClipboardFormat]) {
+        self.current_remote_lock = None;
+        #[cfg(target_os = "macos")]
+        crate::file_provider::transition(&self.file_session);
         debug!(
             format_count = available_formats.len(),
             formats = ?available_formats
@@ -1379,7 +1396,15 @@ impl CliprdrBackend for MacCliprdrBackend {
         }
     }
 
+    fn retain_remote_file_lists(&self) -> bool {
+        cfg!(target_os = "macos")
+    }
     fn on_remote_file_list(&mut self, files: &[FileDescriptor], clip_data_id: Option<u32>) {
+        #[cfg(target_os = "macos")]
+        let router = clip_data_id.map(|id| {
+            self.download_router
+                .for_copy(id, self.session_alive.clone(), self.sender.clone())
+        });
         // The file-list request is answered here, not via on_format_data_response.
         if self.discard_stale_reply() {
             return;
@@ -1408,49 +1433,24 @@ impl CliprdrBackend for MacCliprdrBackend {
                     }
                 })
                 .collect();
-            if !entries.is_empty()
-                && entries.iter().all(|e| {
-                    !e.is_dir
-                        && e.relative_path.as_ref().is_none_or(|p| p.is_empty())
-                        && crate::clipboard_image::is_image_name(&e.name)
-                })
-            {
-                if let Some(ticket) = self.image_ticket.clone() {
-                    crate::file_promise::spawn_remote_images(
-                        entries,
-                        self.download_router.clone(),
-                        self.sender.clone(),
-                        self.paste_temp_dir.clone(),
-                        self.self_change_count.clone(),
-                        ticket,
-                    );
-                }
+            self.current_remote_lock = clip_data_id;
+            let Some(router) = router else {
+                warn!("remote file copy requires clipboard locking; no file URL published");
                 return;
-            }
-            let rt = tokio::runtime::Handle::current();
-            // Try lazy first if enabled; it returns false for folder
-            // copies (Phase 1 scope) and we fall through to eager.
-            let mut handled = false;
-            if self.lazy_paste {
-                debug!("attempting lazy paste path");
-                handled = crate::file_promise_lazy::spawn_lazy_paste(
-                    entries.clone(),
-                    self.download_router.clone(),
-                    self.sender.clone(),
-                    self.paste_temp_dir.clone(),
-                    self.self_change_count.clone(),
-                    rt.clone(),
-                );
-            }
-            if !handled {
-                debug!("dispatching eager paste path");
+            };
+            if let Some(ticket) = self.image_ticket.clone() {
                 crate::file_promise::spawn_remote_paste(
                     entries,
-                    self.download_router.clone(),
+                    router,
                     self.sender.clone(),
                     self.paste_temp_dir.clone(),
                     self.self_change_count.clone(),
-                    rt,
+                    tokio::runtime::Handle::current(),
+                    crate::file_promise::FilePasteOptions {
+                        ticket,
+                        session: self.file_session.clone(),
+                        prefer_provider: self.lazy_paste,
+                    },
                 );
             }
         }
@@ -1643,9 +1643,19 @@ impl CliprdrBackend for MacCliprdrBackend {
     /// own; presenters tied to URLs that just left the pasteboard are
     /// effectively zombies that get reaped on the next supersede.
     #[cfg(target_os = "macos")]
-    fn on_outgoing_locks_expired(&mut self, _clip_data_ids: &[LockDataId]) {
-        self.invalidate_image_copy();
-        crate::file_promise_lazy::clear_pasteboard_if_stale(&self.self_change_count);
+    fn on_outgoing_locks_expired(&mut self, clip_data_ids: &[LockDataId]) {
+        if self
+            .current_remote_lock
+            .is_some_and(|id| clip_data_ids.iter().any(|lock| lock.0 == id))
+        {
+            self.current_remote_lock = None;
+            self.invalidate_image_copy();
+            crate::file_promise_lazy::clear_pasteboard_if_stale(&self.self_change_count);
+        }
+    }
+    #[cfg(target_os = "macos")]
+    fn on_outgoing_locks_cleared(&mut self, clip_data_ids: &[LockDataId]) {
+        self.on_outgoing_locks_expired(clip_data_ids);
     }
 }
 
@@ -2325,6 +2335,11 @@ mod tests {
             session_end_cc: Arc::new(std::sync::atomic::AtomicI64::new(-1)),
             image_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             image_ticket: None,
+            #[cfg(target_os = "macos")]
+            file_session: crate::file_provider::random_id(),
+            #[cfg(target_os = "macos")]
+            session_alive: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            current_remote_lock: None,
             advertise_state: Arc::new(AdvertiseState::default()),
             lazy_paste: true,
             initial_advertise_pending: true,
@@ -3216,5 +3231,30 @@ mod tests {
         backend.on_format_data_response(FormatDataResponse::new_data(&png));
         assert!(rx.try_recv().is_err());
         assert_eq!(pb::read_image_bytes().unwrap().1, png);
+    }
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn an_old_expired_lock_does_not_invalidate_a_newer_copy() {
+        let (mut backend, _rx) = test_backend();
+        backend.current_remote_lock = Some(42);
+        let before = backend
+            .image_epoch
+            .load(std::sync::atomic::Ordering::Acquire);
+        backend.on_outgoing_locks_expired(&[LockDataId(41)]);
+        assert_eq!(backend.current_remote_lock, Some(42));
+        assert_eq!(
+            backend
+                .image_epoch
+                .load(std::sync::atomic::Ordering::Acquire),
+            before
+        );
+        backend.on_outgoing_locks_cleared(&[LockDataId(42)]);
+        assert_eq!(backend.current_remote_lock, None);
+        assert_eq!(
+            backend
+                .image_epoch
+                .load(std::sync::atomic::Ordering::Acquire),
+            before + 1
+        );
     }
 }

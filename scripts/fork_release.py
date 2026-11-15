@@ -42,6 +42,8 @@ def verify_files(archive, sums, expected_sha, expected_name):
             raise ValueError('release source commit mismatch')
         required = ['macrdp.app/Contents/MacOS/macrdp',
                     'macrdpController.app/Contents/MacOS/macrdptray',
+                    'macrdp.app/Contents/Helpers/macrdpFiles.app/Contents/MacOS/macrdpFiles',
+                    'macrdp.app/Contents/Helpers/macrdpFiles.app/Contents/PlugIns/macrdpFiles.appex/Contents/MacOS/macrdpFilesProvider',
                     'CAPABILITIES.json', 'README.md', 'README_CN.md']
         if any(name not in bundle.namelist() for name in required):
             raise ValueError('release bundle incomplete')
@@ -75,14 +77,9 @@ def notes(tag, sha, repo):
     heading = '## ' + tag + '\n'
     if heading not in changelog:
         raise ValueError('tag must have a reviewed CHANGELOG section')
-    section = changelog.split(heading, 1)[1].split('\n## ', 1)[0].strip()
     link = f'https://github.com/{repo}/blob/{tag}/CHANGELOG.md#{tag.replace(".", "")}'
-    return (f'{MARKER}sha={sha} -->\n\n{section}\n\n'
-            f'[Full changelog / 完整更新记录]({link})\n\n'
-            f'Source / 源提交: `{sha}`. Apple Silicon macOS; ad-hoc signed, not notarized.\n'
-            'Apple Silicon macOS；临时签名，未公证。Install both apps together / 请同时更新两个 app。\n'
-            'Back up your configuration; renewed macOS privacy grants may be needed.\n'
-            '请备份配置；替换后可能需要重新授予 macOS 隐私权限。\n')
+    template = Path('packaging/RELEASE_NOTES.md').read_text()
+    return f'{MARKER}sha={sha} -->\n\n' + template.format(tag=tag, changelog_url=link, source_sha=sha)
 
 
 def stage(repo, tag, sha, directory):
@@ -126,9 +123,9 @@ def cleanup(repo, dry_run):
         for fresh, original in [(fresh_current, current), (fresh_old, old)]:
             if any(fresh.get(k) != original.get(k) for k in ('body', 'draft', 'tag_name', 'assets', 'published_at')):
                 raise ValueError('release changed during cleanup; refusing deletion')
-        print(('Would delete ' if dry_run else 'Deleting ') + old['tag_name'] + ' (Git tag retained)')
+        print(('Would delete ' if dry_run else 'Deleting ') + old['tag_name'] + ' (including its tag)')
         if not dry_run:
-            gh('api', '--method', 'DELETE', f"repos/{repo}/releases/{old['id']}")
+            gh('release', 'delete', old['tag_name'], '--repo', repo, '--cleanup-tag', '--yes')
 
 
 def main():

@@ -76,7 +76,12 @@ impl SessionStats {
             .unwrap_or_else(|p| p.into_inner())
             .clone();
         let metadata = metadata().lock().unwrap_or_else(|p| p.into_inner()).clone();
+        #[cfg(target_os = "macos")]
+        let file_clipboard = crate::file_provider::status();
+        #[cfg(not(target_os = "macos"))]
+        let file_clipboard = serde_json::Value::Null;
         serde_json::json!({
+            "file_clipboard": file_clipboard,
             "schema_version": 2,
             "build_commit": metadata.build_commit,
             "config_revision": metadata.config_revision,

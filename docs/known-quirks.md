@@ -1,5 +1,8 @@
 # Known behavioural quirks
 
+**Fork clipboard update (2026-11-16):** This dev branch replaces sparse presenter URLs with system File Provider URLs or complete-file fallback. PNG/DIB screenshot representations take priority; metadata uses persistent incremental anchors. Historical clipboard investigation notes below describe earlier implementations. See [current implementation and verification limits](../native/file-provider/README.md).
+
+
 **2026-11-15 correction — automatic QoE blank recovery now defaults OFF.**
 A user-confirmed visible, interactive mstsc session was repeatedly disconnected
 by the historical zero-`timeDiffEDR` heuristic. This field is a millisecond timing,

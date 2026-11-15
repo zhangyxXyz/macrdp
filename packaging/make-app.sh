@@ -183,6 +183,11 @@ else
     echo "==> WARNING: macrdpshield not found; --shield-primary will REFUSE to start (unset SKIP_BUILD?)" >&2
 fi
 
+# Embed the independent macOS 15+ File Provider host/extension. The server on
+# older macOS keeps its complete-file fallback; no App Group is required.
+python3 "$PKG_DIR/make-file-provider.py" --destination "$STAGE/Contents/Helpers" \
+    --identity "$IDENTITY" --prefix "$BUNDLE_PREFIX"
+
 # 3. Sign the Mach-O executable, then the bundle (which seals Info.plist + the
 #    Resources, including the app icon + the embedded IFD bundle).
 # Embed the provisioning profile (if any) BEFORE the bundle sign so it's sealed in.

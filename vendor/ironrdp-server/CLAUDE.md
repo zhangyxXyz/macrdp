@@ -63,6 +63,7 @@ clashing names were renamed for this (11): `RdpdrDriveServerFactory`,
 | (31) | A zero-payload fast-path update (`HiddenPointer`, `DefaultPointer`) goes out as one empty frame instead of nothing, **harvested early** from upstream #2274 (merged 2026-10-29, after this pin) | `encoder/fast_path.rs` `UpdateFragmenter::encode_next` | — |
 | (32) | The serving path's pre-finalize phase (X.224, TLS, CredSSP) is bounded by `SERVE_NEGOTIATION_TIMEOUT` (60 s), so an unauthenticated peer that goes silent can't hold the serving connection. **Upstream as #2432 (`e482e340`); drops at the next pin bump** | `run_connection_inner`, around `negotiate_and_authenticate` | — |
 | (33) | The client's desktop and device scale factors on `ConnectionInfo`, **harvested early** from upstream #2107 (merged 2026-10-30, after this pin) | `ConnectionInfo` fields + `new()`, the `on_connection_info` call in `client_accepted`; pairs with acceptor divergence (6) | `ConnectionInfo::{desktop,device}_scale_factor` |
+| (34) | Drive CLIPRDR timeout maintenance every five seconds on the serving connection and retain/release explicit remote-file consumers | `client_loop`, `dispatch_events`, `ServerEvent::ClipboardLease` | `ClipboardLease { id, retain }` |
 
 Notes on the port:
 - **(26)** Ported from main (#222) on 2026-10-27. Upstream's per-PDU lock-wait

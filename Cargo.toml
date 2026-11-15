@@ -1,6 +1,6 @@
 [package]
 name = "macrdp"
-version = "0.10.5"
+version = "0.10.6"
 edition = "2021"
 description = "Native RDP server for macOS"
 license = "MIT OR Apache-2.0"
@@ -12,7 +12,7 @@ path = "src/main.rs"
 
 [dependencies]
 # Async runtime
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "signal", "sync", "time"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "signal", "sync", "time", "process"] }
 
 # Logging / errors / config
 tracing = "0.1"
@@ -21,6 +21,7 @@ anyhow = "1"
 thiserror = "1"
 clap = { version = "4", features = ["derive"] }
 serde_json = "1"
+base64 = "0.22"
 sha2 = "0.10"
 async-trait = "0.1"
 bytes = "1"
@@ -70,6 +71,7 @@ nfsserve = "0.11.0"
 # src/conn_test.rs). Both are redirected to the pinned git rev by the
 # [patch.crates-io] section below, same as the runtime ironrdp-* deps.
 [dev-dependencies]
+ironrdp-cliprdr = { version = "0.7", features = ["__test"] }
 # Paused test clock (`#[tokio::test(start_paused = true)]`) for timing tests
 # that must not depend on how fast the CI runner is.
 tokio = { version = "1", features = ["test-util"] }
@@ -142,7 +144,7 @@ ironrdp-error            = { git = "https://github.com/Devolutions/IronRDP.git",
 ironrdp                  = { git = "https://github.com/Devolutions/IronRDP.git", rev = "e258f6a06b1fecfc3829a56928043bced1c8ba66" }
 ironrdp-ainput           = { git = "https://github.com/Devolutions/IronRDP.git", rev = "e258f6a06b1fecfc3829a56928043bced1c8ba66" }
 ironrdp-async            = { git = "https://github.com/Devolutions/IronRDP.git", rev = "e258f6a06b1fecfc3829a56928043bced1c8ba66" }
-ironrdp-cliprdr          = { git = "https://github.com/Devolutions/IronRDP.git", rev = "e258f6a06b1fecfc3829a56928043bced1c8ba66" }
+ironrdp-cliprdr          = { path = "vendor/ironrdp-cliprdr" }
 ironrdp-connector        = { git = "https://github.com/Devolutions/IronRDP.git", rev = "e258f6a06b1fecfc3829a56928043bced1c8ba66" }
 ironrdp-core             = { git = "https://github.com/Devolutions/IronRDP.git", rev = "e258f6a06b1fecfc3829a56928043bced1c8ba66" }
 ironrdp-displaycontrol   = { git = "https://github.com/Devolutions/IronRDP.git", rev = "e258f6a06b1fecfc3829a56928043bced1c8ba66" }
@@ -174,6 +176,7 @@ ironrdp-usb              = { git = "https://github.com/Devolutions/IronRDP.git",
 # incompatible versions (trait mismatch). Patch the git source too so every
 # consumer resolves to the single vendored copy.
 [patch."https://github.com/Devolutions/IronRDP.git"]
+ironrdp-cliprdr = { path = "vendor/ironrdp-cliprdr" }
 ironrdp-dvc = { path = "vendor/ironrdp-dvc" }
 
 [profile.release]

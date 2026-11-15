@@ -1718,13 +1718,13 @@ dependencies = [
 [[package]]
 name = "ironrdp-cliprdr"
 version = "0.7.0"
-source = "git+https://github.com/Devolutions/IronRDP.git?rev=e258f6a06b1fecfc3829a56928043bced1c8ba66#e258f6a06b1fecfc3829a56928043bced1c8ba66"
 dependencies = [
  "bitflags 2.11.1",
  "ironrdp-core",
  "ironrdp-pdu",
  "ironrdp-svc",
  "tracing",
+ "visibility",
 ]
 
 [[package]]
@@ -2174,10 +2174,11 @@ checksum = "5e5032e24019045c762d3c0f28f5b6b8bbf38563a65908389bf7978758920897"
 
 [[package]]
 name = "macrdp"
-version = "0.10.5"
+version = "0.10.6"
 dependencies = [
  "anyhow",
  "async-trait",
+ "base64",
  "block2",
  "bytes",
  "cc",
@@ -4187,6 +4188,17 @@ name = "version_check"
 version = "0.9.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
+
+[[package]]
+name = "visibility"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d674d135b4a8c1d7e813e2f8d1c9a58308aee4a680323066025e53132218bd91"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.117",
+]
 
 [[package]]
 name = "want"

@@ -1,5 +1,8 @@
 # Features / status — what works today
 
+**Fork update (2026-11-16):** Windows clipboard files now use a bundled macOS 15+ File Provider for flat-file dataless reads, with a complete-file fallback for folders/unsupported providers. Historical sparse-presenter descriptions below do not describe this dev branch. See [current behavior](../native/file-provider/README.md).
+
+
 Functional v0. RDP clients (mstsc, Microsoft Remote Desktop, FreeRDP) can:
 - Connect over TLS to the Mac on port 3390 with a local Mac username/password.
 - See the primary display at native resolution with incremental damage-region updates.

@@ -20,7 +20,7 @@ env:
 jobs:
   build:
     name: Verify, build, publish and retain current release
-    if: github.repository == 'zhangyxXyz/macrdp'
+    if: github.repository == 'zhangyxXyz/macrdp' && github.event.deleted == false
     runs-on: macos-15
     timeout-minutes: 60
     permissions:
@@ -45,6 +45,7 @@ jobs:
           python3 scripts/check-config-cli.py target/release/macrdp
           swift run --package-path gui --scratch-path gui/.build ConfigSupportTests
           python3 -m unittest discover -s scripts/tests
+          python3 scripts/check-file-provider.py --build-root "$RUNNER_TEMP/file-provider-checks"
       - name: Build and verify both apps
         env:
           CODESIGN_IDENTITY: '-'
@@ -73,7 +74,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ github.ref_name }}
         run: python3 scripts/fork_release.py stage
-      - name: Retain current verified fork release (keep Git tags)
+      - name: Retain current verified fork release and its tag
         env:
           GH_TOKEN: ${{ github.token }}
         run: python3 scripts/fork_release.py cleanup

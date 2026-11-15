@@ -111,7 +111,9 @@ jobs:
       - name: Test (macOS — full code paths)
         env:
           RUSTFLAGS: '-D warnings'
-        run: cargo test --locked --target aarch64-apple-darwin
+        run: |
+          cargo test --locked --target aarch64-apple-darwin
+          python3 scripts/check-file-provider.py --build-root "$RUNNER_TEMP/file-provider-checks"
 
   # End-to-end integration test for the security AUDIT LOG. A cargo test can't
   # drive CredSSP/NLA (the harness is TLS-only), so this runs a real loopback

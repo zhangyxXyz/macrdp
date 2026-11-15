@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       dry_run:
-        description: Preview deletions (Git tags are always retained)
+        description: Preview old owned Release and tag deletions
         type: boolean
         default: true
         required: true

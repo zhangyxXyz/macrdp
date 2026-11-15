@@ -18,6 +18,8 @@ mod camera;
 mod capture;
 mod clipboard;
 mod clipboard_image;
+#[cfg(test)]
+mod clipboard_protocol_tests;
 mod clipboard_rich;
 mod config;
 mod conn_hooks;
@@ -29,6 +31,8 @@ mod display_transition;
 mod file_promise;
 #[cfg(target_os = "macos")]
 mod file_promise_lazy;
+#[cfg(target_os = "macos")]
+mod file_provider;
 #[cfg(target_os = "macos")]
 mod h264;
 mod health;
@@ -533,15 +537,10 @@ struct Args {
     #[arg(long, default_value_t = 4)]
     flush_frames: u32,
 
-    /// Disable lazy Windows→Mac file paste. Lazy paste is ON by default:
-    /// temp files are pre-sized but empty when the Windows copy lands,
-    /// and bytes stream only when the user actually pastes in Finder
-    /// (macOS shows its native "Preparing to paste" progress dialog).
-    /// Handles single files AND folder trees. Uses fewer parallel chunk
-    /// requests than the eager path so the RDP session stays responsive
-    /// during the on-paste download. Pass this to fall back to the eager
-    /// path (downloads every file the moment Windows announces the copy,
-    /// then auto-fires Cmd-V into Finder).
+    /// Download Windows→Mac file copies completely before publishing them.
+    /// By default a bundled macOS 15+ File Provider offers system dataless files
+    /// that also work with direct file readers. If the extension is unavailable,
+    /// older macOS is used, or folders are copied, complete-file download is used.
     #[cfg(target_os = "macos")]
     #[arg(long = "no-lazy-paste", action = clap::ArgAction::SetTrue)]
     no_lazy_paste: bool,
@@ -2359,7 +2358,10 @@ fn spawn_primary_overlay_watcher<T: Send + 'static>(
                             // path, and the startup reaper backstops anything
                             // that slips through on the relaunch.
                             #[cfg(target_os = "macos")]
-                            file_promise_lazy::shutdown_cleanup();
+                            {
+                                file_promise_lazy::shutdown_cleanup();
+                                file_provider::shutdown().await;
+                            }
                             rdpdr::shutdown_cleanup();
                             std::process::exit(DETACH_STUCK_EXIT_CODE);
                         } else {
@@ -3227,7 +3229,10 @@ async fn async_main(mut args: Args, document: Option<config::Document>) -> Resul
         // cliprdr backend, so flush that state explicitly. No-op if
         // MacCliprdr was never constructed.
         #[cfg(target_os = "macos")]
-        file_promise_lazy::shutdown_cleanup();
+        {
+            file_promise_lazy::shutdown_cleanup();
+            file_provider::shutdown().await;
+        }
         // RDPDR NFS volumes are unmounted on disconnect by Surface::Drop, but
         // process::exit (below) skips Drop — so unmount any still-mounted ones
         // here, or a signal stop strands them pointing at the dead server.

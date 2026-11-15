@@ -1050,6 +1050,7 @@ pub enum ServerEvent {
     /// the given reason. See [`ErrorInfoDisconnectHandle::disconnect`].
     Disconnect(ErrorInfo),
     Clipboard(ClipboardMessage),
+    ClipboardLease { id: u32, retain: bool },
     Rdpsnd(RdpsndServerMessage),
     Rdpdr(RdpdrServerMessage),
     Rdpeai(RdpeaiServerMessage),
@@ -1087,6 +1088,7 @@ impl fmt::Debug for ServerEvent {
             Self::Quit(reason) => f.debug_tuple("Quit").field(reason).finish(),
             Self::EvictedByOtherConnection => f.write_str("EvictedByOtherConnection"),
             Self::Disconnect(error) => f.debug_tuple("Disconnect").field(error).finish(),
+            Self::ClipboardLease { .. } => f.write_str("ClipboardLease(..)"),
             Self::Clipboard(..) => f.write_str("Clipboard(..)"),
             Self::Rdpsnd(..) => f.write_str("Rdpsnd(..)"),
             Self::Rdpdr(..) => f.write_str("Rdpdr(..)"),
@@ -3510,6 +3512,11 @@ impl RdpServer {
                         .await
                         .map_err(|e| ServerError::io("write_all", e))?;
                 }
+                ServerEvent::ClipboardLease { id, retain } => {
+                    if let Some(clipboard) = self.get_svc_processor::<CliprdrServer>() {
+                        if retain { clipboard.retain_remote_lock(id); } else { clipboard.release_remote_lock(id); }
+                    }
+                }
                 ServerEvent::Clipboard(c) => {
                     let Some(cliprdr) = self.get_svc_processor::<CliprdrServer>() else {
                         warn!("No clipboard channel, dropping event");
@@ -4197,6 +4204,7 @@ impl RdpServer {
         let mut event_writer = writer.clone();
         let mut auto_reconnect_writer = writer.clone();
         let mut heartbeat_writer = writer.clone();
+        let mut clipboard_timeout_writer = writer.clone();
         let mut udp_tunnel_writer = writer.clone();
         let mut audio_writer = writer.clone();
         let audio_receiver = self.macrdp.audio_receiver.clone();
@@ -4391,6 +4399,31 @@ impl RdpServer {
             }
         };
 
+        let clipboard_state = Rc::clone(&s);
+        let drive_clipboard_timeouts = async move {
+            let mut timer = tokio::time::interval(Duration::from_secs(5));
+            timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            timer.tick().await;
+            loop {
+                timer.tick().await;
+                let mut server = clipboard_state.lock().await;
+                let Some(channel) = server.get_channel_id_by_type::<CliprdrServer>() else { continue; };
+                let Some(clipboard) = server.get_svc_processor::<CliprdrServer>() else { continue; };
+                let messages = match clipboard.drive_timeouts() {
+                    Ok(messages) => messages,
+                    Err(error) => { warn!(?error, "clipboard timeout sweep failed"); continue; }
+                };
+                let bytes = match server_encode_svc_messages(messages.into(), channel, user_channel_id) {
+                    Ok(bytes) => bytes,
+                    Err(error) => { warn!(?error, "clipboard timeout encoding failed"); continue; }
+                };
+                drop(server);
+                if !bytes.is_empty() {
+                    clipboard_timeout_writer.write_all(&bytes).await.map_err(|e| ServerError::io("clipboard timeout write", e))?;
+                }
+            }
+            #[allow(unreachable_code)] Ok::<RunState, ServerError>(RunState::Continue)
+        };
         let send_heartbeats = async move {
             let (Some(config), Some(message_channel_id)) = (heartbeat, message_channel_id) else {
                 return core::future::pending::<ServerResult<RunState>>().await;
@@ -4596,6 +4629,7 @@ impl RdpServer {
             state = dispatch_events => state,
             state = refresh_auto_reconnect_cookie => state,
             state = send_heartbeats => state,
+            state = drive_clipboard_timeouts => state,
             state = dispatch_udp_tunnel => state,
             state = dispatch_audio => state,
             state = dispatch_mt_tunnel => state,

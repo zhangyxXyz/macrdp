@@ -26,7 +26,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicI64, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -98,9 +98,54 @@ pub type SelfChangeCount = Arc<AtomicI64>;
 pub struct DownloadRouter {
     pending: Arc<Mutex<HashMap<u32, oneshot::Sender<FileContentsResponse<'static>>>>>,
     next_stream_id: Arc<AtomicU32>,
+    lease: Option<Arc<DownloadLease>>,
+}
+#[derive(Debug)]
+struct DownloadLease {
+    lock: u32,
+    alive: Arc<AtomicBool>,
+    sender: EventSender,
+}
+impl Drop for DownloadLease {
+    fn drop(&mut self) {
+        if self.alive.load(Ordering::Acquire) {
+            if let Some(sender) = self.sender.lock().unwrap().as_ref() {
+                let _ = sender.send(ServerEvent::ClipboardLease {
+                    id: self.lock,
+                    retain: false,
+                });
+            }
+        }
+    }
 }
 
 impl DownloadRouter {
+    pub fn for_copy(&self, lock: u32, alive: Arc<AtomicBool>, sender: EventSender) -> Self {
+        Self {
+            pending: self.pending.clone(),
+            next_stream_id: self.next_stream_id.clone(),
+            lease: Some(Arc::new(DownloadLease {
+                lock,
+                alive,
+                sender,
+            })),
+        }
+    }
+    pub fn is_connected(&self) -> bool {
+        self.lease
+            .as_ref()
+            .is_none_or(|lease| lease.alive.load(Ordering::Acquire))
+    }
+    pub fn event_sender(&self) -> Option<EventSender> {
+        self.lease.as_ref().map(|lease| lease.sender.clone())
+    }
+    pub fn lock_id(&self) -> Option<u32> {
+        self.lease.as_ref().map(|lease| lease.lock)
+    }
+    pub fn cancel_all(&self) {
+        self.pending.lock().unwrap().clear();
+    }
+
     /// Allocate a fresh stream-id and register the matching oneshot
     /// receiver. The id starts at 1 (mstsc treats 0 as "no stream") and
     /// skips zero on wrap-around.
@@ -154,17 +199,24 @@ pub fn spawn_remote_images(
     let Ok(rt) = tokio::runtime::Handle::try_current() else {
         return;
     };
-    crate::file_promise_lazy::cleanup_previous(&current_temp_dir);
-    let dir = match make_temp_dir() {
-        Ok(dir) => dir,
-        Err(error) => {
-            warn!(%error, "image clipboard staging failed");
+    let dir = {
+        let _guard = crate::clipboard::pasteboard_guard();
+        if !ticket.is_current() || !router.is_connected() {
             return;
         }
+        crate::file_promise_lazy::cleanup_previous(&current_temp_dir);
+        let dir = match make_temp_dir() {
+            Ok(dir) => dir,
+            Err(error) => {
+                warn!(%error, "image clipboard staging failed");
+                return;
+            }
+        };
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+        *current_temp_dir.lock().unwrap() = Some(dir.clone());
+        dir
     };
-    use std::os::unix::fs::PermissionsExt;
-    let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
-    *current_temp_dir.lock().unwrap() = Some(dir.clone());
     rt.spawn(async move {
         let work = async {
             let mut paths = Vec::new();
@@ -292,31 +344,68 @@ fn publish_ready_images(
 /// the `relative_path` fields), then publishes the **top-level** paths
 /// (entries where `relative_path` is `None`) to NSPasteboard so Finder
 /// pastes the folder tree rather than 1000 leaf URLs.
+pub struct FilePasteOptions {
+    pub ticket: crate::clipboard_image::CopyTicket,
+    pub session: String,
+    pub prefer_provider: bool,
+}
+
 pub fn spawn_remote_paste(
-    entries: Vec<RemoteEntry>,
+    mut entries: Vec<RemoteEntry>,
     router: DownloadRouter,
     sender: EventSender,
     current_temp_dir: Arc<Mutex<Option<PathBuf>>>,
     self_change_count: SelfChangeCount,
     rt_handle: tokio::runtime::Handle,
+    options: FilePasteOptions,
 ) {
+    let FilePasteOptions {
+        ticket,
+        session,
+        prefer_provider,
+    } = options;
     if entries.is_empty() {
         return;
     }
     rt_handle.spawn(async move {
-        // Wipe any previous temp dir before starting the new download so
-        // /tmp doesn't accumulate stale paste data across copies.
-        if let Some(old) = current_temp_dir.lock().unwrap().take() {
-            let _ = std::fs::remove_dir_all(&old);
-        }
-        let dir = match make_temp_dir() {
-            Ok(d) => d,
-            Err(e) => {
-                warn!("failed to create paste temp dir: {e}");
-                return;
+        if !ticket.is_current() || !router.is_connected() { return; }
+        if entries.len() > 4096 { warn!("remote file count exceeds transfer limit"); return; }
+        for entry in &mut entries {
+            if !ticket.is_current() || !router.is_connected() { return; }
+                if !entry.is_dir && entry.size.is_none() {
+                    match fetch_size(entry.index, &router, &sender).await {
+                        Ok(size) => entry.size = Some(size),
+                        Err(error) => { warn!(%error, "remote file size request failed"); return; }
+                    }
+                }
             }
+        if prefer_provider && crate::file_provider::available() && entries.iter().all(|e| !e.is_dir && e.relative_path.as_ref().is_none_or(|p| p.is_empty())) {
+            match crate::file_provider::offer(&session, &entries, router.clone()).await {
+                Ok(paths) => {
+                    if publish_file_urls(&paths, &self_change_count, &ticket) { info!(files=paths.len(), "published OS dataless clipboard file URLs"); }
+                    return;
+                }
+                Err(error) => warn!(%error, "File Provider unavailable for copy; downloading complete files before publication"),
+            }
+        }
+        if !ticket.is_current() || !router.is_connected() { return; }
+        // Preserve native PNG pasteboard representations on the complete-image fallback.
+        if entries.len() <= 16 && entries.iter().map(|e| e.size.unwrap_or(u64::MAX)).try_fold(0u64,|sum,size|sum.checked_add(size)).is_some_and(|total|total<=crate::clipboard_image::MAX_IMAGE_BYTES as u64)
+            && entries.iter().all(|e| !e.is_dir && e.relative_path.as_ref().is_none_or(|p|p.is_empty()) && crate::clipboard_image::is_image_name(&e.name)) {
+            spawn_remote_images(entries, router, sender, current_temp_dir, self_change_count, ticket);
+            return;
+        }
+        let dir = {
+            let _guard = crate::clipboard::pasteboard_guard();
+            if !ticket.is_current() || !router.is_connected() { return; }
+            crate::file_promise_lazy::cleanup_previous(&current_temp_dir);
+            let dir = match make_temp_dir() {
+                Ok(dir) => dir,
+                Err(error) => { warn!(%error, "file clipboard staging failed"); return; }
+            };
+            *current_temp_dir.lock().unwrap() = Some(dir.clone());
+            dir
         };
-        *current_temp_dir.lock().unwrap() = Some(dir.clone());
 
         // Compute every entry's full destination path up front. Path-
         // safety check rejects anything that escapes the temp root via
@@ -332,8 +421,11 @@ pub fn spawn_remote_paste(
                     return;
                 }
             };
-            if e.relative_path.is_none() {
+            if e.relative_path.as_ref().is_none_or(|p| p.is_empty()) {
                 top_level.push(dst.clone());
+            }
+            if planned.iter().any(|(_, path): &(RemoteEntry, PathBuf)| path == &dst) {
+                warn!("duplicate remote file destination"); return;
             }
             planned.push((e, dst));
         }
@@ -357,6 +449,8 @@ pub fn spawn_remote_paste(
         // Now fetch files. Sequential per-file (each file uses parallel
         // chunks internally), one failure aborts.
         for (e, dst) in &planned {
+            if !ticket.is_current() || !router.is_connected() { return; }
+            if e.size.is_some_and(|size| size > 128 * 1024 * 1024 * 1024) { warn!("remote file exceeds 128 GiB transfer limit"); return; }
             if e.is_dir {
                 continue;
             }
@@ -369,17 +463,9 @@ pub fn spawn_remote_paste(
                     return;
                 }
             }
-            match fetch_one_file(
-                e.index,
-                e.size,
-                dst,
-                &router,
-                &sender,
-                EAGER_PARALLEL_CHUNKS,
-                EAGER_CHUNK_SIZE,
-            )
-            .await
-            {
+            let download = fetch_one_file(e.index, e.size, dst, &router, &sender, EAGER_PARALLEL_CHUNKS, EAGER_CHUNK_SIZE);
+            let result = tokio::select! { result = download => result, _ = ticket.superseded() => return };
+            match result {
                 Ok(()) => {
                     debug!(name = %e.name, dest = ?dst, "downloaded remote file");
                 }
@@ -390,7 +476,7 @@ pub fn spawn_remote_paste(
             }
         }
 
-        publish_to_pasteboard(&top_level, &self_change_count);
+        if !publish_file_urls(&top_level, &self_change_count, &ticket) { return; }
         info!(
             files = planned.iter().filter(|(e, _)| !e.is_dir).count(),
             roots = top_level.len(),
@@ -415,13 +501,17 @@ pub fn resolve_dest(root: &Path, entry: &RemoteEntry) -> Option<PathBuf> {
             if component.is_empty() {
                 continue;
             }
-            if component == "." || component == ".." || component.contains('/') {
+            if component == "." || component == ".." || component.contains(['/', '\0']) {
                 return None;
             }
             p.push(component);
         }
     }
-    if entry.name == "." || entry.name == ".." || entry.name.contains('/') {
+    if entry.name.is_empty()
+        || entry.name == "."
+        || entry.name == ".."
+        || entry.name.contains(['/', '\\', '\0'])
+    {
         return None;
     }
     p.push(&entry.name);
@@ -503,7 +593,8 @@ fn make_temp_dir() -> std::io::Result<PathBuf> {
         .map(|d| d.as_nanos())
         .unwrap_or(0);
     let dir = std::env::temp_dir().join(format!("macrdp-paste-{}-{nanos}", std::process::id()));
-    std::fs::create_dir_all(&dir)?;
+    use std::os::unix::fs::DirBuilderExt;
+    std::fs::DirBuilder::new().mode(0o700).create(&dir)?;
     Ok(dir)
 }
 
@@ -525,9 +616,13 @@ pub fn reap_stale() {
     );
 }
 
-fn publish_to_pasteboard(paths: &[PathBuf], self_change_count: &SelfChangeCount) {
+pub fn publish_file_urls(
+    paths: &[PathBuf],
+    self_change_count: &SelfChangeCount,
+    ticket: &crate::clipboard_image::CopyTicket,
+) -> bool {
     if paths.is_empty() {
-        return;
+        return false;
     }
     let urls: Vec<Retained<NSURL>> = paths
         .iter()
@@ -538,7 +633,7 @@ fn publish_to_pasteboard(paths: &[PathBuf], self_change_count: &SelfChangeCount)
         })
         .collect();
     if urls.is_empty() {
-        return;
+        return false;
     }
     // NSPasteboard.writeObjects takes NSArray<NSPasteboardWriting>; NSURL
     // conforms to NSPasteboardWriting (under the `NSPasteboard` feature
@@ -554,13 +649,19 @@ fn publish_to_pasteboard(paths: &[PathBuf], self_change_count: &SelfChangeCount)
     let _pb_guard = crate::clipboard::pasteboard_guard();
     let new_change_count = unsafe {
         let pb = crate::clipboard::pasteboard();
+        if !ticket.may_publish(pb.changeCount() as i64) {
+            return false;
+        }
         crate::clipboard::begin_local_write(&pb);
-        pb.writeObjects(&array);
+        if !pb.writeObjects(&array) {
+            return false;
+        }
         pb.changeCount() as i64
     };
     // Tell the Mac-side poller "we just wrote these; ignore the next
     // changeCount tick."
     self_change_count.store(new_change_count, Ordering::Relaxed);
+    true
 }
 
 /// Download a single file as a fan-out of RANGE chunks. Up to
@@ -604,10 +705,12 @@ pub async fn fetch_one_file(
     // on APFS; the actual blocks materialize as chunks land.
     let file = std::fs::OpenOptions::new()
         .write(true)
-        .create(true)
-        .truncate(true)
+        .create_new(true)
         .open(dst)
         .map_err(|e| format!("create {dst:?}: {e}"))?;
+    if total > 128 * 1024 * 1024 * 1024 {
+        return Err("remote file exceeds 128 GiB transfer limit".into());
+    }
     file.set_len(total)
         .map_err(|e| format!("set_len {dst:?}: {e}"))?;
     let file = Arc::new(file);
@@ -717,12 +820,28 @@ async fn chunk_task(
     Ok(())
 }
 
-async fn fetch_size(
+pub async fn fetch_size(
     index: i32,
     router: &DownloadRouter,
     sender: &EventSender,
 ) -> Result<u64, String> {
+    if !router.is_connected() {
+        return Err("clipboard session disconnected".into());
+    }
     let (stream_id, rx) = router.register();
+    struct Pending {
+        id: u32,
+        router: DownloadRouter,
+    }
+    impl Drop for Pending {
+        fn drop(&mut self) {
+            self.router.pending.lock().unwrap().remove(&self.id);
+        }
+    }
+    let _pending = Pending {
+        id: stream_id,
+        router: router.clone(),
+    };
     push_request(
         sender,
         FileContentsRequest {
@@ -731,24 +850,43 @@ async fn fetch_size(
             flags: FileContentsFlags::SIZE,
             position: 0,
             requested_size: 8,
-            data_id: None,
+            data_id: router.lock_id(),
         },
     )?;
-    let resp = rx.await.map_err(|_| "size: channel closed".to_string())?;
+    let resp = tokio::time::timeout(std::time::Duration::from_secs(30), rx)
+        .await
+        .map_err(|_| "size request timed out".to_string())?
+        .map_err(|_| "size: channel closed".to_string())?;
     if resp.is_error() {
         return Err("size: remote returned CB_RESPONSE_FAIL".into());
     }
     resp.data_as_size().map_err(|e| format!("size decode: {e}"))
 }
 
-async fn fetch_range(
+pub async fn fetch_range(
     index: i32,
     position: u64,
     requested_size: u32,
     router: &DownloadRouter,
     sender: &EventSender,
 ) -> Result<Vec<u8>, String> {
+    if !router.is_connected() {
+        return Err("clipboard session disconnected".into());
+    }
     let (stream_id, rx) = router.register();
+    struct Pending {
+        id: u32,
+        router: DownloadRouter,
+    }
+    impl Drop for Pending {
+        fn drop(&mut self) {
+            self.router.pending.lock().unwrap().remove(&self.id);
+        }
+    }
+    let _pending = Pending {
+        id: stream_id,
+        router: router.clone(),
+    };
     push_request(
         sender,
         FileContentsRequest {
@@ -757,10 +895,16 @@ async fn fetch_range(
             flags: FileContentsFlags::RANGE,
             position,
             requested_size,
-            data_id: None,
+            data_id: router.lock_id(),
         },
     )?;
-    let resp = rx.await.map_err(|_| "range: channel closed".to_string())?;
+    let resp = tokio::time::timeout(std::time::Duration::from_secs(30), rx)
+        .await
+        .map_err(|_| "range request timed out".to_string())?
+        .map_err(|_| "range: channel closed".to_string())?;
+    if !router.is_connected() {
+        return Err("clipboard session disconnected".into());
+    }
     if resp.is_error() {
         return Err(format!(
             "range at {position}: remote returned CB_RESPONSE_FAIL"
@@ -1038,5 +1182,42 @@ mod tests {
             }
         }
         std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[tokio::test]
+    async fn request_cancellation_removes_its_pending_route() {
+        let router = DownloadRouter::default();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let sender = Arc::new(Mutex::new(Some(tx)));
+        let task = {
+            let router = router.clone();
+            tokio::spawn(async move { fetch_range(0, 0, 1, &router, &sender).await })
+        };
+        rx.recv().await.unwrap();
+        assert_eq!(router.pending.lock().unwrap().len(), 1);
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert!(router.pending.lock().unwrap().is_empty());
+    }
+    #[tokio::test]
+    async fn copy_lease_releases_only_after_last_consumer_and_never_across_sessions() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let sender = Arc::new(Mutex::new(Some(tx)));
+        let alive = Arc::new(AtomicBool::new(true));
+        let first = DownloadRouter::default().for_copy(7, alive.clone(), sender.clone());
+        let second = first.clone();
+        drop(first);
+        assert!(rx.try_recv().is_err());
+        drop(second);
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(ServerEvent::ClipboardLease {
+                id: 7,
+                retain: false
+            })
+        ));
+        let old = DownloadRouter::default().for_copy(8, alive.clone(), sender);
+        alive.store(false, Ordering::Release);
+        drop(old);
+        assert!(rx.try_recv().is_err());
     }
 }
