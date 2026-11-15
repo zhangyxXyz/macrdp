@@ -1,0 +1,68 @@
+name: Development build
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: dev-build-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: '0'
+  CARGO_NET_RETRY: '10'
+
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          persist-credentials: false
+      - uses: actions-rust-lang/setup-rust-toolchain@46268bd060767258de96ed93c1251119784f2ab6
+        with:
+          toolchain: '1.95.0'
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4
+      - name: Format and lint
+        run: |
+          cargo fmt --all -- --check
+          cargo clippy --locked --all-targets -- -D warnings
+      - name: Test Rust and configuration
+        run: |
+          cargo test --release --locked
+          cargo build --release --locked
+          python3 scripts/check-config-cli.py target/release/macrdp
+          swift run --package-path gui --scratch-path gui/.build ConfigSupportTests
+          python3 -m unittest discover -s scripts/tests -p 'test_cleanup_workflow_runs.py'
+      - name: Build server and helper apps
+        env:
+          CODESIGN_IDENTITY: '-'
+        run: |
+          cargo build --release --locked --manifest-path ifd-handler/Cargo.toml
+          swift build --package-path gui -c release --product macrdphud
+          swift build --package-path gui -c release --product macrdpshield
+          SKIP_BUILD=1 APP_DIR="$RUNNER_TEMP/appout" packaging/make-app.sh
+          APP_DIR="$RUNNER_TEMP/appout" gui/make-tray-app.sh
+          codesign --verify --deep --strict target/macrdp.app
+          codesign --verify --deep --strict target/macrdpController.app
+      - name: Archive apps and record provenance
+        run: |
+          mkdir -p target/app-pair dist
+          cp -R target/macrdp.app target/macrdpController.app target/app-pair/
+          cp README.md README_CN.md LICENSE-MIT LICENSE-APACHE target/app-pair/
+          git rev-parse HEAD > target/app-pair/SOURCE_COMMIT
+          target/release/macrdp --capabilities > target/app-pair/CAPABILITIES.json
+          NAME="macrdp-dev-${GITHUB_SHA::12}-aarch64-apple-darwin"
+          ditto -c -k target/app-pair "dist/${NAME}.zip"
+          (cd dist && shasum -a 256 *.zip > SHA256SUMS)
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: macrdp-dev-${{ github.sha }}-aarch64-apple-darwin
+          path: dist/
+          if-no-files-found: error
+          retention-days: 14

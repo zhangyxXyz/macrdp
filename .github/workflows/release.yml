@@ -123,10 +123,8 @@ jobs:
           cargo build --release --locked --target "${{ matrix.target }}"
 
       - name: Ad-hoc codesign
-        # Without any signature the OS treats every rebuilt binary as a new
-        # identity and the user has to re-grant Screen Recording / Accessibility
-        # on every download. Ad-hoc (-s -) at least gives it a stable hash.
-        # For production: replace with Developer ID + notarytool.
+        # Ad-hoc hashes change across rebuilds and can invalidate TCC grants.
+        # Production distribution requires a stable identity + notarization.
         shell: bash
         run: |
           set -euo pipefail
@@ -198,6 +196,9 @@ jobs:
             || { echo "shield-window helper not embedded in the app"; exit 1; }
           codesign --verify --deep --strict target/macrdp.app
 
+      - name: Build controller app
+        run: APP_DIR="$RUNNER_TEMP/appout" gui/make-tray-app.sh
+
       - name: Stage app artifact
         id: stageapp
         shell: bash
@@ -209,7 +210,9 @@ jobs:
           NAME="macrdp-${VERSION}-${{ matrix.target }}-app"
           mkdir -p dist
           # ditto -k preserves the bundle's signature + symlinks (plain zip won't).
-          ditto -c -k --keepParent target/macrdp.app "dist/${NAME}.zip"
+          mkdir -p target/app-pair
+          cp -R target/macrdp.app target/macrdpController.app target/app-pair/
+          ditto -c -k target/app-pair "dist/${NAME}.zip"
           (cd dist && shasum -a 256 "${NAME}.zip" > "${NAME}.zip.sha256")
           echo "archive=dist/${NAME}.zip" >> "$GITHUB_OUTPUT"
           echo "checksum=dist/${NAME}.zip.sha256" >> "$GITHUB_OUTPUT"
