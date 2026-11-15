@@ -869,25 +869,22 @@ impl RdpServerDisplay for CaptureDisplay {
     }
 
     async fn updates(&mut self) -> ServerResult<Box<dyn RdpServerDisplayUpdates>> {
-        if let Some(preparation) = &self.preparation {
-            let unlocked = preparation.run().await.map_err(|error| {
-                ServerError::reason("prepare authenticated capture", format!("{error:#}"))
-            })?;
-            if unlocked {
-                crate::session_lock::wait_for_display(self.display_id)
-                    .await
-                    .map_err(|error| {
-                        ServerError::reason("display readiness after unlock", format!("{error:#}"))
-                    })?;
+        // Include preparation failures in the same truthful telemetry as SCK
+        // failures. No capture, input-size commit or display sync before this gate.
+        let result = async {
+            if let Some(preparation) = &self.preparation {
+                let unlocked = preparation.run().await?;
+                if unlocked {
+                    crate::session_lock::wait_for_display(self.display_id).await?;
+                }
             }
+            // The sync block keeps the display mutex out of every await point.
+            let (width, height) = self.sync_virtual_display();
+            self.desktop_size.commit_input_size(width, height);
+            crate::input::invalidate_display_bounds();
+            self.build_updates(width, height).await
         }
-        // `sync_virtual_display` is a sync block (no awaits) so the display
-        // mutex guard never lives across an await point (Send bound on the
-        // returned future).
-        let (width, height) = self.sync_virtual_display();
-        self.desktop_size.commit_input_size(width, height);
-        crate::input::invalidate_display_bounds();
-        let result = self.build_updates(width, height).await;
+        .await;
         if let Some(stats) = crate::stats::global() {
             stats.update_display(|d| {
                 if let Err(error) = &result {
