@@ -2158,6 +2158,8 @@ dependencies = [
  "rustls",
  "rustls-pemfile",
  "screencapturekit",
+ "serde_json",
+ "sha2 0.10.9",
  "thiserror 1.0.69",
  "tokio",
  "tokio-rustls",

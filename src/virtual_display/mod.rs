@@ -25,6 +25,53 @@ pub use stub::{
     DetachedPrimary, PrimaryOverride, ShieldedPrimary, VirtualDisplay,
 };
 
+/// Measurements, not configuration intent. A missing CoreGraphics pixel mode
+/// remains unknown instead of being guessed from a requested HiDPI flag.
+#[derive(Clone, Debug, Default)]
+pub struct DisplayMeasurement {
+    pub display_id: Option<u32>,
+    pub points_width: Option<f64>,
+    pub points_height: Option<f64>,
+    pub backing_width: Option<u32>,
+    pub backing_height: Option<u32>,
+    /// Effective remote UI size: wire pixels per logical point.
+    pub scale_percent: Option<f64>,
+    /// Actual macOS backing pixels per logical point, independently measured.
+    pub backing_scale_percent: Option<f64>,
+    pub native_capture: Option<bool>,
+}
+impl DisplayMeasurement {
+    fn from_dimensions(
+        display_id: u32,
+        points: (f64, f64),
+        backing: Option<(u32, u32)>,
+        wire: (u16, u16),
+    ) -> Self {
+        let points_width = (points.0.is_finite() && points.0 > 0.0).then_some(points.0);
+        let points_height = (points.1.is_finite() && points.1 > 0.0).then_some(points.1);
+        let backing = backing.filter(|(w, h)| *w > 0 && *h > 0);
+        Self {
+            display_id: Some(display_id),
+            points_width,
+            points_height,
+            backing_width: backing.map(|(w, _)| w),
+            backing_height: backing.map(|(_, h)| h),
+            // A single UI scale is only meaningful when both axes agree.
+            // Capture can later resolve an aspect-preserving letterbox to the
+            // smaller ratio; a stretched fallback has no uniform UI scale.
+            scale_percent: points_width.zip(points_height).and_then(|(w, h)| {
+                let x = f64::from(wire.0) / w * 100.0;
+                let y = f64::from(wire.1) / h * 100.0;
+                ((x - y).abs() <= 1.0).then_some(x)
+            }),
+            backing_scale_percent: points_width
+                .zip(backing)
+                .map(|(p, (w, _))| f64::from(w) / p * 100.0),
+            native_capture: backing.map(|(w, h)| (w, h) == (u32::from(wire.0), u32::from(wire.1))),
+        }
+    }
+}
+
 /// When the virtual display runs HiDPI (`--virtual-display-hidpi`).
 #[derive(Clone, Debug)]
 pub enum HidpiPolicy {
@@ -204,15 +251,39 @@ mod macos {
             "--ignored",
         ])
         .env(TEST_SELECT_MODE_ENV, &spec);
-        let out = cmd.output().context("starting the display-mode helper")?;
-        match out.status.code() {
+        cmd.stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        let child = cmd.spawn().context("starting the display-mode helper")?;
+        let status = wait_for_helper(child, Duration::from_secs(3))?;
+        match status.code() {
             Some(HELPER_SELECTED) => Ok(true),
             Some(HELPER_NOT_LISTED) => Ok(false),
-            _ => Err(anyhow!(
-                "display-mode helper failed ({}): {}",
-                out.status,
-                String::from_utf8_lossy(&out.stderr).trim()
-            )),
+            _ => Err(anyhow!("display-mode helper failed ({status})")),
+        }
+    }
+
+    pub(super) fn wait_for_helper(
+        mut child: std::process::Child,
+        timeout: Duration,
+    ) -> Result<std::process::ExitStatus> {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            match child.try_wait() {
+                Ok(Some(status)) => return Ok(status),
+                Ok(None) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(10))
+                }
+                Ok(None) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(anyhow!("display-mode helper timed out"));
+                }
+                Err(e) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(e).context("waiting for display-mode helper");
+                }
+            }
         }
     }
 
@@ -425,6 +496,20 @@ mod macos {
             Ok(vd)
         }
 
+        pub fn measurement(&self, wire_width: u16, wire_height: u16) -> super::DisplayMeasurement {
+            let display = CGDisplay::new(self.display_id);
+            let bounds = display.bounds();
+            let backing = display
+                .display_mode()
+                .map(|m| (m.pixel_width() as u32, m.pixel_height() as u32));
+            super::DisplayMeasurement::from_dimensions(
+                self.display_id,
+                (bounds.size.width, bounds.size.height),
+                backing,
+                (wire_width, wire_height),
+            )
+        }
+
         /// Pixel width of the display's current mode, from
         /// `CGDisplayCopyDisplayMode`. `CGDisplayBounds` only gives points,
         /// which read the same for the 1:1 and 2x modes of one point size.
@@ -522,6 +607,10 @@ mod macos {
                 let b = CGDisplay::new(self.display_id).bounds();
                 self.origin_pts = (b.origin.x, b.origin.y);
                 self.size_pts = (b.size.width, b.size.height);
+                // A failed request can leave the previous, perfectly valid
+                // HiDPI mode in place. Classify its actual bounds, not the
+                // rejected request's point width.
+                self.record_scale(self.size_pts.0 as u32);
                 return Err(anyhow!(
                     "virtual display didn't take the mode for {mode_w}x{mode_h} points"
                 ));
@@ -2086,6 +2175,13 @@ mod stub {
         pub fn size_pts(&self) -> (f64, f64) {
             (0.0, 0.0)
         }
+        pub fn measurement(
+            &self,
+            _wire_width: u16,
+            _wire_height: u16,
+        ) -> super::DisplayMeasurement {
+            Default::default()
+        }
         pub fn mode_px(&self) -> (u32, u32) {
             (0, 0)
         }
@@ -2141,7 +2237,59 @@ mod stub {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn stretched_fallback_does_not_claim_a_uniform_remote_ui_scale() {
+        let actual = super::DisplayMeasurement::from_dimensions(
+            42,
+            (1920.0, 1200.0),
+            Some((1920, 1200)),
+            (3840, 2160),
+        );
+        assert_eq!(actual.scale_percent, None);
+        assert_eq!(actual.backing_scale_percent, Some(100.0));
+        assert_eq!(actual.native_capture, Some(false));
+    }
+
+    #[test]
+    fn native_hidpi_is_distinct_from_upscaled_wire_pixels() {
+        let native = super::DisplayMeasurement::from_dimensions(
+            42,
+            (1920.0, 1080.0),
+            Some((3840, 2160)),
+            (3840, 2160),
+        );
+        assert_eq!(native.scale_percent, Some(200.0));
+        assert_eq!(native.backing_scale_percent, Some(200.0));
+        assert_eq!(native.native_capture, Some(true));
+        let scaled = super::DisplayMeasurement::from_dimensions(
+            42,
+            (1920.0, 1080.0),
+            Some((1920, 1080)),
+            (3840, 2160),
+        );
+        assert_eq!(scaled.scale_percent, Some(200.0));
+        assert_eq!(scaled.backing_scale_percent, Some(100.0));
+        assert_eq!(scaled.native_capture, Some(false));
+        let unknown =
+            super::DisplayMeasurement::from_dimensions(42, (1920.0, 1080.0), None, (3840, 2160));
+        assert_eq!(unknown.native_capture, None);
+        assert_eq!(unknown.backing_scale_percent, None);
+    }
+
     use super::*;
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn stalled_mode_helper_is_killed_and_reaped() {
+        let child = std::process::Command::new("/bin/sleep")
+            .arg("5")
+            .spawn()
+            .unwrap();
+        let started = std::time::Instant::now();
+        let err = macos::wait_for_helper(child, std::time::Duration::from_millis(20)).unwrap_err();
+        assert!(err.to_string().contains("timed out"));
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+    }
 
     #[test]
     fn only_a_2x_client_gets_hidpi() {

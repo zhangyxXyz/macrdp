@@ -10,6 +10,41 @@
 use std::process::Command;
 
 fn main() {
+    // Feature probing must identify the source commit even when package versions
+    // are unchanged between main-branch builds. The dirty suffix is diagnostic,
+    // never used as a replacement for capability negotiation.
+    let git_text = |args: &[&str]| {
+        Command::new("git")
+            .args(args)
+            .output()
+            .ok()
+            .filter(|out| out.status.success())
+            .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_owned())
+    };
+    for name in ["HEAD", "index", "packed-refs"] {
+        if let Some(path) = git_text(&["rev-parse", "--git-path", name]) {
+            println!("cargo:rerun-if-changed={path}");
+        }
+    }
+    if let Some(reference) = git_text(&["symbolic-ref", "-q", "HEAD"]) {
+        if let Some(path) = git_text(&["rev-parse", "--git-path", &reference]) {
+            println!("cargo:rerun-if-changed={path}");
+        }
+    }
+    // Re-evaluate the dirty marker after source edits, including new modules.
+    for path in ["src", "vendor", "Cargo.toml", "Cargo.lock", "build.rs"] {
+        println!("cargo:rerun-if-changed={path}");
+    }
+    let mut commit = git_text(&["rev-parse", "HEAD"]).unwrap_or_else(|| "unknown".into());
+    if Command::new("git")
+        .args(["diff-index", "--quiet", "HEAD", "--"])
+        .status()
+        .is_ok_and(|status| !status.success())
+    {
+        commit.push_str("-dirty");
+    }
+    println!("cargo:rustc-env=MACRDP_BUILD_COMMIT={commit}");
+
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("macos") {
         return;
     }

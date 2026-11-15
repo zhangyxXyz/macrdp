@@ -1,5 +1,8 @@
 # Commands & CLI reference
 
+See [Reliable display settings](display-settings.md) for resolution/scale policy,
+configuration validation, transactional saving, and measured display status.
+
 ```bash
 cargo build                    # debug build
 cargo build --release          # release build (LTO, ~30s)
@@ -101,6 +104,14 @@ MACRDP_MODS_RESYNC_IDLE_MS=10000  # env-only: after this many ms with no input,
                           #   secondary click). 0 disables the idle trigger; the
                           #   per-connection reset still applies. Independent of
                           #   --map-ctrl-to-cmd.
+--resolution-policy client|fixed # Explicit resolution policy. Fixed also ignores
+                          #   dynamic size requests. Client follows initial size;
+                          #   physical capture requires no --width/--height/--hidpi.
+                          #   Config: RESOLUTION_POLICY. Conflicts with a legacy
+                          #   --no-client-resolution when selecting client.
+--live-resize true|false   # Allow dynamic client resolution changes (default true),
+                          #   only under client policy. Independent of automatic
+                          #   virtual-display UI scale. Config: LIVE_RESIZE=1|0.
 --no-client-resolution    # Don't adopt the resolution the client requests at
                           #   connect (the auto-adopt default). Auto-adopt
                           #   applies on the mirror-primary path when no
@@ -590,21 +601,29 @@ each interval and waits `TIMEOUT_SECS` for it to run; a deadlocked runtime never
 runs it. A bounce logs `health-check watchdog: tokio runtime wedged …` before
 exiting.
 
-Blank recovery + auto-reconnect (env-tunable, **settable through `config.env`**
-— the matching keys are the same names minus the `MACRDP_` prefix, e.g.
-`BLANK_RECOVERY=0`; on by default with `--enable-h264`).
-The mstsc reconnect-blank auto-heal now **reactivates the RDP core in place** —
-on a detected blank the server sends a bare Deactivation–Reactivation (Server
-Deactivate All → new Demand Active) that preserves the EGFX channel/surface, and
-mstsc re-maps its retained surface and presents again with NO disconnect
-(live-verified: 5/5 blanks healed EDR=0 → presenting in ~1-2 s, zero drops). This
-is the default first action; a drop is the fallback only if the reactivation ever
-fails to heal. Detection is link-aware (RTT-gated) and has a wall-clock fast-path
-so a static blank heals in ~4 s (see the blank-recovery notes in
-`docs/known-quirks.md`):
+Experimental QoE-based blank recovery is **off by default**, including with
+`--enable-h264`. The matching `config.env` keys omit the `MACRDP_` prefix.
+Only `MACRDP_BLANK_RECOVERY=1` (or `true`, `on`, `yes`, case-insensitive) opts in;
+unset, empty, false, and unrecognized values keep it disabled. Use
+`BLANK_RECOVERY=0` in `config.env` to explicitly preserve this choice.
+
+**Zero QoE render timing does not prove a black screen.** MS-RDPEGFX defines
+`timeDiffEDR` as an integer millisecond timing, also using zero for overflow,
+and says QoE metrics should be used for information/debugging. A visible,
+interactive mstsc session can repeatedly report zero. The old heuristic could
+reactivate and then disconnect such a healthy session. See
+[the field definition](https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpegfx/17aaf205-23fe-467f-a629-447f428fdda0)
+and [server processing guidance](https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpegfx/06a92ec4-1048-4e5f-b2f9-bc114da00d88).
+
+If explicitly enabled for an experiment, the historical heuristic first tries
+core Deactivation–Reactivation, then may drop the connection. Its thresholds
+below do not turn QoE timing into reliable presentation evidence. With recovery
+disabled, the manual **Ctrl+Alt+Shift+R** resync remains available; for a genuinely
+blank mstsc surface, fully close and reopen its window. Auto-reconnect cookies
+are independent of this heuristic and remain enabled by default.
 ```
-MACRDP_BLANK_RECOVERY=1                # 0 disables the detector entirely
-MACRDP_BLANK_RECOVERY_REACTIVATE=1     # 1 = reactivate-in-place (heals mstsc); 0 = fall back to drop
+MACRDP_BLANK_RECOVERY=0                # default OFF; 1/true/on/yes explicitly enables the experimental heuristic
+MACRDP_BLANK_RECOVERY_REACTIVATE=1     # only with recovery opted in: try reactivation first; 0 = drop-only
 MACRDP_BLANK_RECOVERY_MAX_RTT_MS=80    # withhold recovery at/above this link RTT (0 = no gate)
 MACRDP_BLANK_RECOVERY_MIN_QOE=24       # all-zero QoE reports for the count path (~3 s of active decode) — never/barely-presented sessions only; an ESTABLISHED session uses ESTABLISHED_MIN_QOE instead
 MACRDP_BLANK_RECOVERY_MIN_RENDER_REPORTS=3  # CONSECUTIVE nonzero decode+render reports that count as "presenting" and disarm the detector (a shorter blip doesn't, and a lapse back to zero re-arms it)

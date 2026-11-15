@@ -24,9 +24,12 @@ let package = Package(
     targets: [
         .executableTarget(
             name: "macrdptray",
+            dependencies: ["ConfigSupport"],
             path: "Sources/macrdptray",
             linkerSettings: [.linkedFramework("SystemExtensions")]
         ),
+        .target(name: "ConfigSupport"),
+        .executableTarget(name: "ConfigSupportTests", dependencies: ["ConfigSupport"], path: "Tests/ConfigSupportTests"),
         .executableTarget(name: "macrdphud", path: "Sources/macrdphud"),
         .executableTarget(name: "macrdpshield", path: "Sources/macrdpshield"),
         .executableTarget(

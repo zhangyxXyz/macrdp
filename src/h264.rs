@@ -502,6 +502,9 @@ fn should_demigrate_to_tcp(
 /// quirk note in `docs/known-quirks.md`.
 #[derive(Clone, Copy, Debug)]
 struct BlankRecoveryParams {
+    /// Explicit experimental opt-in. QoE render timing cannot prove that the
+    /// client's desktop is blank, so no automatic recovery is allowed by default.
+    enabled: bool,
     /// QoE reports that must accumulate (all with `time_diff_dr == 0`) before
     /// the session is declared blank. Upstream delivers ~8 `on_qoe_metrics`
     /// callbacks/s during active decoding (~1 per DVC batch, NOT per wire PDU —
@@ -738,6 +741,31 @@ fn blank_action(attempt: u32, max_attempts: u32) -> BlankAction {
     }
 }
 
+/// MS-RDPEGFX 2.2.2.21 defines timeDiffEDR as an integer millisecond timing,
+/// including zero for overflow, not a presentation-success flag. Normal mstsc
+/// sessions can report repeated zeros. Keep the legacy recovery heuristic only
+/// for operators who explicitly opt in after observing an actual blank screen.
+fn blank_recovery_opted_in(value: Option<&str>) -> bool {
+    value.is_some_and(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "on" | "yes"
+        )
+    })
+}
+
+fn blank_recovery_action(attempt: u32, params: &BlankRecoveryParams) -> BlankAction {
+    if params.reactivate {
+        if attempt == 1 {
+            BlankAction::Reactivate
+        } else {
+            BlankAction::Drop
+        }
+    } else {
+        blank_action(attempt, params.max_attempts)
+    }
+}
+
 /// Reconnect-storm guard (see [`BlankRecoveryParams::max_consecutive_drops`]):
 /// true when the blank-recovery DROP lever must be withheld because the last
 /// `cap` consecutive connections all ended in a blank drop without any
@@ -873,15 +901,13 @@ impl QoeEvidence {
 /// Decide whether to run a blank-recovery attempt. Pure (counters + Durations,
 /// not a clock) so it's unit-testable without timing.
 ///
-/// The signal (pcap-proven 2026-07-02, validated live the same day — see
-/// [[h264-reconnect-blank]]): a reconnect that lands on mstsc's stale retained
-/// surface DECODES every frame — FrameAcks and QoE acks flow normally — but
-/// never PRESENTS, and its QoE Frame Acknowledge PDUs report `timeDiffEDR == 0`
-/// on every single frame. A rendering session shows nonzero EDR on its first
-/// callbacks (~100–230 ms after connect). So: QoE flowing + zero render-time
-/// ever = the client is painting into a surface nobody composites (the
-/// reconnect-blank). The caller then pulls the [`blank_action`] lever for the
-/// attempt number: remap to a fresh surface, or drop the connection.
+/// This is an opt-in heuristic, not a protocol-level blank-screen detector.
+/// Repeated zero `timeDiffEDR` was observed alongside stale mstsc surfaces, but
+/// also in normally visible, interactive sessions. The field is an integer
+/// millisecond timing and the protocol reserves zero for overflow too;
+/// MS-RDPEGFX 3.2.5.21 limits these metrics to informational/debugging use.
+/// The explicit enabled check is part of this decision so every recovery path,
+/// including retries and the final drop, remains disabled without opt-in.
 ///
 /// Each clause guards a distinct failure mode:
 /// - `zero_streak >= min_qoe_reports`: enough evidence, and implies the client
@@ -917,6 +943,9 @@ fn should_blank_recover(
     post_attempt_zero_span: Option<Duration>,
     p: &BlankRecoveryParams,
 ) -> bool {
+    if !p.enabled {
+        return false;
+    }
     // Durable clean-presentation latch (v0.9.2): a connection that produced a
     // sustained nonzero-EDR run BEFORE any recovery attempt genuinely presented
     // the desktop at connect, so it is not the reconnect-blank (which is black
@@ -1611,16 +1640,8 @@ pub struct Gfx {
     /// so a congested link sheds packet load that bitrate cuts alone can't. Default 10
     /// fps (100 ms); `MACRDP_ADAPTIVE_FLOOR_FPS` overrides. See [`frame_drop_at_floor`].
     adaptive_min_fps_interval: Duration,
-    /// Blank-presentation recovery (the mstsc reconnect-blank). On by default
-    /// (`MACRDP_BLANK_RECOVERY=0` disables); a strict no-op unless a QoE-acking
-    /// client (mstsc) decodes a whole detection window without ever presenting —
-    /// see [`should_blank_recover`]. On detection (default): drop the connection
-    /// so the client auto-reconnects via the auto-reconnect cookie — the fresh
-    /// connection renders with high probability. `MACRDP_BLANK_RECOVERY_MAX_
-    /// ATTEMPTS ≥ 2` re-enables the non-destructive fresh-surface remap first
-    /// ([`Gfx::perform_blank_remap`]; live-verified NOT to heal mstsc, kept for
-    /// experimentation) — see [`BlankAction`].
-    blank_recovery_enabled: bool,
+    /// Experimental recovery parameters, disabled without explicit opt-in.
+    /// QoE timing alone is not evidence of a blank desktop.
     blank_params: BlankRecoveryParams,
     /// Consecutive connections (process lifetime) that ended in a blank-recovery
     /// DROP with no connection presenting in between — the reconnect-storm guard
@@ -1759,20 +1780,21 @@ impl Gfx {
         let normal_keyframe_frames =
             (f64::from(fps) * f64::from(keyframe_secs)).round().max(1.0) as u32;
         let stretched_keyframe_frames = stretched_keyframe_interval(fps, normal_keyframe_frames);
-        // Blank-presentation recovery (the mstsc reconnect-blank): on by default —
-        // it only ever acts on the pcap-proven blank signature (QoE acks flowing
-        // with decode+render time zero on EVERY frame of a whole window), so a
-        // rendering client is effectively never touched. `MACRDP_BLANK_RECOVERY=0`
-        // is the kill switch; the window tunables are for experimentation.
+        // Automatic QoE-based recovery is experimental and OFF by default:
+        // healthy, interactive mstsc sessions can also report zero EDR.
+        // Only explicit opt-in may activate the historical thresholds below.
         // min_qoe 24 ≈ 3 s of active decoding (callbacks arrive ~8/s, per DVC
         // batch — measured live). max_attempts 1 = drop straight away (the
         // remap was live-verified never to heal mstsc; ≥2 re-enables
         // remap-first). max_consecutive_drops caps the cross-connection
         // drop → reconnect → blank → drop loop on a truly-stuck client.
-        let blank_recovery_enabled = match std::env::var("MACRDP_BLANK_RECOVERY") {
-            Ok(v) => !(v == "0" || v.eq_ignore_ascii_case("false")),
-            Err(_) => true,
-        };
+        let blank_recovery_enabled =
+            blank_recovery_opted_in(std::env::var("MACRDP_BLANK_RECOVERY").ok().as_deref());
+        if blank_recovery_enabled {
+            warn!("EXPERIMENTAL QoE-based blank recovery explicitly enabled; QoE timing does not prove missing presentation and this heuristic may reactivate or disconnect a healthy session");
+        } else {
+            info!("Automatic QoE-based blank recovery disabled (default); zero render timing alone will not reactivate or disconnect the session");
+        }
         // These two RTT knobs allow an explicit 0 (= "disable"), unlike env_u32
         // whose zero-filter falls back to the default.
         let env_u32_zero_ok = |name: &str, default: u32| -> u32 {
@@ -1794,6 +1816,7 @@ impl Gfx {
             .map(|s| !matches!(s.trim(), "0" | "false" | "off" | "no"))
             .unwrap_or(true);
         let blank_params = BlankRecoveryParams {
+            enabled: blank_recovery_enabled,
             min_qoe_reports: u64::from(env_u32("MACRDP_BLANK_RECOVERY_MIN_QOE", 24)),
             min_render_reports: u64::from(env_u32("MACRDP_BLANK_RECOVERY_MIN_RENDER_REPORTS", 3)),
             established_render_reports: u64::from(env_u32(
@@ -1906,7 +1929,6 @@ impl Gfx {
             stretched_keyframe_frames,
             congestion_retransmits,
             adaptive_min_fps_interval,
-            blank_recovery_enabled,
             blank_params,
             consecutive_blank_drops: Arc::new(AtomicU32::new(0)),
             link_rtt_ms,
@@ -2064,16 +2086,12 @@ impl Gfx {
             if ctx.surface_id.is_none() || ctx.encoder.is_none() {
                 self.setup_locked(ctx)?;
             }
-            // Blank-presentation detector (the mstsc reconnect-blank): the client
-            // is decoding + acking every frame (QoE reports flowing) but its
-            // reported decode+render time has been zero on every single one — it
-            // is compositing into a stale retained surface and never presenting
-            // (pcap-proven signature, 2026-07-02). Pull the recovery lever for
-            // this attempt: remap the output to a fresh surface, or (last
-            // attempt) drop the connection so the client auto-reconnects.
+            // Opt-in historical QoE heuristic. Zero timing is not proof of a
+            // blank screen; only an explicitly enabled experiment may use it
+            // to remap/reactivate or drop a connection.
             // Decision here (under ctx), action after the guard drops.
             // `qoe_reports` resets so a re-fire needs a fresh all-zero window.
-            if self.blank_recovery_enabled && ctx.surface_id.is_some() {
+            if self.blank_params.enabled && ctx.surface_id.is_some() {
                 // A GENUINELY-ESTABLISHED connection clears the reconnect-storm
                 // guard: the consecutive-drop counter only tracks UNBROKEN runs
                 // of blank-dropped connections (see `blank_drop_capped`).
@@ -2155,17 +2173,7 @@ impl Gfx {
                     )
                 }) {
                     let attempt_no = ctx.blank_recovery_attempts + 1;
-                    let action = if self.blank_params.reactivate {
-                        // Experimental: first fire = bare core reactivation;
-                        // later fires fall through to the drop.
-                        if attempt_no == 1 {
-                            BlankAction::Reactivate
-                        } else {
-                            BlankAction::Drop
-                        }
-                    } else {
-                        blank_action(attempt_no, self.blank_params.max_attempts)
-                    };
+                    let action = blank_recovery_action(attempt_no, &self.blank_params);
                     let drops_so_far = self.consecutive_blank_drops.load(Ordering::Relaxed);
                     if action == BlankAction::Drop
                         && blank_drop_capped(drops_so_far, self.blank_params.max_consecutive_drops)
@@ -2181,10 +2189,10 @@ impl Gfx {
                         warn!(
                             consecutive_blank_drops = drops_so_far,
                             cap = self.blank_params.max_consecutive_drops,
-                            "EGFX blank persisted across every auto-reconnect — giving up on \
-                             automatic recovery for this client (it re-lands on its stale \
-                             surface every time). Fully close and reopen the RDP client \
-                             window to clear its surface cache."
+                            "EXPERIMENTAL QoE recovery reached its reconnect limit; further \
+                             automatic drops are disabled. Timing does not verify desktop \
+                             visibility. If the screen is actually blank, fully close and \
+                             reopen the RDP client window."
                         );
                     } else {
                         ctx.blank_recovery_attempts += 1;
@@ -2239,9 +2247,8 @@ impl Gfx {
                             window_reports,
                             window_zeros,
                             window_best_render_run = window_best_run,
-                            "EGFX client is decoding but not presenting (QoE decode+render \
-                             time zero across the whole window — the reconnect-blank) — \
-                             running blank recovery"
+                            "EXPERIMENTAL QoE blank-recovery heuristic matched; \
+                             timing metrics do not prove a blank desktop — running opted-in recovery"
                         );
                     }
                 }
@@ -2814,7 +2821,6 @@ impl Gfx {
         // stats: publish the per-connection baseline (no-op unless --stats-endpoint).
         if let Some(s) = crate::stats::global() {
             let (w, h) = ctx.dims;
-            s.connected.store(true, Ordering::Relaxed);
             s.width.store(u32::from(w), Ordering::Relaxed);
             s.height.store(u32::from(h), Ordering::Relaxed);
             s.ceiling_bps.store(self.bitrate_bps, Ordering::Relaxed);
@@ -3067,12 +3073,12 @@ impl Gfx {
             .clone()
             .ok_or_else(|| anyhow!("EGFX blank drop: server-event sender not set"))?;
         warn!(
-            "EGFX blank recovery: dropping the connection so the client auto-reconnects \
-             via the auto-reconnect cookie (a fresh connection usually renders)"
+            "EXPERIMENTAL QoE blank recovery: dropping the connection after explicit opt-in; \
+             the client may auto-reconnect, but a blank desktop is not proven"
         );
         sender
             .send(ServerEvent::Quit(
-                "EGFX blank recovery: client decodes but never presents".into(),
+                "Experimental QoE-based recovery requested a reconnect".into(),
             ))
             .map_err(|_| anyhow!("EGFX blank drop: ServerEvent send failed"))?;
         Ok(())
@@ -3596,11 +3602,9 @@ impl GraphicsPipelineHandler for GfxHandler {
     }
 
     /// Inbound client QoE frame-acknowledge. Feeds the blank-presentation
-    /// detector (see [`should_blank_recover`]): `time_diff_dr` is the client's own
-    /// decode+render time for the frame — a blank (stale-surface) mstsc session
-    /// reports it as 0 on EVERY frame while still decoding/acking normally,
-    /// whereas a rendering session shows nonzero values within ~60 ms of the
-    /// first frame (pcap-proven 2026-07-02). Runs with the server mutex held
+    /// experimental detector (see [`should_blank_recover`]): `time_diff_dr` is
+    /// a millisecond render timing, not a presentation-success flag. Zero is
+    /// valid and does not prove a blank desktop. Runs with the server mutex held
     /// (like `on_frame_ack`), so it only touches ctx — never `server_handle`.
     fn on_qoe_metrics(&mut self, metrics: QoeMetrics) {
         trace!(?metrics, "EGFX on_qoe_metrics");
@@ -3627,9 +3631,8 @@ impl GraphicsPipelineHandler for GfxHandler {
                     frame_id = metrics.frame_id,
                     time_diff_dr = metrics.time_diff_dr,
                     since_attempt_ms = ctx.last_blank_recovery_at.elapsed().as_millis() as u64,
-                    "EGFX first QoE report after a blank-recovery attempt (nonzero = the \
-                     client claims to be presenting; only a SUSTAINED run confirms the heal — \
-                     otherwise the heal-confirmation deadline escalates)"
+                    "EGFX first QoE report after an experimental recovery attempt; \
+                     timing alone does not confirm whether the desktop is visible"
                 );
             }
             // Durable clean-presentation latch (v0.9.2): once the connection has
@@ -3646,8 +3649,8 @@ impl GraphicsPipelineHandler for GfxHandler {
                 ctx.qoe.presented_clean = true;
                 debug!(
                     nonzero_streak = ctx.qoe.nonzero_streak,
-                    "EGFX connection presented cleanly before any recovery — blank detector \
-                     latched off for this connection"
+                    "EGFX sustained nonzero QoE timing before recovery — experimental heuristic \
+                     latched off for this connection (presentation not independently verified)"
                 );
             }
             if metrics.time_diff_dr > 0 && was.nonzero_streak == 0 {
@@ -3655,9 +3658,7 @@ impl GraphicsPipelineHandler for GfxHandler {
                     frame_id = metrics.frame_id,
                     time_diff_dr = metrics.time_diff_dr,
                     zero_streak_broken = was.zero_streak,
-                    "EGFX nonzero QoE decode+render time — client is presenting (the blank \
-                     detector disarms once the nonzero run is sustained, and re-arms if it \
-                     lapses back to zero)"
+                    "EGFX nonzero QoE render timing — informational metric, not proof of desktop visibility"
                 );
             }
             // stats: keep RTT live for mstsc sessions even without
@@ -4947,6 +4948,9 @@ mod tests {
 
     fn blank_params() -> BlankRecoveryParams {
         BlankRecoveryParams {
+            // These tests intentionally exercise the explicitly enabled legacy
+            // heuristic. The default-off policy is covered separately below.
+            enabled: true,
             min_qoe_reports: 120,
             // 3 = the production default; the sustained-disarm tests assert
             // against this value directly.
@@ -4984,6 +4988,86 @@ mod tests {
             post_attempt_burst_zeros: 3,
             post_attempt_burst_window: ms(10_000),
             reactivate: false,
+        }
+    }
+
+    #[test]
+    fn blank_recovery_requires_an_explicit_recognized_opt_in() {
+        assert!(!blank_recovery_opted_in(None));
+        for value in [
+            "",
+            "0",
+            "false",
+            "off",
+            "no",
+            "2",
+            "enabled",
+            "tru",
+            " default ",
+        ] {
+            assert!(!blank_recovery_opted_in(Some(value)), "{value}");
+        }
+        for value in ["1", "true", "on", "yes", " TRUE ", "On", " YES "] {
+            assert!(blank_recovery_opted_in(Some(value)), "{value}");
+        }
+    }
+
+    #[test]
+    fn normal_sessions_with_repeated_zero_qoe_never_recover_without_opt_in() {
+        // The reported incident: a visible, interactive mstsc session emits
+        // repeated zero timings. Feed the real decision function far beyond
+        // every count/time threshold, including the post-attempt drop path.
+        for setting in [None, Some("0"), Some("false"), Some("unknown"), Some("")] {
+            let mut params = production_like_blank_params();
+            params.enabled = blank_recovery_opted_in(setting);
+            params.reactivate = true;
+            let mut evidence = QoeEvidence::default();
+            for _ in 0..1_000 {
+                evidence.record(0);
+                for attempts in [0, 1] {
+                    let action = should_blank_recover(
+                        evidence,
+                        true,
+                        false,
+                        ms(120_000),
+                        ms(120_000),
+                        ms(120_000),
+                        attempts,
+                        true,
+                        Some(ms(100)),
+                        &params,
+                    )
+                    .then(|| blank_recovery_action(attempts + 1, &params));
+                    assert_eq!(action, None, "setting={setting:?}, attempts={attempts}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn explicit_opt_in_preserves_the_experimental_reactivate_then_drop_path() {
+        let mut params = production_like_blank_params();
+        params.enabled = blank_recovery_opted_in(Some("yes"));
+        params.reactivate = true;
+        let mut evidence = QoeEvidence::default();
+        for _ in 0..200 {
+            evidence.record(0);
+        }
+        for (attempts, expected) in [(0, BlankAction::Reactivate), (1, BlankAction::Drop)] {
+            let action = should_blank_recover(
+                evidence,
+                true,
+                false,
+                ms(120_000),
+                ms(120_000),
+                ms(120_000),
+                attempts,
+                true,
+                Some(ms(100)),
+                &params,
+            )
+            .then(|| blank_recovery_action(attempts + 1, &params));
+            assert_eq!(action, Some(expected));
         }
     }
 

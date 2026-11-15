@@ -22,16 +22,14 @@
 
 use std::net::Ipv4Addr;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
-/// The live snapshot. Every field is an atomic so the encode path can update it
-/// lock-free; the listener reads it under no lock either. Values are best-effort
-/// and eventually-consistent — a slightly stale read between updates is fine for
-/// a status display. "Connected" is set at EGFX setup and cleared, with the
-/// other per-session values, by [`SessionStats::session_ended`] when the
-/// served connection ends.
+/// Encoder counters remain lock-free and best-effort. Display measurements
+/// are published as one coherent snapshot, independent of the selected codec.
+/// Connection state belongs to DisplayLifecycle, never encoder initialization.
 #[derive(Default)]
 pub struct SessionStats {
+    display: Mutex<DisplaySnapshot>,
     pub connected: AtomicBool,
     pub width: AtomicU32,
     pub height: AtomicU32,
@@ -72,24 +70,147 @@ impl SessionStats {
     }
 
     fn to_json(&self) -> String {
-        format!(
-            concat!(
-                "{{\"connected\":{},\"width\":{},\"height\":{},\"bitrate_bps\":{},",
-                "\"ceiling_bps\":{},\"rtt_ms\":{},\"queue_delay_ms\":{},\"fps\":{},",
-                "\"frames_sent\":{},\"adaptive\":{},\"aac\":{}}}"
-            ),
-            self.connected.load(Ordering::Relaxed),
-            self.width.load(Ordering::Relaxed),
-            self.height.load(Ordering::Relaxed),
-            self.bitrate_bps.load(Ordering::Relaxed),
-            self.ceiling_bps.load(Ordering::Relaxed),
-            self.rtt_ms.load(Ordering::Relaxed),
-            self.queue_delay_ms.load(Ordering::Relaxed),
-            self.fps.load(Ordering::Relaxed),
-            self.frames_sent.load(Ordering::Relaxed),
-            self.adaptive.load(Ordering::Relaxed),
-            self.aac.load(Ordering::Relaxed),
-        )
+        let display = self
+            .display
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone();
+        let metadata = metadata().lock().unwrap_or_else(|p| p.into_inner()).clone();
+        serde_json::json!({
+            "schema_version": 2,
+            "build_commit": metadata.build_commit,
+            "config_revision": metadata.config_revision,
+            "process": { "pid": std::process::id() },
+            "startup": { "phase": metadata.phase, "screen_recording": metadata.screen_recording,
+                         "accessibility": metadata.accessibility },
+            "connected": self.connected.load(Ordering::Relaxed),
+            "width": self.width.load(Ordering::Relaxed),
+            "height": self.height.load(Ordering::Relaxed),
+            "bitrate_bps": self.bitrate_bps.load(Ordering::Relaxed),
+            "ceiling_bps": self.ceiling_bps.load(Ordering::Relaxed),
+            "rtt_ms": self.rtt_ms.load(Ordering::Relaxed),
+            "queue_delay_ms": self.queue_delay_ms.load(Ordering::Relaxed),
+            "fps": self.fps.load(Ordering::Relaxed),
+            "frames_sent": self.frames_sent.load(Ordering::Relaxed),
+            "adaptive": self.adaptive.load(Ordering::Relaxed),
+            "aac": self.aac.load(Ordering::Relaxed),
+            "display": display.json()
+        })
+        .to_string()
+    }
+
+    pub fn update_display(&self, update: impl FnOnce(&mut DisplaySnapshot)) {
+        update(&mut self.display.lock().unwrap_or_else(|p| p.into_inner()));
+    }
+}
+
+/// One coherent display snapshot. Unknown measurements stay null, never inferred
+/// from the requested mode. Published by capture for both H.264 and bitmap paths.
+#[derive(Clone, Debug)]
+pub struct DisplaySnapshot {
+    pub session_generation: u64,
+    pub request_sequence: u64,
+    pub layout_generation: u64,
+    pub phase: &'static str,
+    pub request_source: Option<&'static str>,
+    pub requested_width: Option<u16>,
+    pub requested_height: Option<u16>,
+    pub requested_scale: Option<u32>,
+    pub wire_width: Option<u16>,
+    pub wire_height: Option<u16>,
+    pub actual: crate::virtual_display::DisplayMeasurement,
+    pub fallback_reason: Option<String>,
+}
+impl Default for DisplaySnapshot {
+    fn default() -> Self {
+        Self {
+            session_generation: 0,
+            request_sequence: 0,
+            layout_generation: 0,
+            phase: "idle",
+            request_source: None,
+            requested_width: None,
+            requested_height: None,
+            requested_scale: None,
+            wire_width: None,
+            wire_height: None,
+            actual: Default::default(),
+            fallback_reason: None,
+        }
+    }
+}
+impl DisplaySnapshot {
+    /// A latest layout may cancel an earlier pending drag by returning to the
+    /// applied mode. The previous measurement remains valid, so leave applying.
+    pub fn finish_unchanged_request(&mut self, negotiated: (u16, u16)) {
+        if self.wire_width.zip(self.wire_height) == Some(negotiated) {
+            self.phase = if self.fallback_reason.is_some() {
+                "degraded"
+            } else {
+                "active"
+            };
+        }
+    }
+    fn json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "session_generation": self.session_generation, "request_sequence": self.request_sequence,
+            "phase": self.phase, "layout_generation": self.layout_generation,
+            "requested": { "source": self.request_source, "width": self.requested_width, "height": self.requested_height,
+                           "scale_percent": self.requested_scale },
+            "wire": { "width": self.wire_width, "height": self.wire_height },
+            "actual": { "display_id": self.actual.display_id,
+                "points_width": self.actual.points_width, "points_height": self.actual.points_height,
+                "backing_width": self.actual.backing_width, "backing_height": self.actual.backing_height,
+                "scale_percent": self.actual.scale_percent,
+                "backing_scale_percent": self.actual.backing_scale_percent,
+                "native_capture": self.actual.native_capture },
+            "fallback_reason": self.fallback_reason
+        })
+    }
+}
+#[derive(Clone)]
+struct Metadata {
+    build_commit: Option<String>,
+    config_revision: Option<String>,
+    phase: String,
+    screen_recording: Option<bool>,
+    accessibility: Option<bool>,
+}
+fn metadata() -> &'static Mutex<Metadata> {
+    static META: OnceLock<Mutex<Metadata>> = OnceLock::new();
+    META.get_or_init(|| {
+        Mutex::new(Metadata {
+            build_commit: None,
+            config_revision: None,
+            phase: "starting".into(),
+            screen_recording: None,
+            accessibility: None,
+        })
+    })
+}
+pub fn set_metadata(build_commit: Option<&str>, config_revision: Option<&str>) {
+    let mut m = metadata().lock().unwrap_or_else(|p| p.into_inner());
+    m.build_commit = build_commit.map(str::to_owned);
+    m.config_revision = config_revision.map(str::to_owned);
+}
+pub fn set_startup(phase: &str, screen_recording: Option<bool>, accessibility: Option<bool>) {
+    let mut m = metadata().lock().unwrap_or_else(|p| p.into_inner());
+    m.phase = phase.to_owned();
+    m.screen_recording = screen_recording;
+    m.accessibility = accessibility;
+}
+
+/// The listener exists, but permission readiness is independently verified by
+/// main. A listening socket alone is insufficient to claim usable capture/input.
+pub fn mark_listening() {
+    let mut m = metadata().lock().unwrap_or_else(|p| p.into_inner());
+    m.phase = readiness_after_listen(m.screen_recording, m.accessibility).to_owned();
+}
+fn readiness_after_listen(screen: Option<bool>, input: Option<bool>) -> &'static str {
+    match (screen, input) {
+        (Some(true), Some(true)) => "ready",
+        (Some(false), _) | (_, Some(false)) => "permission_required",
+        _ => "starting",
     }
 }
 
@@ -167,11 +288,74 @@ mod tests {
         let j = s.to_json();
         // Spot-check a few fields + that it's a single line with the expected keys.
         assert!(j.starts_with('{') && j.ends_with('}'));
+        let v: serde_json::Value = serde_json::from_str(&j).unwrap();
+        assert_eq!(v["schema_version"], 2);
+        assert!(v["display"]["actual"]["backing_width"].is_null());
         assert!(!j.contains('\n'));
         assert!(j.contains("\"connected\":true"));
         assert!(j.contains("\"width\":1920"));
         assert!(j.contains("\"bitrate_bps\":4000000"));
         assert!(j.contains("\"fps\":60"));
+    }
+
+    #[test]
+    fn display_status_is_independent_of_encoder_and_preserves_unknowns() {
+        let stats = SessionStats::default();
+        stats.update_display(|d| {
+            d.phase = "degraded";
+            d.wire_width = Some(3840);
+            d.wire_height = Some(2160);
+            d.actual.points_width = Some(3840.0);
+            d.actual.scale_percent = Some(100.0);
+            d.fallback_reason = Some("mode failed: \"density\"\nretry".into());
+        });
+        let json: serde_json::Value = serde_json::from_str(&stats.to_json()).unwrap();
+        assert_eq!(json["frames_sent"], 0);
+        assert_eq!(json["display"]["wire"]["width"], 3840);
+        assert_eq!(json["display"]["actual"]["scale_percent"], 100.0);
+        assert!(json["display"]["actual"]["backing_width"].is_null());
+        assert!(json["display"]["requested"]["width"].is_null());
+        assert_eq!(
+            json["display"]["fallback_reason"],
+            "mode failed: \"density\"\nretry"
+        );
+    }
+
+    #[test]
+    fn cancelled_pending_layout_restores_measured_status() {
+        let mut display = DisplaySnapshot {
+            phase: "applying",
+            ..Default::default()
+        };
+        display.finish_unchanged_request((3840, 2160));
+        assert_eq!(display.phase, "applying", "no measurements yet");
+        display.wire_width = Some(3840);
+        display.wire_height = Some(2160);
+        display.finish_unchanged_request((1920, 1080));
+        assert_eq!(
+            display.phase, "applying",
+            "reactivation still has the previous measured wire size"
+        );
+        display.finish_unchanged_request((3840, 2160));
+        assert_eq!(display.phase, "active");
+        display.phase = "applying";
+        display.fallback_reason = Some("density fallback".into());
+        display.finish_unchanged_request((3840, 2160));
+        assert_eq!(display.phase, "degraded");
+    }
+
+    #[test]
+    fn listening_requires_verified_permissions_to_claim_ready() {
+        assert_eq!(readiness_after_listen(Some(true), Some(true)), "ready");
+        assert_eq!(readiness_after_listen(None, Some(true)), "starting");
+        assert_eq!(
+            readiness_after_listen(Some(true), Some(false)),
+            "permission_required"
+        );
+        assert_eq!(
+            readiness_after_listen(Some(false), None),
+            "permission_required"
+        );
     }
 
     #[test]

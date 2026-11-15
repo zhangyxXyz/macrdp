@@ -14,6 +14,15 @@ use tracing::trace;
 /// given. Mirrors the `display_suppressed` shared-flag pattern.
 pub type SharedKeyboardLayout = std::sync::Arc<std::sync::atomic::AtomicU32>;
 
+// Display changes initiated by the server must invalidate the mouse mapping
+// immediately. The TTL below still handles external arrangement changes.
+static DISPLAY_BOUNDS_GENERATION: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+pub fn invalidate_display_bounds() {
+    DISPLAY_BOUNDS_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Release);
+}
+
 pub struct MacInputHandler {
     /// Live session desktop size, shared with `CaptureDisplay`. Read per
     /// mouse event (not copied at construction) so coordinate scaling stays
@@ -89,7 +98,7 @@ impl RdpServerInputHandler for MacInputHandler {
         }
         #[cfg(target_os = "macos")]
         {
-            let (width, height) = self.desktop_size.get();
+            let (width, height) = self.desktop_size.get_for_input();
             let letterbox = self.desktop_size.letterbox();
             self.inner.mouse(event, width, height, letterbox);
         }
@@ -1002,6 +1011,7 @@ mod macos {
         // reconfig mis-maps moves for < the TTL before self-correcting.
         cached_bounds: Option<(f64, f64, f64, f64)>,
         bounds_cached_at: Instant,
+        bounds_generation: u64,
         // Per-button click history so a quick second press at (roughly) the
         // same spot becomes click_count=2 and Finder recognises a double-
         // click. Without this every press has click_count=1 implicitly and
@@ -1115,6 +1125,7 @@ mod macos {
                 target_display_id,
                 cached_bounds: None,
                 bounds_cached_at: Instant::now(),
+                bounds_generation: 0,
                 click_left: None,
                 click_right: None,
                 click_middle: None,
@@ -1134,9 +1145,8 @@ mod macos {
 
         /// How long a `target_bounds` result may be served from cache. Long
         /// enough to shed the per-mouse-move CoreGraphics query (hundreds/s
-        /// during a drag), short enough that a display reconfiguration (rare;
-        /// e.g. --detach-primary engaging at connect) mis-maps coords for at
-        /// most a quarter second before self-correcting.
+        /// during a drag). Server-driven changes invalidate the cache directly;
+        /// this TTL catches external display arrangement changes.
         const BOUNDS_CACHE_TTL: Duration = Duration::from_millis(250);
 
         /// Current global-coord bounds of the target display. Re-queried
@@ -1145,8 +1155,12 @@ mod macos {
         /// built-in panel) doesn't leave us posting to a stale rectangle,
         /// without paying a CG display lookup on every mouse move.
         fn target_bounds(&mut self) -> (f64, f64, f64, f64) {
+            let generation =
+                super::DISPLAY_BOUNDS_GENERATION.load(std::sync::atomic::Ordering::Acquire);
             if let Some(b) = self.cached_bounds {
-                if self.bounds_cached_at.elapsed() < Self::BOUNDS_CACHE_TTL {
+                if self.bounds_generation == generation
+                    && self.bounds_cached_at.elapsed() < Self::BOUNDS_CACHE_TTL
+                {
                     return b;
                 }
             }
@@ -1158,6 +1172,7 @@ mod macos {
             let bounds = (b.origin.x, b.origin.y, b.size.width, b.size.height);
             self.cached_bounds = Some(bounds);
             self.bounds_cached_at = Instant::now();
+            self.bounds_generation = generation;
             bounds
         }
 

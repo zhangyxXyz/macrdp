@@ -120,78 +120,143 @@ pub const RESIZE_DEBOUNCE: Duration = Duration::from_millis(400);
 /// monitor-layout PDU the client sends; the capture loop calls
 /// [`PendingResize::take_settled`] each iteration and only acts once
 /// [`RESIZE_DEBOUNCE`] has passed since the *last* PDU, so a multi-tick drag
-/// produces one resize, not one per tick. Same epoch+millis pattern as
-/// [`ClickSignal`] — one `Arc`, lock-free.
+/// produces one resize, not one per tick. The size and receive time are
+/// published together under a short mutex so they cannot be read out of step.
 #[derive(Clone)]
 pub struct PendingResize {
     inner: Arc<PendingResizeInner>,
 }
 
 struct PendingResizeInner {
-    epoch: Instant,
-    /// Packed size of the most recently requested resize. Meaningless while
-    /// `last_update_ms == 0`.
-    size: AtomicU32,
-    /// Milliseconds since `epoch` of the last `request()` call; 0 = no
-    /// pending request (never requested, or already consumed).
-    last_update_ms: AtomicU64,
+    // Size and timestamp are one publication: two independent relaxed atomics
+    // can let the reader consume a new size against the previous timestamp.
+    latest: std::sync::Mutex<Option<(Instant, (u16, u16))>>,
 }
-
 impl PendingResize {
     pub fn new() -> Self {
         Self {
             inner: Arc::new(PendingResizeInner {
-                epoch: Instant::now(),
-                size: AtomicU32::new(0),
-                last_update_ms: AtomicU64::new(0),
+                latest: std::sync::Mutex::new(None),
             }),
         }
     }
-
-    fn now_ms(&self) -> u64 {
-        self.inner.epoch.elapsed().as_millis() as u64
-    }
-
-    /// Record a resize request "now", superseding any not-yet-settled
-    /// request — only the most recent size in a drag matters.
     pub fn request(&self, width: u16, height: u16) {
-        self.inner
-            .size
-            .store(pack_size(width, height), Ordering::Relaxed);
-        // max(1) so a request at t≈0 isn't mistaken for "none pending".
-        self.inner
-            .last_update_ms
-            .store(self.now_ms().max(1), Ordering::Relaxed);
+        *self.inner.latest.lock().unwrap_or_else(|p| p.into_inner()) =
+            Some((Instant::now(), (width, height)));
     }
-
-    /// True if a request is outstanding (settled or not yet). The capture
-    /// loop uses this to decide whether to poll on a bounded timeout instead
-    /// of blocking indefinitely on the next camera sample.
+    pub fn clear(&self) {
+        *self.inner.latest.lock().unwrap_or_else(|p| p.into_inner()) = None;
+    }
     pub fn has_pending(&self) -> bool {
-        self.inner.last_update_ms.load(Ordering::Relaxed) != 0
+        self.inner
+            .latest
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .is_some()
     }
-
-    /// If a request has been outstanding for at least `debounce` with no
-    /// newer request superseding it, consume and return it. Returns `None`
-    /// if nothing is pending or it hasn't settled yet.
     pub fn take_settled(&self, debounce: Duration) -> Option<(u16, u16)> {
-        let last_ms = self.inner.last_update_ms.load(Ordering::Relaxed);
-        if last_ms == 0 {
-            return None;
-        }
-        if self.now_ms().saturating_sub(last_ms) < debounce.as_millis() as u64 {
-            return None;
-        }
-        // Only consume if nothing newer raced in since we read `last_ms`.
-        if self
-            .inner
-            .last_update_ms
-            .compare_exchange(last_ms, 0, Ordering::Relaxed, Ordering::Relaxed)
-            .is_err()
+        let mut latest = self.inner.latest.lock().unwrap_or_else(|p| p.into_inner());
+        if latest
+            .as_ref()
+            .is_some_and(|(when, _)| when.elapsed() >= debounce)
         {
-            return None;
+            latest.take().map(|(_, size)| size)
+        } else {
+            None
         }
-        Some(unpack_size(self.inner.size.load(Ordering::Relaxed)))
+    }
+}
+
+/// Connection-scoped transient display state. Reactivation deliberately does
+/// not begin a new session; only the server's fresh-connection hook does.
+pub struct DisplayLifecycle {
+    epoch: AtomicU64,
+    sequence: AtomicU64,
+    layout_generation: AtomicU64,
+    active: AtomicBool,
+    pending: PendingResize,
+    suppress: Arc<AtomicBool>,
+}
+impl DisplayLifecycle {
+    pub fn new() -> Self {
+        Self {
+            epoch: AtomicU64::new(0),
+            sequence: AtomicU64::new(0),
+            layout_generation: AtomicU64::new(0),
+            active: AtomicBool::new(false),
+            pending: PendingResize::new(),
+            suppress: Arc::new(AtomicBool::new(false)),
+        }
+    }
+    pub fn pending_resize(&self) -> PendingResize {
+        self.pending.clone()
+    }
+    pub fn suppress_next_adopt(&self) -> Arc<AtomicBool> {
+        self.suppress.clone()
+    }
+    pub fn begin(&self, scale: Option<u32>) {
+        self.active.store(false, Ordering::SeqCst);
+        self.epoch.fetch_add(1, Ordering::SeqCst);
+        self.sequence.store(0, Ordering::SeqCst);
+        self.layout_generation.store(0, Ordering::SeqCst);
+        self.pending.clear();
+        self.suppress.store(false, Ordering::SeqCst);
+        self.active.store(true, Ordering::SeqCst);
+        if let Some(stats) = crate::stats::global() {
+            stats.connected.store(true, Ordering::Relaxed);
+            stats.update_display(|d| {
+                *d = Default::default();
+                d.session_generation = self.epoch.load(Ordering::SeqCst);
+                d.requested_scale = scale;
+                d.phase = "applying";
+            });
+        }
+    }
+    pub fn end(&self) {
+        self.active.store(false, Ordering::SeqCst);
+        self.pending.clear();
+        self.suppress.store(false, Ordering::SeqCst);
+        if let Some(stats) = crate::stats::global() {
+            stats.connected.store(false, Ordering::Relaxed);
+            stats.update_display(|d| {
+                let generation = d.session_generation;
+                *d = Default::default();
+                d.session_generation = generation;
+            });
+        }
+    }
+    fn request(&self) -> (u64, u64) {
+        let seq = self.sequence.fetch_add(1, Ordering::SeqCst) + 1;
+        let token = (self.epoch.load(Ordering::SeqCst), seq);
+        if let Some(stats) = crate::stats::global() {
+            stats.update_display(|d| {
+                d.session_generation = token.0;
+                d.request_sequence = token.1;
+            });
+        }
+        token
+    }
+    fn advance_layout(&self) -> (u64, u64) {
+        self.layout_generation.fetch_add(1, Ordering::SeqCst);
+        let token = self.token();
+        if let Some(stats) = crate::stats::global() {
+            stats.update_display(|d| d.layout_generation = token.1);
+        }
+        token
+    }
+    fn token(&self) -> (u64, u64) {
+        (
+            self.epoch.load(Ordering::SeqCst),
+            self.layout_generation.load(Ordering::SeqCst),
+        )
+    }
+    fn is_current(&self, token: (u64, u64)) -> bool {
+        self.active.load(Ordering::SeqCst) && self.token() == token
+    }
+}
+impl Default for DisplayLifecycle {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -212,6 +277,9 @@ impl Default for PendingResize {
 #[derive(Clone)]
 pub struct SharedDesktopSize {
     packed: Arc<AtomicU32>,
+    /// Input keeps the previous negotiated size until the matching display
+    /// mode has settled. Publishing a new wire size alone is not a mapping.
+    input_packed: Arc<AtomicU32>,
     /// True when capture is letterboxing/pillarboxing (preserving the Mac's
     /// aspect ratio inside a differently-shaped client frame) rather than
     /// stretching to fill. `input.rs` reads this so mouse coords map into the
@@ -223,6 +291,7 @@ impl SharedDesktopSize {
     pub fn new(width: u16, height: u16) -> Self {
         Self {
             packed: Arc::new(AtomicU32::new(pack_size(width, height))),
+            input_packed: Arc::new(AtomicU32::new(pack_size(width, height))),
             letterbox: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -234,6 +303,15 @@ impl SharedDesktopSize {
     pub fn set(&self, width: u16, height: u16) {
         self.packed
             .store(pack_size(width, height), Ordering::Relaxed);
+    }
+
+    pub fn get_for_input(&self) -> (u16, u16) {
+        unpack_size(self.input_packed.load(Ordering::Acquire))
+    }
+
+    pub fn commit_input_size(&self, width: u16, height: u16) {
+        self.input_packed
+            .store(pack_size(width, height), Ordering::Release);
     }
 
     pub fn set_letterbox(&self, on: bool) {
@@ -331,6 +409,8 @@ pub struct CaptureDisplay {
     /// `desktop_size` so capture, input scaling, and the H.264 pipeline
     /// all serve it.
     pub auto_size: bool,
+    pub live_resize: bool,
+    pub lifecycle: Arc<DisplayLifecycle>,
     /// Opt out of aspect-preserving letterbox on the auto-size path: stretch the
     /// Mac screen to fill the client frame (the old default) instead of adding
     /// black bars. Only relevant when `auto_size` is scaling to a non-native
@@ -407,18 +487,15 @@ pub struct CaptureDisplay {
     /// size. See `request_initial_size`'s doc comment for why this exists.
     pub suppress_next_adopt: Arc<AtomicBool>,
     /// The `--virtual-display` this session serves, when there is one.
-    /// Shared with `main.rs`, which created it. Enables live client-driven
-    /// resize on the virtual-display path:
-    /// `request_layout` accepts the request even though `auto_size` is
-    /// pinned off there, and `updates()` re-modes the display to match
-    /// `desktop_size` before each capture stream is built.
+    /// Shared with `main.rs`, which created it. `updates()` re-modes it to
+    /// match the negotiated size and independent scale policy before capture.
     pub virtual_display: Option<Arc<std::sync::Mutex<crate::virtual_display::VirtualDisplay>>>,
     /// When the virtual display runs HiDPI (`--virtual-display-hidpi`). With
     /// `Auto`, decided per connection from the client's desktop scale factor
     /// in `sync_virtual_display`.
     pub vd_hidpi: crate::virtual_display::HidpiPolicy,
-    /// The session's UI scale for the pointer (see `pointer_scale`): set at
-    /// connect and from each monitor layout, and read live by the capture
+    /// Measured wire pixels per point, in percent, for the pointer. Published
+    /// after mode application and read live by the capture
     /// loop so a scale change resends the pointer.
     pub pointer_ui_scale: Arc<std::sync::atomic::AtomicU32>,
 
@@ -577,6 +654,62 @@ fn cap_client_size(client: DesktopSize, max: Option<DesktopSize>) -> DesktopSize
     }
 }
 
+fn pointer_factor(scale_percent: u32) -> f64 {
+    f64::from(scale_percent) / 100.0
+}
+
+fn aspect_preserving_scale(
+    actual: &crate::virtual_display::DisplayMeasurement,
+    wire: (u16, u16),
+) -> Option<f64> {
+    actual
+        .points_width
+        .zip(actual.points_height)
+        .map(|(w, h)| (f64::from(wire.0) / w).min(f64::from(wire.1) / h) * 100.0)
+}
+
+fn mode_fallback(
+    actual: &crate::virtual_display::DisplayMeasurement,
+    wire: (u16, u16),
+    ui_scale: u32,
+) -> Option<String> {
+    let mut reasons = Vec::new();
+    if actual
+        .scale_percent
+        .is_some_and(|s| (s - f64::from(ui_scale * 100)).abs() > 1.0)
+    {
+        reasons.push("macOS selected a different display scale (density fallback)");
+    }
+    if actual
+        .backing_width
+        .zip(actual.backing_height)
+        .is_some_and(|(w, h)| u32::from(wire.0) > w || u32::from(wire.1) > h)
+    {
+        reasons.push("wire resolution exceeds actual backing pixels; capture is upscaled");
+    }
+    (!reasons.is_empty()).then(|| reasons.join("; "))
+}
+
+/// Resolution and scale decisions are independent. A fixed desktop or a
+/// disabled live-resolution policy may still re-mode at the existing size.
+fn layout_target(
+    auto_size: bool,
+    live_resize: bool,
+    applied_scale: Option<u32>,
+    desired_scale: u32,
+    current: (u16, u16),
+    requested: DesktopSize,
+) -> Option<DesktopSize> {
+    adopt_client_size(auto_size && live_resize, current, requested).or_else(|| {
+        applied_scale
+            .is_some_and(|applied| applied != desired_scale)
+            .then_some(DesktopSize {
+                width: current.0,
+                height: current.1,
+            })
+    })
+}
+
 #[async_trait::async_trait]
 impl RdpServerDisplay for CaptureDisplay {
     async fn size(&mut self) -> DesktopSize {
@@ -612,10 +745,10 @@ impl RdpServerDisplay for CaptureDisplay {
             return DesktopSize { width, height };
         }
 
-        // A new connection (reactivations we trigger returned above). The
-        // server has just published the scale this client announced.
-        self.pointer_ui_scale
-            .store(self.vd_hidpi.ui_scale(), Ordering::Relaxed);
+        self.lifecycle.request();
+        // Confirm Active can echo the server's Demand Active dimensions.
+        // It is negotiation input, not a reliable original client request:
+        // leave requested dimensions unknown until a Monitor Layout arrives.
 
         let client_size = cap_client_size(client_size, self.max_client_size);
         if let Some(adopted) = adopt_client_size(self.auto_size, (width, height), client_size) {
@@ -641,11 +774,9 @@ impl RdpServerDisplay for CaptureDisplay {
     /// and calls this on every layout change — the default trait impl is a
     /// no-op debug log, which is why this used to silently do nothing).
     ///
-    /// Engages on the auto-adopt path (mirrors `request_initial_size`) AND on
-    /// the virtual-display path (`virtual_display` is `Some` — the display
-    /// itself is re-moded to the requested size in `updates()`, so the
-    /// session stays a 1:1 native capture at the new size). Still a no-op
-    /// for a pinned size (`--width`/`--height`/`--hidpi` without a vd).
+    /// Resolution follows the same policy as `request_initial_size`. A fixed
+    /// virtual display can still follow the client's scale independently of
+    /// its fixed wire resolution. `live_resize` only controls resolution.
     /// Debounced by the capture loop via `pending_resize` so a window drag
     /// (many PDUs/sec) produces one resize, not one per tick. Both codec
     /// paths ride the same core deactivation-reactivation; on the EGFX
@@ -656,16 +787,6 @@ impl RdpServerDisplay for CaptureDisplay {
     /// surface swap without the core reactivation was tried first and was
     /// visually broken on a real client).
     fn request_layout(&mut self, layout: ironrdp_displaycontrol::pdu::DisplayControlMonitorLayout) {
-        let resizable = self.auto_size || self.virtual_display.is_some();
-        if !resizable {
-            tracing::debug!(
-                "client requested a live resize (window drag) but the session size \
-                 is pinned (--no-client-resolution, or an explicit \
-                 --width/--height/--hidpi without a virtual display) — ignoring"
-            );
-            return;
-        }
-
         let Some(monitor) = layout
             .monitors()
             .iter()
@@ -675,18 +796,6 @@ impl RdpServerDisplay for CaptureDisplay {
             tracing::debug!("client sent a monitor layout with no monitors — ignoring");
             return;
         };
-
-        // Moving the client window between displays of different scale (a
-        // Retina panel and a 1x monitor) can change the scale with or without
-        // the size, so this re-modes even when the size is unchanged.
-        let scale_changed = self
-            .vd_hidpi
-            .observe_client_scale(monitor.desktop_scale_factor());
-        let layout_ui_scale = self.vd_hidpi.ui_scale();
-        // Read live by the capture loop, so a change resends the pointer even
-        // when this layout doesn't re-mode the display.
-        self.pointer_ui_scale
-            .store(layout_ui_scale, Ordering::Relaxed);
 
         let (w, h) = monitor.dimensions();
         let (Ok(width), Ok(height)) = (u16::try_from(w), u16::try_from(h)) else {
@@ -698,20 +807,48 @@ impl RdpServerDisplay for CaptureDisplay {
             return;
         };
 
+        self.lifecycle.request();
+        if let Some(stats) = crate::stats::global() {
+            stats.update_display(|d| {
+                d.requested_width = Some(width);
+                d.requested_height = Some(height);
+                d.request_source = Some("monitor_layout");
+                if let Some(scale) = monitor.desktop_scale_factor() {
+                    d.requested_scale = Some(scale);
+                }
+            });
+        }
+        // Scale is independent of resolution policy, including when live
+        // resolution updates are disabled. Publish pointer scale only after
+        // the actual mode is known, at the same boundary as input mapping.
+        self.vd_hidpi
+            .observe_client_scale(monitor.desktop_scale_factor());
+        // Compare against the applied mode, not the preceding PDU. Repeated
+        // 200% layouts during debounce must retain an unapplied 100→200 change.
+        let applied_scale = self.virtual_display.as_ref().map(|vd| {
+            vd.lock()
+                .expect("virtual display mutex poisoned")
+                .ui_scale()
+        });
+        self.pending_resize.clear();
         let requested = cap_client_size(DesktopSize { width, height }, self.max_client_size);
         let (cur_w, cur_h) = self.desktop_size.get();
-        let Some(adopted) = adopt_client_size(resizable, (cur_w, cur_h), requested) else {
-            // Size unchanged (or outside the protocol-legal band): only a
-            // scale change still needs a re-mode, at the current size.
-            if scale_changed {
-                tracing::info!(
-                    ui_scale = self.vd_hidpi.ui_scale(),
-                    "client display scale changed — re-moding at the same size (debounced)"
-                );
-                self.pending_resize.request(cur_w, cur_h);
+        let Some(adopted) = layout_target(
+            self.auto_size,
+            self.live_resize,
+            applied_scale,
+            self.vd_hidpi.ui_scale(),
+            (cur_w, cur_h),
+            requested,
+        ) else {
+            if let Some(stats) = crate::stats::global() {
+                stats.update_display(|d| d.finish_unchanged_request((cur_w, cur_h)));
             }
             return;
         };
+        if let Some(stats) = crate::stats::global() {
+            stats.update_display(|d| d.phase = "applying");
+        }
 
         tracing::info!(
             client_w = adopted.width,
@@ -730,9 +867,22 @@ impl RdpServerDisplay for CaptureDisplay {
         // mutex guard never lives across an await point (Send bound on the
         // returned future).
         let (width, height) = self.sync_virtual_display();
-        self.build_updates(width, height)
-            .await
-            .map_err(display_error)
+        self.desktop_size.commit_input_size(width, height);
+        crate::input::invalidate_display_bounds();
+        let result = self.build_updates(width, height).await;
+        if let Some(stats) = crate::stats::global() {
+            stats.update_display(|d| {
+                if let Err(error) = &result {
+                    d.fallback_reason = Some(format!("capture failed: {error:#}"));
+                }
+                d.phase = if d.fallback_reason.is_some() {
+                    "degraded"
+                } else {
+                    "active"
+                };
+            });
+        }
+        result.map_err(display_error)
     }
 }
 
@@ -744,32 +894,26 @@ impl CaptureDisplay {
     /// The factor is the session's pixels per point: with "Optimize for
     /// Retina displays" on, Windows App draws session pixels (pointer
     /// included) 1:1, so a 2x session needs a 2x pointer and a 1x session a
-    /// 1x one. With `Auto` it comes from `pointer_ui_scale`, which follows
-    /// the client's monitor layouts; `On` uses the session width over points.
+    /// 1x one. With `Auto` it comes from `pointer_ui_scale` (percent),
+    /// published from the measured mode; `On` uses session width over points.
     /// The pointer-scale cell for the capture loop to follow, with the
     /// `--cursor-scale` multiplier it applies on top. `Some` only for `Auto`
     /// on the HiDPI virtual display, where the pointer scale changes
     /// mid-capture.
     fn live_pointer_scale(&self) -> Option<(Arc<std::sync::atomic::AtomicU32>, f64)> {
-        let hidpi = self
-            .display_id
-            .is_some_and(crate::virtual_display::is_hidpi_virtual_display);
-        (hidpi && matches!(self.vd_hidpi, crate::virtual_display::HidpiPolicy::Auto(_)))
-            .then(|| (self.pointer_ui_scale.clone(), self.cursor_scale))
+        (self.virtual_display.is_some()
+            && matches!(self.vd_hidpi, crate::virtual_display::HidpiPolicy::Auto(_)))
+        .then(|| (self.pointer_ui_scale.clone(), self.cursor_scale))
     }
 
-    fn pointer_scale(&self, width: u16) -> f64 {
-        let hidpi = self
-            .display_id
-            .is_some_and(crate::virtual_display::is_hidpi_virtual_display);
-        if !hidpi {
-            return 1.0;
-        }
-        match self.vd_hidpi {
-            crate::virtual_display::HidpiPolicy::Auto(_) => {
-                f64::from(self.pointer_ui_scale.load(Ordering::Relaxed))
-            }
-            _ => f64::from(width) / self.screen_size_pts.0.max(1.0),
+    fn pointer_scale(&self, _width: u16) -> f64 {
+        if self.virtual_display.is_some() {
+            // A density fallback can make points larger than the wire, even
+            // though the display is no longer classified as Retina. It still
+            // needs the measured fractional pointer factor (for example 0.5).
+            pointer_factor(self.pointer_ui_scale.load(Ordering::Acquire))
+        } else {
+            1.0
         }
     }
 
@@ -782,11 +926,42 @@ impl CaptureDisplay {
     /// re-moding here means the fresh capture stream opens against a display
     /// that is already the right size (a 1:1 native capture, no SCK scaling,
     /// no letterbox). On failure the session must still come up, so fall
-    /// back to serving the display's actual current size. No-op without a
-    /// virtual display (mirror-primary).
+    /// back to scaling the actual mode into the already-negotiated wire size.
+    /// No-op without a virtual display (mirror-primary).
+    fn publish_mode(
+        &self,
+        width: u16,
+        height: u16,
+        mut actual: crate::virtual_display::DisplayMeasurement,
+        fallback: Option<String>,
+    ) {
+        let fitting_scale = aspect_preserving_scale(&actual, (width, height));
+        if self.auto_size && !self.stretch {
+            actual.scale_percent = fitting_scale;
+        }
+        // A stretched fallback has no single content scale. Keep the pointer
+        // undistorted and fitting within both axes while telemetry stays null.
+        if let Some(scale) = actual.scale_percent.or(fitting_scale) {
+            self.pointer_ui_scale
+                .store(scale.round().max(1.0) as u32, Ordering::Release);
+        }
+        if let Some(stats) = crate::stats::global() {
+            stats.width.store(u32::from(width), Ordering::Relaxed);
+            stats.height.store(u32::from(height), Ordering::Relaxed);
+            stats.update_display(|d| {
+                d.wire_width = Some(width);
+                d.wire_height = Some(height);
+                d.actual = actual;
+                d.fallback_reason = fallback;
+                d.phase = "applying";
+            });
+        }
+    }
+
     fn sync_virtual_display(&mut self) -> (u16, u16) {
         let (width, height) = self.desktop_size.get();
         let Some(vd) = self.virtual_display.clone() else {
+            self.publish_mode(width, height, Default::default(), None);
             return (width, height);
         };
         let mut vd = vd.lock().expect("virtual display mutex poisoned");
@@ -794,10 +969,19 @@ impl CaptureDisplay {
         // Compare in pixels: on a HiDPI vd the points are the session size
         // divided by the UI scale.
         if vd.mode_px() == (u32::from(width), u32::from(height)) && vd.ui_scale() == ui_scale {
+            let actual = vd.measurement(width, height);
+            let fallback = mode_fallback(&actual, (width, height), ui_scale);
+            self.publish_mode(width, height, actual, fallback);
             return (width, height);
         }
+        // Invalidate old delayed sweeps at the mode-application boundary.
+        // A duplicate/no-op PDU must not cancel a necessary post-mode sweep.
+        self.lifecycle.advance_layout();
         match vd.resize(u32::from(width), u32::from(height), ui_scale) {
             Ok(()) => {
+                let actual = vd.measurement(width, height);
+                let fallback = mode_fallback(&actual, (width, height), ui_scale);
+                self.publish_mode(width, height, actual, fallback);
                 self.screen_size_pts = vd.size_pts();
                 let vd_id = vd.display_id();
                 tracing::info!(
@@ -881,6 +1065,8 @@ impl CaptureDisplay {
                     }
                     let captured_primary = self.captured_primary.clone();
                     let shielded_primary = self.shielded_primary.clone();
+                    let lifecycle = self.lifecycle.clone();
+                    let generation = lifecycle.token();
                     std::thread::spawn(move || {
                         // Re-blank after each window-gather sweep. DIAGNOSED from
                         // the callback trace: the vd re-mode resets the physical
@@ -893,6 +1079,9 @@ impl CaptureDisplay {
                         // blink a little less than a second after the resize". So
                         // the re-assert has to run AFTER each sweep, here.
                         let reblank = || {
+                            if !lifecycle.is_current(generation) {
+                                return;
+                            }
                             if let Some(cap) = captured_primary.as_ref() {
                                 if let Some(g) =
                                     cap.lock().expect("captured_primary poisoned").as_ref()
@@ -917,9 +1106,15 @@ impl CaptureDisplay {
                         // however long the relayout takes; a no-op second sweep is
                         // cheap when the first already stuck.
                         std::thread::sleep(std::time::Duration::from_millis(700));
+                        if !lifecycle.is_current(generation) {
+                            return;
+                        }
                         let first = crate::input::gather_windows_onto_display(vd_id);
                         reblank();
                         std::thread::sleep(std::time::Duration::from_millis(1000));
+                        if !lifecycle.is_current(generation) {
+                            return;
+                        }
                         let second = crate::input::gather_windows_onto_display(vd_id);
                         reblank();
                         // One more after the relayout has fully settled, in case
@@ -950,6 +1145,12 @@ impl CaptureDisplay {
                 // the next client asks for the size that last succeeded.
                 // Input maps onto the display's current points.
                 self.screen_size_pts = vd.size_pts();
+                self.publish_mode(
+                    width,
+                    height,
+                    vd.measurement(width, height),
+                    Some(format!("mode change failed: {e:#}; capture is scaled")),
+                );
                 tracing::warn!(
                     error = ?e,
                     requested_w = width,
@@ -1834,8 +2035,9 @@ mod macos {
                         let scale = cell.load(Ordering::Relaxed);
                         if scale != self.applied_pointer_scale {
                             self.applied_pointer_scale = scale;
-                            self.cursor
-                                .set_scale(multiplier.clamp(0.1, 8.0) * f64::from(scale));
+                            self.cursor.set_scale(
+                                multiplier.clamp(0.1, 8.0) * super::pointer_factor(scale),
+                            );
                             tracing::info!(
                                 pointer_ui_scale = scale,
                                 "resending the pointer at a new scale"
@@ -2304,6 +2506,125 @@ mod tests {
         let clone = size.clone();
         clone.set(u16::MAX, 1);
         assert_eq!(size.get(), (u16::MAX, 1));
+    }
+
+    #[test]
+    fn negotiated_size_is_not_input_size_until_display_commit() {
+        let size = SharedDesktopSize::new(3840, 2160);
+        size.set(1920, 1080);
+        assert_eq!(size.get(), (1920, 1080));
+        assert_eq!(size.get_for_input(), (3840, 2160));
+        size.clone().commit_input_size(1920, 1080);
+        assert_eq!(size.get_for_input(), (1920, 1080));
+    }
+
+    #[test]
+    fn new_session_clears_transients_and_invalidates_old_delayed_work() {
+        let lifecycle = DisplayLifecycle::new();
+        lifecycle.begin(Some(200));
+        lifecycle.request();
+        let old = lifecycle.advance_layout();
+        lifecycle.pending.request(1600, 900);
+        lifecycle.suppress.store(true, Ordering::Relaxed);
+        lifecycle.end();
+        assert!(!lifecycle.is_current(old));
+        assert!(!lifecycle.pending.has_pending());
+        assert!(!lifecycle.suppress.load(Ordering::Relaxed));
+        lifecycle.begin(None);
+        assert!(!lifecycle.is_current(old));
+        assert_eq!(lifecycle.token(), (old.0 + 1, 0));
+        assert!(lifecycle.is_current(lifecycle.token()));
+    }
+
+    #[test]
+    fn newer_layout_cancels_only_previous_layout_work_not_the_session() {
+        let lifecycle = DisplayLifecycle::new();
+        lifecycle.begin(None);
+        lifecycle.request();
+        let first = lifecycle.advance_layout();
+        lifecycle.request(); // Duplicate/no-op receipt does not cancel a sweep.
+        assert!(lifecycle.is_current(first));
+        let second = lifecycle.advance_layout();
+        assert_eq!(first.0, second.0);
+        assert!(second.1 > first.1);
+        assert!(!lifecycle.is_current(first));
+        assert!(lifecycle.is_current(second));
+        // A server-driven reactivation consumes the echo flag, not begin/end.
+        lifecycle.suppress.store(true, Ordering::Relaxed);
+        assert!(lifecycle.suppress.swap(false, Ordering::Relaxed));
+        assert!(lifecycle.is_current(second));
+    }
+
+    #[test]
+    fn fixed_resolution_and_live_resize_do_not_override_scale_policy() {
+        let current = (3840, 2160);
+        let request = DesktopSize {
+            width: 1920,
+            height: 1080,
+        };
+        for auto in [false, true] {
+            for live in [false, true] {
+                let target = layout_target(auto, live, Some(1), 2, current, request).unwrap();
+                assert_eq!(
+                    (target.width, target.height),
+                    if auto && live { (1920, 1080) } else { current }
+                );
+                let target = layout_target(auto, live, Some(2), 2, current, request);
+                assert_eq!(target.is_some(), auto && live);
+            }
+        }
+        assert!(layout_target(false, true, None, 2, current, request).is_none());
+    }
+
+    #[test]
+    fn pointer_and_letterbox_use_measured_fractional_scales() {
+        assert_eq!(pointer_factor(50), 0.5);
+        assert_eq!(pointer_factor(100), 1.0);
+        assert_eq!(pointer_factor(200), 2.0);
+        let actual = crate::virtual_display::DisplayMeasurement {
+            points_width: Some(1920.0),
+            points_height: Some(1200.0),
+            ..Default::default()
+        };
+        assert_eq!(aspect_preserving_scale(&actual, (3840, 2160)), Some(180.0));
+        assert!(aspect_preserving_scale(&Default::default(), (3840, 2160)).is_none());
+    }
+
+    #[test]
+    fn repeated_scale_pdus_keep_an_unapplied_scale_request() {
+        let current = (3840, 2160);
+        let requested = DesktopSize {
+            width: 1920,
+            height: 1080,
+        };
+        for (auto, live) in [(false, true), (true, false)] {
+            for _ in 0..2 {
+                let target = layout_target(auto, live, Some(1), 2, current, requested).unwrap();
+                assert_eq!((target.width, target.height), current);
+            }
+            assert!(layout_target(auto, live, Some(2), 2, current, requested).is_none());
+        }
+    }
+
+    #[test]
+    fn returning_to_current_layout_cancels_a_pending_drag() {
+        let pending = PendingResize::new();
+        pending.request(2560, 1440);
+        pending.clear(); // Every newly validated layout replaces the old intent.
+        let current = (3840, 2160);
+        assert!(layout_target(
+            true,
+            true,
+            Some(1),
+            1,
+            current,
+            DesktopSize {
+                width: current.0,
+                height: current.1
+            }
+        )
+        .is_none());
+        assert_eq!(pending.take_settled(Duration::ZERO), None);
     }
 
     #[test]

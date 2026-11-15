@@ -18,10 +18,12 @@ mod camera;
 mod capture;
 mod clipboard;
 mod clipboard_rich;
+mod config;
 mod conn_hooks;
 #[cfg(test)]
 mod conn_test;
 mod cursor;
+mod display_transition;
 #[cfg(target_os = "macos")]
 mod file_promise;
 #[cfg(target_os = "macos")]
@@ -160,12 +162,12 @@ fn primary_screen_geometry() -> ((f64, f64), (f64, f64)) {
 }
 
 #[cfg(target_os = "macos")]
-fn ensure_screen_recording_access() {
+fn ensure_screen_recording_access() -> bool {
     use core_graphics::access::ScreenCaptureAccess;
     let tcc = ScreenCaptureAccess;
     if tcc.preflight() {
         info!("Screen Recording permission already granted");
-        return;
+        return true;
     }
     warn!(
         "Screen Recording permission NOT granted. macrdp will appear in \
@@ -175,6 +177,7 @@ fn ensure_screen_recording_access() {
     // request() registers the binary with TCC and opens the prompt; the
     // returned bool reflects current state, which is still false on first run.
     let _ = tcc.request();
+    false
 }
 
 #[derive(Parser, Debug)]
@@ -190,12 +193,12 @@ struct Args {
     /// (queried via ScreenCaptureKit). Overriding to a non-native size makes
     /// SCK scale internally; we then disable dirty-rect updates and ship a
     /// full frame every tick, so bandwidth is higher than at native size.
-    #[arg(long)]
+    #[arg(long, value_parser = clap::value_parser!(u16).range(200..=8192))]
     width: Option<u16>,
 
     /// Desktop height in pixels. Defaults to the primary display's native height.
     /// Same trade-off as --width when overridden.
-    #[arg(long)]
+    #[arg(long, value_parser = clap::value_parser!(u16).range(200..=8192))]
     height: Option<u16>,
 
     /// Capture the primary display at its backing (Retina) pixel resolution
@@ -738,6 +741,16 @@ struct Args {
     #[arg(long = "no-client-resolution", action = clap::ArgAction::SetTrue)]
     no_client_resolution: bool,
 
+    /// Adopt the client resolution or keep the configured display size.
+    /// Unset preserves the legacy automatic/explicit-size behavior.
+    #[arg(long, value_enum)]
+    resolution_policy: Option<ResolutionPolicy>,
+
+    /// Allow client resolution changes during a connected session.
+    /// Auto HiDPI scale-only changes are independent of this switch.
+    #[arg(long, action = clap::ArgAction::Set)]
+    live_resize: Option<bool>,
+
     /// On the auto-size path, stretch the Mac screen to fill the client frame
     /// instead of preserving the Mac's aspect ratio. By default, when the client
     /// requests a resolution with a different aspect ratio than the Mac display,
@@ -857,6 +870,15 @@ struct Args {
     /// for the recognized keys; unknown keys are ignored.
     #[arg(long)]
     config: Option<PathBuf>,
+
+    /// Validate a config and print redacted effective settings as JSON, then exit.
+    /// Does not access Keychain, request permissions, create displays or listen.
+    #[arg(long, conflicts_with = "capabilities")]
+    check_config: Option<PathBuf>,
+
+    /// Print the configuration/telemetry protocol supported by this build as JSON.
+    #[arg(long)]
+    capabilities: bool,
 
     /// EXPERIMENTAL research spike (not a real feature): instantiate a user-space
     /// USB host controller via IOUSBHostControllerInterface to prove the
@@ -1284,6 +1306,12 @@ enum VdHidpiArg {
     On,
     /// HiDPI only for a client that announces a 2× desktop scale factor.
     Auto,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+enum ResolutionPolicy {
+    Client,
+    Fixed,
 }
 
 /// Expiry classification for an operator-supplied cert. Pure (testable) split
@@ -1966,6 +1994,7 @@ fn spawn_primary_overlay_watcher<T: Send + 'static>(
     label: &'static str,
     vd_id: u32,
     tracker: capture::SessionTracker,
+    transitions: display_transition::Coordinator,
     slot: Arc<std::sync::Mutex<Option<T>>>,
     install: fn(u32) -> Result<T>,
     // (--restore-windows-on-disconnect) When true, make windows follow the
@@ -2018,10 +2047,21 @@ fn spawn_primary_overlay_watcher<T: Send + 'static>(
         const REACTIVATION_POLL: Duration = Duration::from_millis(75);
         let mut was_zero = true;
         let mut installed_at: Option<Instant> = None;
+        let mut restore_state = display_transition::RestoreState::default();
+        let mut reconcile = false;
         loop {
-            tracker.notify.notified().await;
+            if !reconcile {
+                tracker.notify.notified().await;
+            }
+            reconcile = false;
+            if transitions.is_stopping() {
+                break;
+            }
             let count = tracker.count.load(Ordering::SeqCst);
             let now_zero = count == 0;
+            if restore_state.restart_due(!now_zero) {
+                was_zero = false;
+            }
             info!(label, was_zero, now_zero, count, "overlay watcher woke");
             match (was_zero, now_zero) {
                 (true, false) => {
@@ -2031,18 +2071,53 @@ fn spawn_primary_overlay_watcher<T: Send + 'static>(
                             label,
                             "connection flapped during debounce — skipping install"
                         );
-                        was_zero = true;
+                        (was_zero, reconcile) = restore_state.reconcile(false, false);
                         continue;
                     }
-                    match install(vd_id) {
-                        Ok(ovr) => {
+                    let worker_slot = slot.clone();
+                    let worker_tracker = tracker.clone();
+                    let started = Instant::now();
+                    let result = transitions
+                        .run(move |stopping| {
+                            if worker_tracker.count.load(Ordering::SeqCst) == 0 {
+                                return Ok(false);
+                            }
+                            let ovr = install(vd_id)?;
+                            if stopping.load(Ordering::Acquire) {
+                                // Shutdown began while CoreGraphics was busy. Restore
+                                // on this blocking worker; never publish a late guard.
+                                drop(ovr);
+                                return Ok(false);
+                            }
+                            *worker_slot.lock().expect("overlay mutex poisoned") = Some(ovr);
+                            Ok::<_, anyhow::Error>(true)
+                        })
+                        .await;
+                    info!(
+                        label,
+                        operation = "install",
+                        elapsed_ms = started.elapsed().as_millis() as u64,
+                        "physical display transition finished"
+                    );
+                    if transitions.is_stopping() {
+                        break;
+                    }
+                    match result {
+                        Ok(Some(Ok(true))) => {
                             installed_at = Some(Instant::now());
                             info!(
                                 label,
                                 "RDP client connected — Mac is now headless via the \
                                  virtual display"
                             );
-                            *slot.lock().expect("overlay mutex poisoned") = Some(ovr);
+                            // The client may have left while install was in
+                            // flight. Reconcile the latest state before running
+                            // connection-only effects; keep any new session's
+                            // already-installed overlay instead of undoing it.
+                            if tracker.count.load(Ordering::SeqCst) == 0 {
+                                (was_zero, reconcile) = restore_state.reconcile(true, false);
+                                continue;
+                            }
                             // (--restore-windows-on-disconnect) Auto-gather any
                             // windows stranded on the built-in panel (e.g. swept
                             // there by a previous disconnect) onto the virtual
@@ -2050,7 +2125,14 @@ fn spawn_primary_overlay_watcher<T: Send + 'static>(
                             // "follow me". Off-thread; the install's reposition has
                             // already settled, so the vd's live bounds are correct.
                             if restore_windows {
+                                let current_tracker = tracker.clone();
+                                let current_transitions = transitions.clone();
                                 std::thread::spawn(move || {
+                                    if current_transitions.is_stopping()
+                                        || current_tracker.count.load(Ordering::SeqCst) == 0
+                                    {
+                                        return;
+                                    }
                                     let moved = restore_gather_windows(vd_id);
                                     if moved > 0 {
                                         info!(
@@ -2072,7 +2154,14 @@ fn spawn_primary_overlay_watcher<T: Send + 'static>(
                             // inside attempt_auto_unlock.
                             if auto_unlock {
                                 let password = Arc::clone(&password);
+                                let current_tracker = tracker.clone();
+                                let current_transitions = transitions.clone();
                                 std::thread::spawn(move || {
+                                    if current_transitions.is_stopping()
+                                        || current_tracker.count.load(Ordering::SeqCst) == 0
+                                    {
+                                        return;
+                                    }
                                     use std::sync::atomic::Ordering as AtomicOrdering;
                                     match attempt_auto_unlock(password.as_str()) {
                                         AutoUnlockOutcome::NotLocked
@@ -2111,10 +2200,19 @@ fn spawn_primary_overlay_watcher<T: Send + 'static>(
                                 });
                             }
                         }
-                        Err(e) => warn!(
+                        Ok(Some(Err(e))) => warn!(
                             label,
                             "could not engage headless overlay on client connect: {e:#}"
                         ),
+                        Err(e) => {
+                            warn!(label, error = %e, "physical display install worker failed")
+                        }
+                        Ok(None) => break,
+                        Ok(Some(Ok(false))) => {
+                            (was_zero, reconcile) = restore_state
+                                .reconcile(false, tracker.count.load(Ordering::SeqCst) > 0);
+                            continue;
+                        }
                     }
                 }
                 (false, true) => {
@@ -2157,58 +2255,130 @@ fn spawn_primary_overlay_watcher<T: Send + 'static>(
                             tokio::time::sleep(wait).await;
                         }
                     }
-                    if let Some(ovr) = slot.lock().expect("overlay mutex poisoned").take() {
-                        // Drop runs the actual restore + emits its own
-                        // success/warn logs; don't claim a result here.
-                        drop(ovr);
+                    // A reconnect can arrive during the minimum dwell. It
+                    // must cancel a restore that has not entered CoreGraphics.
+                    if tracker.count.load(Ordering::SeqCst) > 0 {
+                        continue;
+                    }
+                    let worker_slot = slot.clone();
+                    let worker_tracker = tracker.clone();
+                    let started = Instant::now();
+                    let result = transitions
+                        .run(move |_| {
+                            use display_transition::RestoreOutcome;
+                            let mut current = worker_slot.lock().expect("overlay mutex poisoned");
+                            if worker_tracker.count.load(Ordering::SeqCst) > 0 {
+                                return if current.is_some() {
+                                    RestoreOutcome::Retained
+                                } else {
+                                    RestoreOutcome::Absent
+                                };
+                            }
+                            let ovr = current.take();
+                            drop(current);
+                            if ovr.is_none() {
+                                return RestoreOutcome::Absent;
+                            }
+                            drop(ovr); // Slow native restore; never hold the slot lock.
+                            RestoreOutcome::Removed {
+                                failed: virtual_display::take_detach_reenable_failed(),
+                            }
+                        })
+                        .await;
+                    info!(
+                        label,
+                        operation = "restore",
+                        elapsed_ms = started.elapsed().as_millis() as u64,
+                        "physical display transition finished"
+                    );
+                    if transitions.is_stopping() {
+                        break;
+                    }
+                    let outcome = match result {
+                        Ok(Some(outcome)) => outcome,
+                        Ok(None) => break,
+                        Err(e) => {
+                            warn!(label, error = %e, "physical display restore worker failed");
+                            // A panic may have left a guard; observe actual state.
+                            if slot.lock().expect("overlay mutex poisoned").is_some() {
+                                display_transition::RestoreOutcome::Retained
+                            } else {
+                                display_transition::RestoreOutcome::Absent
+                            }
+                        }
+                    };
+                    restore_state.observe(outcome);
+                    if outcome == display_transition::RestoreOutcome::Retained {
+                        (was_zero, reconcile) =
+                            restore_state.reconcile(true, tracker.count.load(Ordering::SeqCst) > 0);
+                        continue;
+                    }
+                    let removed =
+                        matches!(outcome, display_transition::RestoreOutcome::Removed { .. });
+                    if removed {
                         installed_at = None;
-                        info!(label, "last RDP client disconnected");
-
-                        // #168: on --detach-primary, macOS 26.x can't re-enable
-                        // the physical panel in-process — only process exit
-                        // reverts the CGS disable. If Drop just flagged that
-                        // failure, restart (under launchd) so the panel comes
-                        // back, rather than leaving it dark until the next manual
-                        // kickstart. Only DetachedPrimary::drop sets the flag, so
-                        // this is a guaranteed no-op for --capture-primary (and
-                        // off macOS, where the stub returns false). The take_*
-                        // read clears the flag.
-                        if virtual_display::take_detach_reenable_failed() {
-                            if detach_restart_on_stuck(
-                                std::io::stdout().is_terminal(),
-                                std::env::var("MACRDP_DETACH_RESTART_ON_STUCK")
-                                    .ok()
-                                    .as_deref(),
-                            ) {
-                                warn!(
-                                    label,
-                                    "detach could not re-enable the built-in display \
+                        info!(
+                            label,
+                            "physical screen restoration completed after disconnect"
+                        );
+                    }
+                    // #168: on --detach-primary, macOS 26.x can't re-enable
+                    // the physical panel in-process — only process exit
+                    // reverts the CGS disable. If Drop just flagged that
+                    // failure, restart (under launchd) so the panel comes
+                    // back, rather than leaving it dark until the next manual
+                    // kickstart. Only DetachedPrimary::drop sets the flag, so
+                    // this is a guaranteed no-op for --capture-primary (and
+                    // off macOS, where the stub returns false). The take_*
+                    // read clears the flag.
+                    if restore_state.restart_due(tracker.count.load(Ordering::SeqCst) > 0) {
+                        if detach_restart_on_stuck(
+                            std::io::stdout().is_terminal(),
+                            std::env::var("MACRDP_DETACH_RESTART_ON_STUCK")
+                                .ok()
+                                .as_deref(),
+                        ) {
+                            warn!(
+                                label,
+                                "detach could not re-enable the built-in display \
                                      (macOS won't do it in-process, #168) — exiting so \
                                      launchd restarts a fresh process to restore it. \
                                      Set MACRDP_DETACH_RESTART_ON_STUCK=0 to disable."
-                                );
-                                // Mirror the signal handler's cleanup before a
-                                // process::exit (which bypasses Drop): flush lazy-
-                                // paste state + unmount RDPDR NFS volumes. On this
-                                // disconnect edge the per-connection Drops have
-                                // usually already run, so these are near-no-ops —
-                                // but they keep the bounce as clean as the signal
-                                // path, and the startup reaper backstops anything
-                                // that slips through on the relaunch.
-                                #[cfg(target_os = "macos")]
-                                file_promise_lazy::shutdown_cleanup();
-                                rdpdr::shutdown_cleanup();
-                                std::process::exit(DETACH_STUCK_EXIT_CODE);
-                            } else {
-                                warn!(
-                                    label,
-                                    "detach could not re-enable the built-in display \
+                            );
+                            // Mirror the signal handler's cleanup before a
+                            // process::exit (which bypasses Drop): flush lazy-
+                            // paste state + unmount RDPDR NFS volumes. On this
+                            // disconnect edge the per-connection Drops have
+                            // usually already run, so these are near-no-ops —
+                            // but they keep the bounce as clean as the signal
+                            // path, and the startup reaper backstops anything
+                            // that slips through on the relaunch.
+                            #[cfg(target_os = "macos")]
+                            file_promise_lazy::shutdown_cleanup();
+                            rdpdr::shutdown_cleanup();
+                            std::process::exit(DETACH_STUCK_EXIT_CODE);
+                        } else {
+                            warn!(
+                                label,
+                                "detach could not re-enable the built-in display \
                                      (#168) and restart-on-stuck is off — the panel \
                                      stays dark until macrdp restarts (launchctl \
                                      kickstart -k, or quit + relaunch)."
-                                );
-                            }
+                            );
+                            restore_state.acknowledge_failure();
                         }
+                    }
+                    if restore_state.pending_failure() && tracker.count.load(Ordering::SeqCst) > 0 {
+                        warn!(label, "physical display restore failed during a new connection — postponing restart until it disconnects");
+                    }
+                    if tracker.count.load(Ordering::SeqCst) > 0 {
+                        // A new connection arrived during the uninterruptible
+                        // restore. Reinstall serially; never run the old
+                        // disconnect's window/lock effects against it.
+                        (was_zero, reconcile) = restore_state.reconcile(false, true);
+                        continue;
+                    }
+                    if removed {
                         // (--restore-windows-on-disconnect) Sweep windows off the
                         // virtual display back onto the built-in panel so the Mac
                         // is usable locally. MUST run AFTER `drop(ovr)` — that's
@@ -2216,7 +2386,14 @@ fn spawn_primary_overlay_watcher<T: Send + 'static>(
                         // the vd off (0,0); the gather reads each display's live
                         // bounds. Off-thread so the watcher loop isn't blocked.
                         if restore_windows {
+                            let current_tracker = tracker.clone();
+                            let current_transitions = transitions.clone();
                             std::thread::spawn(move || {
+                                if current_transitions.is_stopping()
+                                    || current_tracker.count.load(Ordering::SeqCst) > 0
+                                {
+                                    return;
+                                }
                                 let moved = restore_gather_windows(physical_main_id);
                                 if moved > 0 {
                                     info!(
@@ -2246,6 +2423,7 @@ fn spawn_primary_overlay_watcher<T: Send + 'static>(
                         // docs/known-quirks.md.
                         if let Some(activity) = lock_on_disconnect.clone() {
                             let tracker_for_lock = tracker.clone();
+                            let transitions_for_lock = transitions.clone();
                             // A later disconnect supersedes this one's pending
                             // lock (it arms its own, timed from ITS edge).
                             let generation = LOCK_GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
@@ -2261,6 +2439,9 @@ fn spawn_primary_overlay_watcher<T: Send + 'static>(
                                 let due_ms = activity.now_ms();
                                 let mut holding = false;
                                 loop {
+                                    if transitions_for_lock.is_stopping() {
+                                        return;
+                                    }
                                     if LOCK_GENERATION.load(Ordering::SeqCst) != generation {
                                         tracing::debug!(
                                             label,
@@ -2346,7 +2527,11 @@ fn spawn_primary_overlay_watcher<T: Send + 'static>(
                 }
                 _ => {}
             }
-            was_zero = now_zero;
+            // Notifications can merge while a native call is in flight. The
+            // desired state is the current count, not the edge we started from.
+            // Pending failed restoration also requires work without a guard.
+            (was_zero, reconcile) =
+                restore_state.reconcile(!now_zero, tracker.count.load(Ordering::SeqCst) > 0);
         }
     });
 }
@@ -2404,6 +2589,32 @@ fn main() -> Result<()> {
             std::process::exit(virtual_display::run_select_mode_helper(&spec));
         }
     }
+    // Inspection commands must exit before creating a runtime, installing any
+    // environment bridge, requesting TCC, reading Keychain, or touching displays.
+    let mut args = Args::parse();
+    if args.capabilities {
+        println!("{}", config::capabilities());
+        return Ok(());
+    }
+    if let Some(path) = &args.check_config {
+        let report = check_config_report(path);
+        let ok = report["ok"].as_bool().unwrap_or(false);
+        println!("{report}");
+        if !ok {
+            std::process::exit(2);
+        }
+        return Ok(());
+    }
+    let document = if let Some(path) = &args.config {
+        let document = config::Document::read(path)?;
+        document.ensure_valid()?;
+        args = args_from_config_values(path, &document)
+            .map_err(|error| anyhow!(document.redact_error(&format!("{error:#}"))))?;
+        Some(document)
+    } else {
+        None
+    };
+    validate_config_args(&args)?;
     // Build the tokio runtime explicitly so every worker thread starts
     // at boosted QoS (see `boost_thread_qos`). `#[tokio::main]`'s
     // generated runtime gives us no hook for this. Crucially: the main
@@ -2416,7 +2627,127 @@ fn main() -> Result<()> {
             boost_thread_qos();
         })
         .build()?;
-    rt.block_on(async_main())
+    let result = rt.block_on(async_main(args, document));
+    if result.is_err() {
+        stats::set_startup("failed", None, None);
+    }
+    result
+}
+
+/// Shared by the actual backend and the check-config JSON; the UI must never
+/// present automatic sizing while a legacy escape-hatch flag pins the display.
+fn client_resolution_enabled(args: &Args) -> bool {
+    match args.resolution_policy {
+        Some(ResolutionPolicy::Client) => true,
+        Some(ResolutionPolicy::Fixed) => false,
+        None => {
+            !args.no_client_resolution
+                && (args.virtual_display
+                    || (!args.hidpi && args.width.is_none() && args.height.is_none()))
+        }
+    }
+}
+
+fn validate_config_args(args: &Args) -> Result<()> {
+    if args.cert.is_some() != args.key.is_some() {
+        return Err(anyhow!(
+            "--cert and --key must be supplied together (or neither, for the self-signed default)"
+        ));
+    }
+    if args.skip_auth && !args.bind.ip().is_loopback() {
+        return Err(anyhow!(
+            "--skip-auth refused on a non-loopback bind; remove --skip-auth or rebind to 127.0.0.1"
+        ));
+    }
+    if args.resolution_policy == Some(ResolutionPolicy::Client) && args.no_client_resolution {
+        return Err(anyhow!(
+            "--resolution-policy=client conflicts with --no-client-resolution"
+        ));
+    }
+    if args.resolution_policy == Some(ResolutionPolicy::Client)
+        && !args.virtual_display
+        && (args.hidpi || args.width.is_some() || args.height.is_some())
+    {
+        return Err(anyhow!("RESOLUTION_POLICY=client conflicts with physical-display --hidpi/--width/--height; remove those pins, select fixed, or enable a virtual display"));
+    }
+    if args.virtual_display && (args.width.is_none() || args.height.is_none()) {
+        return Err(anyhow!(
+            "--virtual-display requires both --width and --height"
+        ));
+    }
+    for (enabled, flag) in [
+        (
+            args.virtual_display_hidpi.is_some(),
+            "--virtual-display-hidpi",
+        ),
+        (args.make_primary, "--make-primary"),
+        (args.detach_primary, "--detach-primary"),
+        (args.capture_primary, "--capture-primary"),
+        (args.shield_primary, "--shield-primary"),
+    ] {
+        if enabled && !args.virtual_display {
+            return Err(anyhow!("{flag} requires --virtual-display"));
+        }
+    }
+    let modes: Vec<_> = [
+        (args.detach_primary, "--detach-primary"),
+        (args.capture_primary, "--capture-primary"),
+        (args.shield_primary, "--shield-primary"),
+    ]
+    .into_iter()
+    .filter_map(|(enabled, name)| enabled.then_some(name))
+    .collect();
+    if modes.len() > 1 {
+        return Err(anyhow!("{} are mutually exclusive", modes.join(" and ")));
+    }
+    Ok(())
+}
+
+fn effective_config(args: &Args, document: &config::Document) -> serde_json::Value {
+    // Explicit allowlist. Never serialize Args, EXTRA_FLAGS, passwords, username,
+    // credential paths, TLS key paths, or Keychain identifiers.
+    serde_json::json!({
+        "resolution_policy": if client_resolution_enabled(args) { "client" } else { "fixed" },
+        "live_resize": args.live_resize.unwrap_or(true),
+        "virtual_display": args.virtual_display,
+        "vd_width": args.width, "vd_height": args.height,
+        "vd_hidpi": match args.virtual_display_hidpi { None => "0", Some(VdHidpiArg::On) => "1", Some(VdHidpiArg::Auto) => "auto" },
+        "primary_mode": if args.detach_primary { "detach" } else if args.capture_primary { "capture" } else if args.shield_primary { "shield" } else { "none" },
+        "hidpi": args.hidpi, "fps": args.fps.unwrap_or(if args.enable_h264 { 60 } else { 15 }),
+        "enable_h264": args.enable_h264, "bitrate": args.bitrate,
+        "max_client_size": args.max_client_size.map(|(w,h)| format!("{w}x{h}")),
+        "stats_endpoint": args.stats_endpoint,
+        "stats_port": document.values.get("STATS_PORT").and_then(|v| v.parse::<u16>().ok()).unwrap_or(40245),
+    })
+}
+
+fn check_config_report(path: &Path) -> serde_json::Value {
+    let mut errors = vec![];
+    let mut warnings = vec![];
+    let mut revision = None;
+    let mut effective = serde_json::Value::Null;
+    match config::Document::read(path) {
+        Err(error) => errors.push(error.to_string()),
+        Ok(document) => {
+            revision = Some(document.revision.clone());
+            warnings = document.warnings.clone();
+            errors = document.errors.clone();
+            if errors.is_empty() {
+                match args_from_config_values(path, &document).and_then(|args| {
+                    validate_config_args(&args)?;
+                    Ok(args)
+                }) {
+                    Ok(args) => effective = effective_config(&args, &document),
+                    Err(error) => errors.push(document.redact_error(&format!("{error:#}"))),
+                }
+            }
+        }
+    }
+    serde_json::json!({
+        "schema_version": config::SCHEMA_VERSION, "ok": errors.is_empty(),
+        "build_commit": config::BUILD_COMMIT, "config_revision": revision,
+        "effective": effective, "warnings": warnings, "errors": errors,
+    })
 }
 
 /// Translate a `config.env` (plain `key=value`, the format the menu-bar
@@ -2451,33 +2782,17 @@ fn parse_max_client_size(spec: &str) -> Result<(u16, u16), String> {
     Ok((parse_dim(w, "width")?, parse_dim(h, "height")?))
 }
 
+#[cfg(test)]
 fn args_from_config(path: &Path) -> Result<Args> {
-    let text = fs::read_to_string(path)
-        .with_context(|| format!("reading config file {}", path.display()))?;
+    let document = config::Document::read(path)?;
+    document.ensure_valid()?;
+    let args = args_from_config_values(path, &document)?;
+    validate_config_args(&args)?;
+    Ok(args)
+}
 
-    let mut cfg: std::collections::HashMap<String, String> = std::collections::HashMap::new();
-    for line in text.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        // Tolerate a leading `export ` (the file used to be shell-sourced).
-        let line = line.strip_prefix("export ").unwrap_or(line);
-        let Some((key, val)) = line.split_once('=') else {
-            continue;
-        };
-        let key = key.trim().to_string();
-        let mut val = val.trim();
-        // Strip one layer of matching surrounding quotes.
-        for q in ['"', '\''] {
-            if val.len() >= 2 && val.starts_with(q) && val.ends_with(q) {
-                val = &val[1..val.len() - 1];
-                break;
-            }
-        }
-        cfg.insert(key, val.to_string());
-    }
-
+fn args_from_config_values(path: &Path, document: &config::Document) -> Result<Args> {
+    let cfg = &document.values;
     let on = |key: &str, default: bool| cfg.get(key).map(|v| v == "1").unwrap_or(default);
     let get =
         |key: &str, default: &str| cfg.get(key).cloned().unwrap_or_else(|| default.to_string());
@@ -2654,134 +2969,12 @@ fn args_from_config(path: &Path) -> Result<Args> {
             argv.push(sz.clone());
         }
     }
-    // Env-only tunables (auth guard, health-check watchdog, blank recovery,
-    // auto-reconnect cookie — each read lazily after this point). Bridge the
-    // friendly config.env keys to their MACRDP_* env vars here so menu-bar /
-    // LaunchAgent users can tune them via config.env without editing the
-    // plist's EnvironmentVariables. Unset keys keep the on-by-default defaults.
-    for (cfg_key, env_var) in [
-        ("CONN_GUARD", "MACRDP_CONN_GUARD"),
-        ("AUDIT_LOG", "MACRDP_AUDIT_LOG"),
-        ("GUARD_RL_MAX", "MACRDP_GUARD_RL_MAX"),
-        ("GUARD_RL_WINDOW_SECS", "MACRDP_GUARD_RL_WINDOW_SECS"),
-        ("GUARD_FAIL_THRESHOLD", "MACRDP_GUARD_FAIL_THRESHOLD"),
-        ("GUARD_FAILFAST_SECS", "MACRDP_GUARD_FAILFAST_SECS"),
-        (
-            "GUARD_COOLDOWN_BASE_SECS",
-            "MACRDP_GUARD_COOLDOWN_BASE_SECS",
-        ),
-        ("GUARD_COOLDOWN_MAX_SECS", "MACRDP_GUARD_COOLDOWN_MAX_SECS"),
-        // Health-check watchdog (env-driven like the auth guard; on by default
-        // when headless). See src/health.rs.
-        ("HEALTH_CHECK", "MACRDP_HEALTHCHECK"),
-        (
-            "HEALTHCHECK_INTERVAL_SECS",
-            "MACRDP_HEALTHCHECK_INTERVAL_SECS",
-        ),
-        (
-            "HEALTHCHECK_TIMEOUT_SECS",
-            "MACRDP_HEALTHCHECK_TIMEOUT_SECS",
-        ),
-        ("HEALTHCHECK_FAILURES", "MACRDP_HEALTHCHECK_FAILURES"),
-        // Blank recovery (the mstsc reconnect-blank auto-heal, needs
-        // --enable-h264) + the auto-reconnect cookie. Env-driven like the
-        // guard (read in h264.rs per connection / main.rs at server build,
-        // both after this bridge runs). BLANK_RECOVERY=0 is the ask that
-        // motivated bridging: disabling the detector for an overlay-link
-        // profile used to need a plist EnvironmentVariables edit.
-        ("BLANK_RECOVERY", "MACRDP_BLANK_RECOVERY"),
-        (
-            "BLANK_RECOVERY_REACTIVATE",
-            "MACRDP_BLANK_RECOVERY_REACTIVATE",
-        ),
-        (
-            "BLANK_RECOVERY_MAX_RTT_MS",
-            "MACRDP_BLANK_RECOVERY_MAX_RTT_MS",
-        ),
-        ("BLANK_RECOVERY_MIN_QOE", "MACRDP_BLANK_RECOVERY_MIN_QOE"),
-        (
-            "BLANK_RECOVERY_MIN_RENDER_REPORTS",
-            "MACRDP_BLANK_RECOVERY_MIN_RENDER_REPORTS",
-        ),
-        (
-            "BLANK_RECOVERY_ESTABLISHED_REPORTS",
-            "MACRDP_BLANK_RECOVERY_ESTABLISHED_REPORTS",
-        ),
-        (
-            "BLANK_RECOVERY_ESTABLISHED_MIN_QOE",
-            "MACRDP_BLANK_RECOVERY_ESTABLISHED_MIN_QOE",
-        ),
-        (
-            "BLANK_RECOVERY_ESTABLISHED_MAX_WAIT_MS",
-            "MACRDP_BLANK_RECOVERY_ESTABLISHED_MAX_WAIT_MS",
-        ),
-        (
-            "BLANK_RECOVERY_ESTABLISHED_WALL_REPORTS",
-            "MACRDP_BLANK_RECOVERY_ESTABLISHED_WALL_REPORTS",
-        ),
-        (
-            "BLANK_RECOVERY_MAX_WAIT_MS",
-            "MACRDP_BLANK_RECOVERY_MAX_WAIT_MS",
-        ),
-        (
-            "BLANK_RECOVERY_MIN_WALL_REPORTS",
-            "MACRDP_BLANK_RECOVERY_MIN_WALL_REPORTS",
-        ),
-        (
-            "BLANK_RECOVERY_HEAL_CONFIRM_MS",
-            "MACRDP_BLANK_RECOVERY_HEAL_CONFIRM_MS",
-        ),
-        (
-            "BLANK_RECOVERY_POST_ATTEMPT_ZEROS",
-            "MACRDP_BLANK_RECOVERY_POST_ATTEMPT_ZEROS",
-        ),
-        (
-            "BLANK_RECOVERY_POST_ATTEMPT_WINDOW_MS",
-            "MACRDP_BLANK_RECOVERY_POST_ATTEMPT_WINDOW_MS",
-        ),
-        ("BLANK_RECOVERY_ARM_MS", "MACRDP_BLANK_RECOVERY_ARM_MS"),
-        ("BLANK_RECOVERY_RETRY_MS", "MACRDP_BLANK_RECOVERY_RETRY_MS"),
-        (
-            "BLANK_RECOVERY_MAX_ATTEMPTS",
-            "MACRDP_BLANK_RECOVERY_MAX_ATTEMPTS",
-        ),
-        (
-            "BLANK_RECOVERY_MAX_CONSECUTIVE_DROPS",
-            "MACRDP_BLANK_RECOVERY_MAX_CONSECUTIVE_DROPS",
-        ),
-        ("AUTO_RECONNECT", "MACRDP_AUTO_RECONNECT"),
-        // USB-redirection read-ahead tunables (--enable-usb-redirection). These
-        // are env-only, read via getenv() in usb_spike.m; bridging them lets the
-        // webcam knobs be set from config.env instead of the plist's
-        // EnvironmentVariables (which a `kickstart -k` won't even pick up).
-        ("USB_PREFETCH_DEPTH", "MACRDP_USB_PREFETCH_DEPTH"),
-        ("USB_STREAM_STALL_MS", "MACRDP_USB_STREAM_STALL_MS"),
-        // Camera-redirection decode diagnostics (--enable-camera-redirection): raw
-        // H.264 + PNG frame dumps to $TMPDIR. Env-only like the USB knobs above;
-        // bridged so it can be flipped in config.env when debugging the camera.
-        ("CAMERA_DUMP", "MACRDP_CAMERA_DUMP"),
-        ("MIC_DUMP", "MACRDP_MIC_DUMP"),
-        // #168 stopgap: when --detach-primary can't re-enable the physical panel
-        // on disconnect (macOS 26.x won't do it in-process), restart under
-        // launchd to restore it. Env-read at the disconnect edge.
-        ("DETACH_RESTART_ON_STUCK", "MACRDP_DETACH_RESTART_ON_STUCK"),
-        // Extra safety-buffer delay (--lock-on-disconnect) on top of the
-        // overlay watcher's REACTIVATION_GRACE before actually locking the
-        // screen. Env-read at the disconnect edge via lock_on_disconnect_delay_ms().
-        (
-            "LOCK_ON_DISCONNECT_DELAY_MS",
-            "MACRDP_LOCK_ON_DISCONNECT_DELAY_MS",
-        ),
-        // Loopback live-telemetry endpoint port (--stats-endpoint). Read via
-        // getenv() in stats::default_port(); bridged like the USB/camera knobs
-        // above so STATS_PORT can be set from config.env.
-        ("STATS_PORT", "MACRDP_STATS_PORT"),
-    ] {
-        if let Some(val) = cfg.get(cfg_key) {
-            if !val.is_empty() {
-                std::env::set_var(env_var, val);
-            }
-        }
+    if let Some(policy) = cfg.get("RESOLUTION_POLICY") {
+        argv.push("--resolution-policy".into());
+        argv.push(policy.clone());
+    }
+    if let Some(live) = cfg.get("LIVE_RESIZE") {
+        argv.push(format!("--live-resize={}", live == "1"));
     }
 
     // BITRATE (H.264 ceiling, Mbit/s), the dedicated key. When set it is
@@ -2792,11 +2985,14 @@ fn args_from_config(path: &Path) -> Result<Args> {
 
     // EXTRA_FLAGS: space-separated escape hatch, appended verbatim — except a
     // `--bitrate <val>` pair is skipped when the dedicated BITRATE key is set.
-    if let Some(extra) = cfg.get("EXTRA_FLAGS") {
-        let mut toks = extra.split_whitespace();
+    if !document.extra_flags.is_empty() {
+        let mut toks = document.extra_flags.iter().map(String::as_str);
         while let Some(tok) = toks.next() {
             if bitrate.is_some() && tok == "--bitrate" {
-                toks.next(); // consume its value so it isn't pushed either
+                toks.next(); // preserve the historical dedicated-key precedence
+                continue;
+            }
+            if bitrate.is_some() && tok.starts_with("--bitrate=") {
                 continue;
             }
             argv.push(tok.to_string());
@@ -2813,12 +3009,9 @@ fn args_from_config(path: &Path) -> Result<Args> {
         .with_context(|| format!("config file {} produced invalid settings", path.display()))
 }
 
-async fn async_main() -> Result<()> {
-    let mut args = Args::parse();
-    // If launched with `--config <file>` (the LaunchAgent path), the file is the
-    // sole source of truth — rebuild Args from it.
-    if let Some(cfg_path) = args.config.clone() {
-        args = args_from_config(&cfg_path)?;
+async fn async_main(mut args: Args, document: Option<config::Document>) -> Result<()> {
+    if let Some(document) = &document {
+        document.apply_environment();
     }
 
     // Research spike (Phase-1b USB-redirection go/no-go): run the UserHCI probe
@@ -2868,6 +3061,11 @@ async fn async_main() -> Result<()> {
         }
     });
     logging::init(filter, args.log_dir.as_deref(), audit_file.as_deref());
+    if let Some(document) = &document {
+        for warning in &document.warnings {
+            warn!("configuration: {warning}");
+        }
+    }
 
     // Sweep leftovers from a PRIOR macrdp that died uncleanly (SIGKILL / panic /
     // power-loss skip Drop AND the signal handler, stranding NFS mounts + paste
@@ -2900,6 +3098,11 @@ async fn async_main() -> Result<()> {
     // update site is a no-op, so the default runtime path is unchanged.
     if args.stats_endpoint {
         let stats = crate::stats::enable();
+        crate::stats::set_metadata(
+            Some(config::BUILD_COMMIT),
+            document.as_ref().map(|doc| doc.revision.as_str()),
+        );
+        crate::stats::set_startup("starting", None, None);
         // The h264 path can't see the audio codec; seed it here from the args.
         stats
             .aac
@@ -2908,56 +3111,6 @@ async fn async_main() -> Result<()> {
         tokio::spawn(crate::stats::serve(port, stats));
     }
 
-    if args.virtual_display_hidpi.is_some() && !args.virtual_display {
-        return Err(anyhow!(
-            "--virtual-display-hidpi requires --virtual-display"
-        ));
-    }
-    if args.make_primary && !args.virtual_display {
-        return Err(anyhow!(
-            "--make-primary requires --virtual-display (it promotes the \
-             virtual display to be the system's primary)"
-        ));
-    }
-    if args.detach_primary && !args.virtual_display {
-        return Err(anyhow!(
-            "--detach-primary requires --virtual-display (you'd be left \
-             with no usable display otherwise)"
-        ));
-    }
-    if args.capture_primary && !args.virtual_display {
-        return Err(anyhow!(
-            "--capture-primary requires --virtual-display (you'd be left \
-             with no usable display otherwise)"
-        ));
-    }
-    if args.shield_primary && !args.virtual_display {
-        return Err(anyhow!(
-            "--shield-primary requires --virtual-display (you'd be left \
-             with no usable display otherwise)"
-        ));
-    }
-    // All three headless mechanisms fight over the same display arrangement,
-    // so exactly one may be active. Checked pairwise so the error names the
-    // actual conflict.
-    if args.capture_primary && args.detach_primary {
-        return Err(anyhow!(
-            "--capture-primary and --detach-primary are mutually exclusive \
-             (pick one mechanism for going headless)"
-        ));
-    }
-    if args.shield_primary && args.detach_primary {
-        return Err(anyhow!(
-            "--shield-primary and --detach-primary are mutually exclusive \
-             (pick one mechanism for going headless)"
-        ));
-    }
-    if args.shield_primary && args.capture_primary {
-        return Err(anyhow!(
-            "--shield-primary and --capture-primary are mutually exclusive \
-             (pick one mechanism for going headless)"
-        ));
-    }
     if (args.restore_windows_on_disconnect || args.lock_on_disconnect || args.auto_unlock)
         && !(args.detach_primary || args.capture_primary || args.shield_primary)
     {
@@ -3018,6 +3171,8 @@ async fn async_main() -> Result<()> {
     // dropped here first so the user's layout is restored before exit.
     // Without this, Ctrl-C would leave the virtual display promoted or
     // the built-in panel disabled until logout.
+    let display_transitions = display_transition::Coordinator::default();
+    let cleanup_transitions = display_transitions.clone();
     let cleanup_primary = primary_override.clone();
     let cleanup_detach = detached_primary.clone();
     let cleanup_capture = captured_primary.clone();
@@ -3025,26 +3180,38 @@ async fn async_main() -> Result<()> {
     tokio::spawn(async move {
         shutdown_signal().await;
         info!("shutdown signal received — exiting");
-        if let Some(ovr) = cleanup_detach.lock().expect("detach mutex poisoned").take() {
-            drop(ovr); // re-enables the built-in display
-        }
-        if let Some(ovr) = cleanup_capture
-            .lock()
-            .expect("capture mutex poisoned")
-            .take()
+        cleanup_transitions.request_shutdown();
+        let started = std::time::Instant::now();
+        if let Err(error) = cleanup_transitions
+            .shutdown(move || {
+                let detach = { cleanup_detach.lock().expect("detach mutex poisoned").take() };
+                drop(detach);
+                let capture = {
+                    cleanup_capture
+                        .lock()
+                        .expect("capture mutex poisoned")
+                        .take()
+                };
+                drop(capture);
+                let shield = { cleanup_shield.lock().expect("shield mutex poisoned").take() };
+                drop(shield);
+                let primary = {
+                    cleanup_primary
+                        .lock()
+                        .expect("primary mutex poisoned")
+                        .take()
+                };
+                drop(primary);
+            })
+            .await
         {
-            drop(ovr); // releases captured displays
+            warn!(%error, "physical display shutdown worker failed");
         }
-        if let Some(ovr) = cleanup_shield.lock().expect("shield mutex poisoned").take() {
-            drop(ovr); // lowers the shield windows
-        }
-        if let Some(ovr) = cleanup_primary
-            .lock()
-            .expect("primary mutex poisoned")
-            .take()
-        {
-            drop(ovr); // restores display arrangement
-        }
+        info!(
+            operation = "shutdown restore",
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "physical display transition finished"
+        );
         // Lazy paste leaves NSFilePresenters registered + a temp dir on
         // disk + URLs on NSPasteboard. Process::exit skips Drop on the
         // cliprdr backend, so flush that state explicitly. No-op if
@@ -3063,8 +3230,18 @@ async fn async_main() -> Result<()> {
         if !args.allow_sleep {
             prevent_sleep();
         }
-        ensure_screen_recording_access();
-        if !ensure_accessibility_access() {
+        let screen_recording = ensure_screen_recording_access();
+        let accessibility = ensure_accessibility_access();
+        stats::set_startup(
+            if screen_recording && accessibility {
+                "starting"
+            } else {
+                "permission_required"
+            },
+            Some(screen_recording),
+            Some(accessibility),
+        );
+        if !accessibility {
             warn!(
                 "Accessibility permission NOT granted. macrdp will appear in \
                  System Settings → Privacy & Security → Accessibility. Enable \
@@ -3181,13 +3358,6 @@ async fn async_main() -> Result<()> {
         // --skip-auth is a dev-only escape hatch. Refuse it whenever the
         // listener is reachable beyond loopback so a fat-fingered config
         // can't accidentally expose an unauth'd RDP server to the LAN.
-        if !args.bind.ip().is_loopback() {
-            return Err(anyhow!(
-                "--skip-auth refused on non-loopback bind {} — \
-                 remove --skip-auth or rebind to 127.0.0.1",
-                args.bind,
-            ));
-        }
         warn!(
             "--skip-auth set; using the given password verbatim without PAM check (loopback only)"
         );
@@ -3218,6 +3388,7 @@ async fn async_main() -> Result<()> {
             "detach",
             vd_id,
             session_tracker.clone(),
+            display_transitions.clone(),
             detached_primary.clone(),
             virtual_display::DetachedPrimary::install,
             args.restore_windows_on_disconnect,
@@ -3237,6 +3408,7 @@ async fn async_main() -> Result<()> {
             "capture",
             vd_id,
             session_tracker.clone(),
+            display_transitions.clone(),
             captured_primary.clone(),
             virtual_display::CapturedPrimary::install,
             args.restore_windows_on_disconnect,
@@ -3256,6 +3428,7 @@ async fn async_main() -> Result<()> {
             "shield",
             vd_id,
             session_tracker.clone(),
+            display_transitions.clone(),
             shielded_primary.clone(),
             virtual_display::ShieldedPrimary::install,
             args.restore_windows_on_disconnect,
@@ -3295,13 +3468,6 @@ async fn async_main() -> Result<()> {
         Some(p) => p,
         None => default_cert_dir()?,
     };
-    // Operator-supplied cert/key are all-or-nothing: one without the other is a
-    // config error (we won't guess the missing half or silently self-sign).
-    if args.cert.is_some() != args.key.is_some() {
-        return Err(anyhow!(
-            "--cert and --key must be supplied together (or neither, for the self-signed default)"
-        ));
-    }
     let TlsMaterial {
         acceptor: tls,
         spki_der,
@@ -3409,12 +3575,7 @@ async fn async_main() -> Result<()> {
     //     (--width/--height pin a size, --hidpi pins backing pixels).
     // --no-client-resolution opts out in both cases — the virtual display
     // then stays fixed at --width/--height; mirror-primary serves native.
-    let auto_size = !args.no_client_resolution
-        && if args.virtual_display {
-            true
-        } else {
-            !args.hidpi && args.width.is_none() && args.height.is_none()
-        };
+    let auto_size = client_resolution_enabled(&args);
     if auto_size {
         info!(
             "client-resolution auto-adopt enabled — the session will be served at \
@@ -3553,9 +3714,12 @@ async fn async_main() -> Result<()> {
     // `vendor/ironrdp-server` `display_suppressed` plumbing.
     let display_suppressed = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
+    let display_lifecycle = Arc::new(capture::DisplayLifecycle::new());
     let display = CaptureDisplay {
         desktop_size: desktop_size.clone(),
         auto_size,
+        live_resize: args.live_resize.unwrap_or(true),
+        lifecycle: display_lifecycle.clone(),
         stretch: args.stretch,
         fps,
         display_id: capture_display_id,
@@ -3578,16 +3742,16 @@ async fn async_main() -> Result<()> {
         // Live in-session resize (client drags its window, sending an
         // MS-RDPEDISP monitor-layout PDU) — the counterpart to the
         // connect-time auto-adopt above. See `CaptureDisplay::request_layout`.
-        pending_resize: capture::PendingResize::new(),
+        pending_resize: display_lifecycle.pending_resize(),
         max_client_size: args
             .max_client_size
             .map(|(width, height)| ironrdp_server::DesktopSize { width, height }),
-        suppress_next_adopt: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        suppress_next_adopt: display_lifecycle.suppress_next_adopt(),
         // Shared so a live client resize can re-mode the display; None on
         // the mirror-primary path (no virtual display to re-mode).
         virtual_display: virtual_display.clone(),
         vd_hidpi: vd_hidpi.clone(),
-        pointer_ui_scale: Arc::new(std::sync::atomic::AtomicU32::new(vd_hidpi.ui_scale())),
+        pointer_ui_scale: Arc::new(std::sync::atomic::AtomicU32::new(vd_hidpi.ui_scale() * 100)),
         // Shared so a live re-mode can re-assert the gamma blanking (a re-mode
         // resets gamma → the panel un-blanks). Only for --capture-primary.
         captured_primary: if args.capture_primary {
@@ -3702,6 +3866,7 @@ async fn async_main() -> Result<()> {
     //   matching non-US layout when --keyboard-layout is unset.
     let mut hooks: Vec<Box<dyn ironrdp_server::ConnectionHandler>> = Vec::new();
     hooks.extend(auth_guard::AuthGuardHandler::from_env());
+    hooks.push(Box::new(conn_hooks::DisplaySessionHook(display_lifecycle)));
     if let Some(activity) = &lock_activity {
         hooks.push(Box::new(lock_activity::ActivityHook(Arc::clone(activity))));
     }
@@ -4147,6 +4312,67 @@ mod config_tests {
         ));
         fs::write(&path, body).unwrap();
         path
+    }
+
+    #[test]
+    fn inspection_reports_effective_legacy_policy_without_credentials() {
+        let path = write_temp("inspect-legacy", "VIRTUAL_DISPLAY=1\nVD_WIDTH=3840\nVD_HEIGHT=2160\nVD_HIDPI=1\nUSE_KEYCHAIN=0\nEXTRA_FLAGS='--no-client-resolution --password secret-value'\n");
+        let report = check_config_report(&path);
+        fs::remove_file(&path).unwrap();
+        assert_eq!(report["ok"], true, "{report}");
+        assert_eq!(report["effective"]["resolution_policy"], "fixed");
+        assert_eq!(report["effective"]["vd_hidpi"], "1");
+        assert_eq!(report["effective"]["vd_width"], 3840);
+        assert!(report["config_revision"]
+            .as_str()
+            .unwrap()
+            .starts_with("sha256:"));
+        assert!(!report.to_string().contains("secret-value"));
+        assert!(!report.to_string().contains("--password"));
+    }
+
+    #[test]
+    fn inspection_uses_startup_validation_and_leaves_env_untouched() {
+        let before = std::env::var_os("MACRDP_STATS_PORT");
+        let path = write_temp("inspect-pure", "STATS_PORT=61234\nPASSWORD_FILE=/nonexistent/check-only-password\nRESOLUTION_POLICY=client\nLIVE_RESIZE=0\n");
+        let report = check_config_report(&path);
+        let args = args_from_config(&path).unwrap();
+        fs::remove_file(&path).unwrap();
+        assert_eq!(report["ok"], true, "{report}");
+        assert_eq!(report["effective"]["resolution_policy"], "client");
+        assert_eq!(report["effective"]["live_resize"], false);
+        assert!(client_resolution_enabled(&args));
+        assert_eq!(args.live_resize, Some(false));
+        assert_eq!(std::env::var_os("MACRDP_STATS_PORT"), before);
+    }
+
+    #[test]
+    fn inspection_rejects_typos_conflicts_and_out_of_band_cli_dimensions() {
+        for (name, body) in [
+            ("bool", "VIRTUAL_DISPLAY=yes"),
+            ("bind", "BIND=invalid-address"),
+            (
+                "policy",
+                "RESOLUTION_POLICY=client\nEXTRA_FLAGS=--no-client-resolution",
+            ),
+            ("size", "EXTRA_FLAGS=--width 199"),
+            ("size-high", "VD_HEIGHT=8193"),
+            ("dpi", "VD_HIDPI=200"),
+            ("mode", "EXTRA_FLAGS=--detach-primary"),
+            ("port", "STATS_PORT=0"),
+            ("tls-pair", "TLS_CERT=/nonexistent/check-cert.pem"),
+            ("auth-bind", "BIND=0.0.0.0:3390\nEXTRA_FLAGS=--skip-auth"),
+            ("mirror-hidpi", "HIDPI=1\nRESOLUTION_POLICY=client"),
+            (
+                "mirror-size",
+                "RESOLUTION_POLICY=client\nEXTRA_FLAGS=--width 3840 --height 2160",
+            ),
+        ] {
+            let path = write_temp(&format!("inspect-invalid-{name}"), body);
+            assert_eq!(check_config_report(&path)["ok"], false, "{name}");
+            assert!(args_from_config(&path).is_err(), "{name}");
+            fs::remove_file(&path).unwrap();
+        }
     }
 
     #[test]

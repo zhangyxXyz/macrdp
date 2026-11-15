@@ -1,5 +1,8 @@
 import AppKit
 import SwiftUI
+import ConfigSupport
+
+private struct ConfigurationReview: Error { let warnings: [String] }
 
 // Draft model backing the tabbed Settings window (SettingsWindow.swift).
 //
@@ -24,6 +27,13 @@ final class SettingsModel: ObservableObject {
     @Published var draft: [String: String]
     /// Set after a successful Apply, for transient "Applied ✓" feedback.
     @Published var lastAppliedAt: Date?
+    @Published var applyMessage: String?
+    @Published var applyError: String?
+    @Published var isApplying = false
+    @Published var capabilities: ServerCapabilities?
+    @Published var capabilityError: String?
+    @Published var reviewWarnings: [String] = []
+    private var savedData: Data?
     /// Cached at open + after Apply (NOT recomputed in the view body — it shells
     /// out to `launchctl`, which per-render would spawn a subprocess per keystroke).
     @Published private(set) var serverRunning = false
@@ -34,32 +44,88 @@ final class SettingsModel: ObservableObject {
     init(controller: AppController) {
         self.controller = controller
         controller.ensureConfigExists()
-        let cfg = controller.readConfig()
+        let loaded = Result { try ConfigDocument(data: Data(contentsOf: controller.configURL)) }
+        let document = try? loaded.get()
+        let cfg = document?.values ?? [:]
         self.saved = cfg
         self.draft = cfg
+        self.savedData = document?.data
+        if case .failure(let error) = loaded { self.applyError = "Could not read configuration: " + error.localizedDescription }
         self.serverRunning = controller.agentState().pid != nil
+        refreshCapabilities()
+    }
+
+    private func refreshCapabilities() {
+        capabilities = nil; capabilityError = nil
+        let controller = self.controller
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            let result = Result { try controller.serverCapabilities() }
+            DispatchQueue.main.async {
+                switch result {
+                case .success(let capabilities): self?.capabilities = capabilities
+                case .failure(let error): self?.capabilityError = error.localizedDescription
+                }
+            }
+        }
     }
 
     /// True when the draft diverges from the on-disk config, i.e. Apply has work.
     var isDirty: Bool { draft != saved }
+    var canApply: Bool { savedData != nil && capabilities?.canValidate == true }
 
     func reload() {
-        let cfg = controller.readConfig()
-        saved = cfg
-        draft = cfg
+        do {
+            let document = try ConfigDocument(data: Data(contentsOf: controller.configURL))
+            saved = document.values
+            draft = document.values
+            savedData = document.data
+        } catch {
+            savedData = nil
+            applyError = "Could not read configuration: " + error.localizedDescription
+        }
     }
 
-    func revert() { draft = saved }
+    func revert() { applyError = nil; applyMessage = nil; reviewWarnings = []; reload(); refreshCapabilities() }
 
     /// Write every changed key, then kickstart once (if the server is running).
-    func apply() {
-        for (key, value) in draft where saved[key] != value {
-            controller.writeConfig(key: key, value: value)
+    func apply(acceptWarnings: Bool = false) {
+        guard !isApplying, let expected = savedData, capabilities?.canValidate == true else {
+            applyError = "A server with configuration validation is required. Reload the settings after updating the server."
+            return
         }
-        controller.applyIfRunning()
-        reload()
-        serverRunning = controller.agentState().pid != nil
-        lastAppliedAt = Date()
+        let changes = draft.filter { saved[$0.key] != $0.value }
+        let controller = self.controller
+        let wasRunning = controller.agentState().pid != nil
+        let acceptedWarnings = acceptWarnings ? reviewWarnings : []
+        isApplying = true; applyError = nil; applyMessage = nil; lastAppliedAt = nil
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            var message = "Settings saved (server stopped)."
+            let result = Result {
+                try ConfigTransaction.apply(url: controller.configURL, expected: expected, changes: changes,
+                    validate: { candidate in
+                        let validation = try controller.validateConfiguration(candidate)
+                        if !validation.warnings.isEmpty && validation.warnings != acceptedWarnings {
+                            throw ConfigurationReview(warnings: validation.warnings)
+                        }
+                    }, activate: {
+                        if wasRunning { message = try controller.restartAndVerifyConfiguration() }
+                    })
+            }
+            DispatchQueue.main.async {
+                guard let self = self else { return }
+                self.isApplying = false
+                self.serverRunning = controller.agentState().pid != nil
+                switch result {
+                case .success:
+                    self.reload(); self.lastAppliedAt = Date(); self.applyMessage = message; self.reviewWarnings = []
+                case .failure(let error):
+                    if let review = error as? ConfigurationReview {
+                        self.reviewWarnings = review.warnings
+                    } else { self.applyError = error.localizedDescription }
+                    // Keep the draft for inspection; explicit Reload adopts any external change.
+                }
+            }
+        }
     }
 
     // MARK: - Typed value access + SwiftUI bindings
@@ -71,11 +137,13 @@ final class SettingsModel: ObservableObject {
     func string(_ key: String, default def: String = "") -> String { draft[key] ?? def }
 
     func setBool(_ key: String, _ value: Bool) {
+        reviewWarnings = []
         draft[key] = value ? "1" : "0"
         normalize()
     }
 
     func setString(_ key: String, _ value: String) {
+        reviewWarnings = []
         draft[key] = value
         normalize()
     }
@@ -149,6 +217,7 @@ final class SettingsModel: ObservableObject {
     /// Choosing a mode makes `PRIMARY_MODE` authoritative and retires the legacy
     /// `CAPTURE_PRIMARY` boolean, so the server never sees a conflicting pair.
     func setPrimaryMode(_ mode: String) {
+        reviewWarnings = []
         draft["PRIMARY_MODE"] = mode
         if mode != "none" { draft["VIRTUAL_DISPLAY"] = "1" }
         if draft["CAPTURE_PRIMARY"] == "1" { draft["CAPTURE_PRIMARY"] = "0" }
@@ -157,10 +226,40 @@ final class SettingsModel: ObservableObject {
 
     // MARK: - Virtual-display resolution
 
+    var supportsDisplayPolicy: Bool { capabilities?.canConfigureDisplay == true }
+    var resolutionPolicy: String {
+        if let explicit = draft["RESOLUTION_POLICY"] { return explicit }
+        guard let flags = try? ExtraFlags(string("EXTRA_FLAGS")) else { return "unknown" }
+        if let policy = flags.value("--resolution-policy") { return policy }
+        return flags.contains("--no-client-resolution") ? "fixed" : "client"
+    }
+    var virtualScale: String {
+        if let explicit = draft["VD_HIDPI"] { return explicit }
+        guard let flags = try? ExtraFlags(string("EXTRA_FLAGS")) else { return "unknown" }
+        if flags.contains("--virtual-display-hidpi") {
+            return flags.value("--virtual-display-hidpi") ?? "1"
+        }
+        return "0"
+    }
+    var displayOverrides: String? {
+        guard let flags = try? ExtraFlags(string("EXTRA_FLAGS")) else { return "Extra flags cannot be parsed. Effective display settings are unknown until corrected in Advanced." }
+        let names = ["--no-client-resolution", "--width", "--height", "--virtual-display", "--virtual-display-hidpi", "--hidpi", "--live-resize", "--resolution-policy", "--max-client-size", "--capture-primary", "--detach-primary", "--shield-primary"]
+        let conflicts = names.filter { flags.contains($0) }
+        return conflicts.isEmpty ? nil : "Advanced → Extra flags also controls display settings: " + conflicts.joined(separator: ", ") + ". Dedicated controls may conflict or omit these overrides; the effective result is unverified. Resolve them before applying; flags are not removed automatically."
+    }
+    var resolutionOptions: [(String, String)] {
+        var options = AppController.resolutions.map { ("\($0.0)x\($0.1)", $0.2) }
+        if !options.contains(where: { $0.0 == resolution }) {
+            options.append((resolution, resolution.replacingOccurrences(of: "x", with: " × ") + " (current custom size)"))
+        }
+        return options
+    }
+
     var resolution: String {
         "\(string("VD_WIDTH", default: "1920"))x\(string("VD_HEIGHT", default: "1080"))"
     }
     func setResolution(_ wxh: String) {
+        reviewWarnings = []
         let parts = wxh.split(separator: "x")
         guard parts.count == 2 else { return }
         draft["VD_WIDTH"] = String(parts[0])

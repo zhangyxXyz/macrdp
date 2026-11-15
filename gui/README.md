@@ -60,46 +60,104 @@ macrdpController.app/Contents/MacOS/macrdptray --print-paths      # diagnose res
 ```
 (`--install-agent` assumes the Keychain password is set separately.)
 
-## Menu
+## Settings and display behavior
 
-- **Status header** — running (with pid) / stopped / not installed; a
-  **⚠️ error** line appears when stopped and the log shows a known failure (login
-  failed / port in use / crash). The menu-bar icon dims when not running.
-- **Set Up Remote Desktop** — one click applies the recommended config (virtual
-  display + detach + H.264 + app-switcher HUD + per-connection workers) and
-  starts. Shown until that config is active.
-- **Start · Stop · Restart** — self-installs on first run, then `kickstart -k` /
-  `bootout` the agent (with EIO retry).
-- **Options** — H.264 / AAC / HiDPI / **Un-minimize on Cmd+Tab** / **App-switcher HUD** /
-  **Per-connection workers (reconnect fix)** checkmarks, **Drive / Smart-card
-  redirection** toggles, **UDP multitransport** + **↳ Move video to UDP (clean
-  link only)** (experimental; mutually exclusive with per-connection workers,
-  enforced with an alert), plus **Allow network connections** (flips `BIND` between
-  `127.0.0.1` and `0.0.0.0`, preserving the port, with a confirmation before
-  exposing to the LAN); shows the current listening address. All write
-  `config.env` and live-`kickstart` if running.
-- **Install smart-card handler…** — one-time privileged install of the PC/SC IFD
-  handler (the redirection toggle only flips the server flag). Pops up a list of
-  your **attached USB devices** to pick the load trigger (macOS loads the driver
-  only on a USB hotplug matching its VID/PID), passes the choice to the embedded
-  installer as `IFD_VID`/`IFD_PID`, and runs it (one admin prompt). Choose
-  *Keep default trigger* to leave the bundle's baked-in IDs.
-- **Display** — **Virtual display (headless)** toggle, a **Primary screen** radio
-  (`PRIMARY_MODE`: *Keep local screen on* / *Detach — move apps to remote* /
-  *Blank — keep apps on Mac*), and a **Virtual display resolution** picker
-  (1280×720 / 1600×900 / 1920×1080 default / 2560×1440). **Detach** disables the
-  physical panel so macOS moves your real apps onto the virtual display (the
-  responsive "remote into my desktop" setup); **Blank** (capture) just blacks the
-  panel and leaves apps on it. Both need the virtual display, so picking either
-  auto-enables it; turning the virtual display off resets the mode to *Keep on*.
-  A virtual display at the client's resolution is captured 1:1 (no scaling), so
-  it's snappier than mirroring a non-matching panel.
-- **Edit config… · Set/Change Account Password…** — edit flags; (re)store the
-  Keychain password.
-- **Open Logs** — opens `~/Library/Logs/macrdp.log`.
-- **Permissions** — Screen Recording / Accessibility with **live ✓ / needs-grant
-  status** (parsed from the server log); clicking opens the System Settings pane.
-- **Quit Controller** — quits the menu-bar app only; the server keeps running.
+Open **Show macrdp… → Display**. Changes stay in a draft until **Save** (server
+stopped) or **Apply & restart**. Applying while running disconnects remote
+sessions. **Reload** discards the draft and reads external edits.
+Double-clicking the running controller app also opens Settings, or brings its
+existing window forward without interrupting an Apply operation.
+
+- **Resolution policy:** follow the RDP client's requested size, or keep a fixed
+  Mac display pixel size. This follows the RDP request, which is not necessarily
+  the remote monitor's native resolution.
+- **Initial / fallback pixel size:** common presets include 3840 × 2160 (4K).
+  Existing custom sizes are retained; width and height can also be entered.
+- **Allow resolution changes during a session:** controls dynamic resolution
+  requests when following the client. A compatible client must send those
+  requests. It does not disable independent automatic scale selection.
+- **Mac interface scaling:** 100%, 200% HiDPI, or follow client scale
+  (experimental). 3840 × 2160 with 200% requests a 1920 × 1080 point workspace
+  rendered at 4K. Auto selects supported Mac scaling; arbitrary Windows scale
+  factors are not promised.
+- **Primary screen:** keep on, detach, or blank. The existing takeover and lock
+  controls remain available. Physical-display HiDPI capture is shown in Video
+  only when virtual display is off.
+
+The controller probes `--capabilities` on the LaunchAgent's server executable.
+New display controls require advertised key support, and saving requires
+`--check-config`. A matching version label alone is insufficient. Unsupported
+servers show an explanation instead of silently accepting unsupported options.
+
+**Status** reports client-requested pixels and scale, RDP output pixels, Mac
+workspace points, backing pixels, remote interface scale, Mac rendering scale and
+native pixel capture separately. Unknown or missing
+fields stay **Unknown**. Display phase is independent of server startup and
+H.264. Fallback details are shown only when the server reports a degraded display.
+The current session state comes from the server; TCP observations are labeled
+separately and do not prove a negotiated client capability. Historical log
+fingerprints are not presented as current client identity. The Permissions pane
+shows the current server’s startup checks, explicitly not live TCC status.
+
+Enable **Advanced → Live statistics endpoint** to obtain schema 2 display and
+startup status over loopback. The controller does not enable it automatically.
+With it off, Apply reports only a saved file and a stable restarted process;
+it explicitly leaves runtime display status unverified. When enabled, startup
+verification requires the new process ID, matching configuration revision and
+startup phase. No RDP login or display session is required to apply settings.
+
+## Reliable configuration saving
+
+The controller reads the server's plain `KEY=value` grammar, including `export`
+followed by whitespace and one matching pair of single or double quotes. It
+never executes shell syntax. Last duplicate values are read consistently; when
+a key is edited, its occurrences become one canonical assignment. Unrelated
+keys, comments and `EXTRA_FLAGS` are preserved. Validation conflicts must be
+resolved explicitly; validation warnings are presented for review before saving.
+
+A private candidate is validated without side effects, then atomically replaces
+the whole file once. External edits detected since loading or during validation
+abort the save. Sensitive temporary and recovery files are created with owner-only
+permissions from the first byte (preserving stricter existing owner permissions).
+The previous bytes are kept in `config.env.previous`. A failed restart or startup
+verification restores those exact bytes and attempts to restart the previous
+configuration; the UI reports both failures if recovery cannot be verified.
+An external edit after replacement is never overwritten by rollback.
+
+## Build verification without installing
+
+From the repository root:
+
+```bash
+swift build --package-path gui --scratch-path gui/.build --product macrdptray
+swift run --package-path gui --scratch-path gui/.build ConfigSupportTests
+```
+
+The Foundation-only test executable covers parsing, duplicate keys, comment and
+unknown-key preservation, rejected candidates, external edits, atomic save,
+rollback, concurrent controllers, private file permissions, EXTRA_FLAGS grouping
+and protocol version/unknown-value handling.
+It does not launch the server or touch user configuration. This target works with
+Command Line Tools installations that do not include XCTest.
+
+On CLT installations whose macOS 27 SDK requires an unavailable SwiftUIMacros
+plugin, an already installed macOS 26.5 SDK can be selected for this build only:
+
+```bash
+swift build --package-path gui --scratch-path gui/.build -c release \
+  --sdk /Library/Developer/CommandLineTools/SDKs/MacOSX26.5.sdk --product macrdptray
+swift run --package-path gui --scratch-path gui/.build \
+  --sdk /Library/Developer/CommandLineTools/SDKs/MacOSX26.5.sdk ConfigSupportTests
+```
+
+When installing later, `gui/make-tray-app.sh` accepts the same SDK path through
+`SWIFT_SDK=/Library/Developer/CommandLineTools/SDKs/MacOSX26.5.sdk`. The install
+script builds only the controller product.
+
+The build-only commands above do not change `xcode-select`, install Xcode, install the controller, or
+restart a service. Full interactive testing still requires launching a staged
+controller against a disposable test service; compilation alone does not verify
+macOS virtual display or real Windows client negotiation.
 
 ## Distribution (paid product)
 

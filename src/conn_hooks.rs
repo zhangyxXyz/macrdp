@@ -29,6 +29,12 @@ impl ConnectionHooks {
 }
 
 impl ConnectionHandler for ConnectionHooks {
+    fn on_server_ready(&mut self) {
+        for h in &mut self.0 {
+            h.on_server_ready();
+        }
+    }
+
     /// Stops at the first rejection, so a later hook never sees a connection an
     /// earlier one refused (put the auth guard first).
     fn on_accept(&mut self, peer: SocketAddr) -> bool {
@@ -108,6 +114,27 @@ impl ConnectionHandler for DesktopScaleHook {
     }
 }
 
+/// Reset connection-local display work on a real connection boundary only.
+pub struct DisplaySessionHook(pub Arc<crate::capture::DisplayLifecycle>);
+impl ConnectionHandler for DisplaySessionHook {
+    fn on_server_ready(&mut self) {
+        crate::stats::mark_listening();
+    }
+
+    fn on_connection_info(&mut self, info: &ConnectionInfo) {
+        self.0.begin(info.desktop_scale_factor);
+    }
+    fn on_disconnected(
+        &mut self,
+        _: SocketAddr,
+        _: Duration,
+        _: Option<&ServerError>,
+    ) -> PostConnectionAction {
+        self.0.end();
+        PostConnectionAction::Continue
+    }
+}
+
 /// With `--stats-endpoint`, clears the per-session stats when a connection ends,
 /// so the endpoint reports `connected:false` instead of the last session's numbers.
 /// Connections are served one at a time, and a preempting client is served only
@@ -142,6 +169,9 @@ mod tests {
     }
 
     impl ConnectionHandler for Probe {
+        fn on_server_ready(&mut self) {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+        }
         fn on_accept(&mut self, _peer: SocketAddr) -> bool {
             self.calls.fetch_add(1, Ordering::SeqCst);
             self.accept
@@ -218,6 +248,7 @@ mod tests {
         let (a, a_calls) = probe(true, false);
         let (b, b_calls) = probe(true, false);
         let mut hooks = ConnectionHooks::new(vec![a, b]);
+        hooks.on_server_ready();
         assert!(hooks.on_accept(PEER));
         hooks.on_connection_info(&info(0x0409));
         hooks.on_authenticated(true, None);
@@ -226,8 +257,8 @@ mod tests {
             hooks.on_disconnected(PEER, Duration::from_secs(1), None),
             PostConnectionAction::Continue
         );
-        assert_eq!(a_calls.load(Ordering::SeqCst), 5);
-        assert_eq!(b_calls.load(Ordering::SeqCst), 5);
+        assert_eq!(a_calls.load(Ordering::SeqCst), 6);
+        assert_eq!(b_calls.load(Ordering::SeqCst), 6);
     }
 
     #[test]

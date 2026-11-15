@@ -5,6 +5,7 @@
 # Env overrides:
 #   APP_DIR=/Applications              # install location (default /Applications)
 #   CODESIGN_IDENTITY="-"             # "-" = ad-hoc; or a Developer ID name
+#   SWIFT_SDK=/path/to/MacOSX.sdk     # optional per-build SDK override
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -24,7 +25,9 @@ VERSION="$(grep -m1 '^version' "$REPO_ROOT/Cargo.toml" | cut -d'"' -f2)"
 echo "==> macrdpController v$VERSION  (id: $CONTROLLER_ID, identity: $IDENTITY, install: $APP_DIR)"
 
 echo "==> swift build -c release"
-( cd "$GUI_DIR" && swift build -c release )
+SWIFT_ARGS=(--package-path "$GUI_DIR" --scratch-path "$GUI_DIR/.build" -c release --product macrdptray)
+if [ -n "${SWIFT_SDK:-}" ]; then SWIFT_ARGS+=(--sdk "$SWIFT_SDK"); fi
+swift build "${SWIFT_ARGS[@]}"
 BIN="$GUI_DIR/.build/release/macrdptray"
 [ -x "$BIN" ] || { echo "build produced no binary at $BIN" >&2; exit 1; }
 

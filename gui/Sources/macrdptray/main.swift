@@ -1,5 +1,6 @@
 import AppKit
 import UniformTypeIdentifiers
+import ConfigSupport
 
 // macrdp Controller: a menu-bar app that controls the macrdp LaunchAgent
 // (label com.clintcan.macrdp, installed by packaging/install-launchagent.sh)
@@ -40,6 +41,17 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     /// The tabbed Settings window (SettingsWindow.swift); nil while closed.
     var settingsWindowController: SettingsWindowController?
+    var configurationIsApplying: Bool { settingsWindowController?.model.isApplying == true }
+
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        configurationIsApplying ? .terminateCancel : .terminateNow
+    }
+
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        // Reuse the existing model/window, including an in-flight Apply transaction.
+        showSettings()
+        return true
+    }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory) // menu-bar only, no Dock icon
@@ -159,7 +171,11 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(.separator())
 
         let running = st.pid != nil
-        if running {
+        if configurationIsApplying {
+            let pending = NSMenuItem(title: "Applying settings — please wait", action: nil, keyEquivalent: "")
+            pending.isEnabled = false
+            menu.addItem(pending)
+        } else if running {
             menu.addItem(item("Stop", #selector(stop)))
             menu.addItem(item("Restart", #selector(restart)))
         } else {
@@ -168,7 +184,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
             menu.addItem(item(st.loaded ? "Start" : "Start (first run sets up)", #selector(start)))
         }
         menu.addItem(.separator())
-        menu.addItem(item("Quit Controller", #selector(quit)))
+        if !configurationIsApplying { menu.addItem(item("Quit Controller", #selector(quit))) }
     }
 
     func item(_ title: String, _ sel: Selector) -> NSMenuItem {
@@ -180,6 +196,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // MARK: - Actions
 
     @objc func start() {
+        guard !configurationIsApplying else { return }
         // Self-install on first run: locate the server app, onboard the Keychain
         // password, write + register the LaunchAgent — no Terminal step needed.
         guard let serverApp = locateServerApp() else {
@@ -201,11 +218,12 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc func stop() {
+        guard !configurationIsApplying else { return }
         _ = run("/bin/launchctl", ["bootout", service])
         refreshGlyph()
     }
 
-    @objc func restart() { start() }
+    @objc func restart() { if !configurationIsApplying { start() } }
 
     func ensureLoaded() {
         guard !agentState().loaded, FileManager.default.fileExists(atPath: plistURL.path) else { return }
@@ -553,12 +571,13 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
-    // Standard 16:9 virtual-display resolutions, highest 1440p; default 1920×1080.
+    // Common virtual-display pixel sizes; retain custom values in the settings model.
     static let resolutions: [(Int, Int, String)] = [
         (1280, 720, "1280 × 720"),
         (1600, 900, "1600 × 900"),
         (1920, 1080, "1920 × 1080 (1080p)"),
         (2560, 1440, "2560 × 1440 (1440p)"),
+        (3840, 2160, "3840 × 2160 (4K)"),
     ]
 
     /// (bundle id, menu label) curated shortcuts for the Ctrl→Cmd exclude list —
@@ -616,46 +635,16 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc func openAccessibility() {
         openURL("x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")
     }
-    @objc func quit() { NSApp.terminate(nil) }
+    @objc func quit() { if !configurationIsApplying { NSApp.terminate(nil) } }
 
     func openURL(_ s: String) { if let u = URL(string: s) { NSWorkspace.shared.open(u) } }
 
     // MARK: - config.env IO
 
     func readConfig() -> [String: String] {
-        guard let text = try? String(contentsOf: configURL, encoding: .utf8) else { return [:] }
-        var d: [String: String] = [:]
-        for raw in text.split(separator: "\n") {
-            let line = raw.trimmingCharacters(in: .whitespaces)
-            if line.isEmpty || line.hasPrefix("#") { continue }
-            guard let eq = line.firstIndex(of: "=") else { continue }
-            let k = String(line[..<eq]).trimmingCharacters(in: .whitespaces)
-            var v = String(line[line.index(after: eq)...]).trimmingCharacters(in: .whitespaces)
-            v = v.trimmingCharacters(in: CharacterSet(charactersIn: "\""))
-            d[k] = v
-        }
-        return d
-    }
-
-    func writeConfig(key: String, value: String) {
-        ensureConfigExists()
-        guard let text = try? String(contentsOf: configURL, encoding: .utf8) else { return }
-        var lines = text.components(separatedBy: "\n")
-        var found = false
-        for (i, raw) in lines.enumerated() {
-            let line = raw.trimmingCharacters(in: .whitespaces)
-            if line.hasPrefix("#") { continue }
-            guard let eq = line.firstIndex(of: "=") else { continue }
-            let k = String(line[..<eq]).trimmingCharacters(in: .whitespaces)
-            if k == key { lines[i] = "\(key)=\(value)"; found = true; break }
-        }
-        if !found { lines.append("\(key)=\(value)") }
-        // Always end with exactly one trailing newline — a config file with no
-        // final newline makes a downstream append concatenate onto the last
-        // key (which silently corrupted VD_HEIGHT + a new key once).
-        let body = lines.joined(separator: "\n")
-        let out = body.hasSuffix("\n") ? body : body + "\n"
-        try? out.write(to: configURL, atomically: true, encoding: .utf8)
+        guard let data = try? Data(contentsOf: configURL),
+              let document = try? ConfigDocument(data: data) else { return [:] }
+        return document.values
     }
 
     func ensureConfigExists() {

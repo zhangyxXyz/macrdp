@@ -198,6 +198,10 @@ impl ConnectionInfo {
 /// is the hook to use for embedders (such as those with their own
 /// multi-transport accept loop) that do not call `run`.
 pub trait ConnectionHandler: Send {
+    /// Called only after `run` has successfully bound and started its listener.
+    /// Default no-op; embedders with their own accept loop own their readiness.
+    fn on_server_ready(&mut self) {}
+
     /// Called after `accept()` returns but before `run_connection()`.
     ///
     /// Return `false` to reject the connection (the TCP stream is dropped).
@@ -629,20 +633,53 @@ impl dvc::DvcProcessor for AInputHandler {
 impl dvc::DvcServerProcessor for AInputHandler {}
 
 struct DisplayControlBackend {
-    display: Arc<Mutex<Box<dyn RdpServerDisplay>>>,
+    // One bounded, latest-value mailbox per channel. Spawning one blocking task
+    // per PDU let tasks acquire `display` out of receive order, and let queued
+    // layouts survive the channel that submitted them.
+    layouts: tokio::sync::watch::Sender<Option<DisplayControlMonitorLayout>>,
+    active: Arc<AtomicBool>,
+    worker: task::JoinHandle<()>,
     monitor_count: u32,
 }
 
 impl DisplayControlBackend {
     fn new(display: Arc<Mutex<Box<dyn RdpServerDisplay>>>, monitor_count: u32) -> Self {
-        Self { display, monitor_count }
+        let (layouts, mut receiver) = tokio::sync::watch::channel(None::<DisplayControlMonitorLayout>);
+        let active = Arc::new(AtomicBool::new(true));
+        let worker_active = active.clone();
+        let worker = task::spawn(async move {
+            while receiver.changed().await.is_ok() {
+                let mut display = display.lock().await;
+                if !worker_active.load(Ordering::Acquire) {
+                    break;
+                }
+                // Read AFTER taking the display lock: a resize/stream rebuild
+                // may have held it while many more layout PDUs arrived.
+                let latest = receiver.borrow_and_update().clone();
+                if let Some(layout) = latest {
+                    display.request_layout(layout);
+                }
+            }
+        });
+        Self {
+            layouts,
+            active,
+            worker,
+            monitor_count,
+        }
+    }
+}
+
+impl Drop for DisplayControlBackend {
+    fn drop(&mut self) {
+        self.active.store(false, Ordering::Release);
+        self.worker.abort();
     }
 }
 
 impl DisplayControlHandler for DisplayControlBackend {
     fn monitor_layout(&self, layout: DisplayControlMonitorLayout) {
-        let display = Arc::clone(&self.display);
-        task::spawn_blocking(move || display.blocking_lock().request_layout(layout));
+        self.layouts.send_replace(Some(layout));
     }
 
     fn capabilities(&self) -> PduResult<DisplayControlCapabilities> {
@@ -2492,10 +2529,18 @@ impl RdpServer {
         // replaced. `run` cleared the set itself, which left embedders driving
         // connections through this method with the previous session's backends
         // still live until the next client attached new ones.
-        self.static_channels = StaticChannelSet::new();
+        self.release_connection_channels().await;
         self.connection_local_addr = None;
 
         result
+    }
+
+    async fn release_connection_channels(&mut self) {
+        self.static_channels = StaticChannelSet::new();
+        // Dropping the display channel cancels queued layouts. A synchronous
+        // request_layout already holding this lock cannot be aborted, so drain
+        // it before on_disconnected resets shared state or the next client starts.
+        drop(self.display.lock().await);
     }
 
     async fn run_connection_inner<S>(&mut self, stream: S, tls: TransportTls) -> ServerResult<()>
@@ -2668,6 +2713,7 @@ impl RdpServer {
 
         debug!("Listening for connections on {local_addr}");
         self.local_addr = Some(local_addr);
+        with_connection_handler(self.connection_handler.as_ref(), |h| h.on_server_ready());
 
         // A candidate that wins a preemption race has ALREADY cleared
         // `on_accept` and fully authenticated by the time it lands here, so it
@@ -3031,7 +3077,7 @@ impl RdpServer {
             // reintroduce #1721's leak (channel backends, e.g. rdpsnd's audio
             // capture, held open until the next client) for every preemption
             // takeover.
-            self.static_channels = StaticChannelSet::new();
+            self.release_connection_channels().await;
             self.connection_local_addr = None;
             #[cfg(feature = "multitransport")]
             self.mt_teardown();
@@ -6373,11 +6419,121 @@ mod preempt_tests {
 
 #[cfg(test)]
 mod tests {
+    use crate::RdpServerDisplayUpdates;
+
     use ironrdp_core::impl_as_any;
     use ironrdp_pdu::gcc::ChannelName;
     use ironrdp_svc::{SvcMessage, SvcServerProcessor};
 
     use super::*;
+
+    struct LayoutRecorder(tokio::sync::mpsc::UnboundedSender<(u32, u32)>);
+    #[async_trait::async_trait]
+    impl RdpServerDisplay for LayoutRecorder {
+        async fn size(&mut self) -> DesktopSize {
+            DesktopSize {
+                width: 1920,
+                height: 1080,
+            }
+        }
+        async fn updates(&mut self) -> ServerResult<Box<dyn RdpServerDisplayUpdates>> {
+            unreachable!()
+        }
+        fn request_layout(&mut self, layout: DisplayControlMonitorLayout) {
+            self.0.send(layout.monitors()[0].dimensions()).unwrap();
+        }
+    }
+    fn layout(width: u32) -> DisplayControlMonitorLayout {
+        DisplayControlMonitorLayout::new_single_primary_monitor(width, 1080, Some(100), None).unwrap()
+    }
+
+    #[tokio::test]
+    async fn display_layout_mailbox_keeps_latest_after_waiting_for_display() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let display: Arc<Mutex<Box<dyn RdpServerDisplay>>> = Arc::new(Mutex::new(Box::new(LayoutRecorder(tx))));
+        let guard = display.lock().await;
+        let backend = DisplayControlBackend::new(display.clone(), 1);
+        backend.monitor_layout(layout(1920));
+        tokio::task::yield_now().await; // Worker is waiting for `display`.
+        for width in (2000..4000).step_by(2) {
+            backend.monitor_layout(layout(width));
+        }
+        backend.monitor_layout(layout(3840));
+        drop(guard);
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), rx.recv()).await.unwrap(),
+            Some((3840, 1080))
+        );
+        tokio::task::yield_now().await;
+        assert!(rx.try_recv().is_err(), "old intermediate layouts must not replay");
+    }
+
+    #[tokio::test]
+    async fn dropping_display_channel_cancels_its_queued_layout() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let display: Arc<Mutex<Box<dyn RdpServerDisplay>>> = Arc::new(Mutex::new(Box::new(LayoutRecorder(tx))));
+        let guard = display.lock().await;
+        let backend = DisplayControlBackend::new(display.clone(), 1);
+        backend.monitor_layout(layout(3840));
+        tokio::task::yield_now().await;
+        drop(backend);
+        drop(guard);
+        // Releasing the display owner closes the recorder channel once the
+        // cancelled worker has dropped its final Arc. No timeout is success.
+        drop(display);
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), rx.recv()).await.unwrap(),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn channel_teardown_drains_an_inflight_layout_before_next_session() {
+        struct SlowLayout {
+            entered: Option<tokio::sync::oneshot::Sender<()>>,
+            release: std::sync::mpsc::Receiver<()>,
+        }
+        #[async_trait::async_trait]
+        impl RdpServerDisplay for SlowLayout {
+            async fn size(&mut self) -> DesktopSize {
+                DesktopSize {
+                    width: 1920,
+                    height: 1080,
+                }
+            }
+            async fn updates(&mut self) -> ServerResult<Box<dyn RdpServerDisplayUpdates>> {
+                unreachable!()
+            }
+            fn request_layout(&mut self, _: DisplayControlMonitorLayout) {
+                self.entered.take().unwrap().send(()).unwrap();
+                self.release.recv().unwrap();
+            }
+        }
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let mut server = RdpServer::builder()
+            .with_addr(([127, 0, 0, 1], 0))
+            .with_no_security()
+            .with_no_input()
+            .with_no_display()
+            .build();
+        server.display = Arc::new(Mutex::new(Box::new(SlowLayout {
+            entered: Some(entered_tx),
+            release: release_rx,
+        })));
+        let display = server.display.clone();
+        let worker = std::thread::spawn(move || display.blocking_lock().request_layout(layout(3840)));
+        entered_rx.await.unwrap();
+        let cleanup = server.release_connection_channels();
+        tokio::pin!(cleanup);
+        tokio::select! {
+            _ = &mut cleanup => panic!("cleanup must wait for the in-flight old layout"),
+            _ = tokio::time::sleep(Duration::from_millis(10)) => {}
+        }
+        release_tx.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), cleanup).await.unwrap();
+        worker.join().unwrap();
+    }
 
     /// A channel backend that owns a resource, released on drop the way
     /// `RdpsndServer` stops its handler.

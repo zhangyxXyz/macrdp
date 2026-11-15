@@ -1,5 +1,7 @@
 import AppKit
 import SwiftUI
+import Combine
+import ConfigSupport
 
 // The tabbed Settings window opened by "Show macrdp…". A SwiftUI TabView hosted
 // in a plain NSWindow (the status-bar item stays AppKit). While the window is
@@ -36,6 +38,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
     }
 
     func windowShouldClose(_ sender: NSWindow) -> Bool {
+        guard !model.isApplying else { return false }
         guard model.isDirty else { return true }
         let a = NSAlert()
         a.messageText = "Discard unsaved changes?"
@@ -181,23 +184,39 @@ struct SettingsView: View {
 
                 Divider()
 
-                detail.frame(maxWidth: .infinity, maxHeight: .infinity)
+                detail.frame(maxWidth: .infinity, maxHeight: .infinity).disabled(model.isApplying)
             }
 
             Divider()
 
+            if let error = model.applyError ?? model.capabilityError {
+                ScrollView {
+                    Text(error).font(.caption).foregroundColor(.red).textSelection(.enabled)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }.frame(maxHeight: 95).padding(.horizontal, 12).padding(.top, 8)
+            }
+            if !model.reviewWarnings.isEmpty {
+                ScrollView {
+                    Text("Review before saving:\n" + model.reviewWarnings.joined(separator: "\n"))
+                        .font(.caption).foregroundColor(.orange).textSelection(.enabled)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }.frame(maxHeight: 85).padding(.horizontal, 12)
+            }
+
             HStack {
                 status
                 Spacer()
-                Button("Revert") { model.revert() }
-                    .disabled(!model.isDirty)
-                Button("Apply") { model.apply() }
+                Button("Reload") { model.revert() }
+                    .disabled(model.isApplying)
+                Button(model.reviewWarnings.isEmpty ? (model.serverRunning ? "Apply & restart" : "Save") : "Apply with warnings") {
+                    model.apply(acceptWarnings: !model.reviewWarnings.isEmpty)
+                }
                     .keyboardShortcut("s", modifiers: .command)
-                    .disabled(!model.isDirty)
+                    .disabled(!model.isDirty || model.isApplying || !model.canApply)
             }
             .padding(12)
         }
-        .frame(width: 660, height: 560)
+        .frame(width: 740, height: 640)
     }
 
     @ViewBuilder private var detail: some View {
@@ -215,13 +234,14 @@ struct SettingsView: View {
     }
 
     @ViewBuilder private var status: some View {
-        if model.isDirty {
-            Label("Unsaved changes — Apply to restart the server with them",
+        if model.isApplying {
+            ProgressView().controlSize(.small)
+            Text("Validating and applying…").font(.callout)
+        } else if let message = model.applyMessage {
+            Text(message).font(.caption).foregroundColor(.secondary)
+        } else if model.isDirty {
+            Label(model.serverRunning ? "Unsaved; applying disconnects remote sessions" : "Unsaved changes",
                   systemImage: "pencil.circle")
-                .font(.callout).foregroundColor(.secondary)
-        } else if model.lastAppliedAt != nil {
-            Label(model.serverRunning ? "Applied — server restarted" : "Applied (server not running)",
-                  systemImage: "checkmark.circle.fill")
                 .font(.callout).foregroundColor(.secondary)
         } else {
             Text(model.serverRunning ? "Server running" : "Server stopped")
@@ -284,6 +304,9 @@ private struct VideoTab: View {
     @ObservedObject var model: SettingsModel
     var body: some View {
         Form {
+            if let overrides = model.displayOverrides {
+                Text(overrides).font(.caption).foregroundColor(.orange)
+            }
             Section {
                 Toggle("H.264 video (EGFX / AVC420)", isOn: model.boolBinding("ENABLE_H264"))
                 Text("Streams the screen as H.264 — far less bandwidth than legacy bitmaps. "
@@ -304,11 +327,14 @@ private struct VideoTab: View {
                     + "clean link it stays at the ceiling. H.264 only.")
                     .font(.caption).foregroundColor(.secondary)
             }
-            Section {
+            if !model.bool("VIRTUAL_DISPLAY") { Section {
                 Toggle("HiDPI capture (Retina pixels)", isOn: model.boolBinding("HIDPI"))
                 Text("Captures the primary display at backing (Retina) resolution — crisper, ~4× the "
                     + "pixels. Best with H.264 and a fast client; mstsc can feel laggy at HiDPI.")
                     .font(.caption).foregroundColor(.secondary)
+            } } else {
+                Section { Text("Virtual-display scaling is configured in Display. The mirror capture HiDPI setting does not control it.")
+                    .font(.caption).foregroundColor(.secondary) }
             }
         }
         .formStyle(.grouped)
@@ -336,16 +362,52 @@ private struct DisplayTab: View {
         Form {
             Section("Virtual display") {
                 Toggle("Headless virtual display", isOn: model.boolBinding("VIRTUAL_DISPLAY"))
-                Text("Serves a headless display at the resolution below instead of mirroring the "
-                    + "physical panel — the local Mac screen stays free.")
+                Text("Creates a separate Mac display for the remote session. Client requests and macOS display limits determine the actual result; see Status after connecting.")
                     .font(.caption).foregroundColor(.secondary)
-                Picker("Resolution", selection: Binding(
-                    get: { model.resolution }, set: { model.setResolution($0) })) {
-                    ForEach(AppController.resolutions, id: \.2) { w, h, label in
-                        Text(label).tag("\(w)x\(h)")
-                    }
+                        .lineLimit(nil).fixedSize(horizontal: false, vertical: true)
+                if let overrides = model.displayOverrides {
+                    Text(overrides).font(.caption).foregroundColor(.orange)
+                        .lineLimit(nil).fixedSize(horizontal: false, vertical: true)
                 }
-                .disabled(!model.bool("VIRTUAL_DISPLAY"))
+                if !model.supportsDisplayPolicy {
+                    Text("This server has not advertised support for display policies. Update the server to edit these settings.")
+                        .font(.caption).foregroundColor(.orange)
+                        .lineLimit(nil).fixedSize(horizontal: false, vertical: true)
+                }
+                Group {
+                    Picker("Resolution policy", selection: Binding(get: { model.resolutionPolicy }, set: { model.setString("RESOLUTION_POLICY", $0) })) {
+                        Text("Follow remote client's request").tag("client")
+                        Text("Fixed pixel size").tag("fixed")
+                        if !["client", "fixed"].contains(model.resolutionPolicy) { Text("Unknown / invalid").tag(model.resolutionPolicy) }
+                    }
+                    Picker(model.resolutionPolicy == "fixed" ? "Pixel size" : "Initial / fallback pixel size", selection: Binding(
+                        get: { model.resolution }, set: { model.setResolution($0) })) {
+                        ForEach(model.resolutionOptions, id: \.0) { value, label in Text(label).tag(value) }
+                    }
+                    HStack {
+                        TextField("Width", text: model.stringBinding("VD_WIDTH", default: "1920"))
+                        Text("×")
+                        TextField("Height", text: model.stringBinding("VD_HEIGHT", default: "1080"))
+                    }
+                    Toggle("Allow resolution changes during a session", isOn: Binding(
+                        get: { model.resolutionPolicy == "client" && model.bool("LIVE_RESIZE", default: true) },
+                        set: { model.setBool("LIVE_RESIZE", $0) }))
+                        .disabled(model.resolutionPolicy == "fixed")
+                    Picker("Mac interface scaling", selection: Binding(get: { model.virtualScale }, set: { model.setString("VD_HIDPI", $0) })) {
+                        Text("100% — standard pixels").tag("0")
+                        Text("200% — HiDPI").tag("1")
+                        Text("Follow client scale — experimental").tag("auto")
+                        if !["0", "1", "auto"].contains(model.virtualScale) { Text("Unknown / invalid").tag(model.virtualScale) }
+                    }
+                    Text(model.resolutionPolicy == "client"
+                         ? "Uses the size requested by RDP, which may differ from the remote monitor. Live changes require client support; that capability is unknown until a request arrives."
+                         : "Keeps this Mac display size when clients connect or resize. The client may fit the image to its window.")
+                        .font(.caption).foregroundColor(.secondary)
+                        .lineLimit(nil).fixedSize(horizontal: false, vertical: true)
+                    Text("4K at 200% requests a 3840 × 2160 pixel image with a 1920 × 1080 point workspace. Auto chooses supported Mac scaling; it does not promise arbitrary Windows scale factors.")
+                        .font(.caption).foregroundColor(.secondary)
+                        .lineLimit(nil).fixedSize(horizontal: false, vertical: true)
+                }.disabled(!model.bool("VIRTUAL_DISPLAY") || !model.supportsDisplayPolicy)
             }
             Section("Primary screen (while connected)") {
                 Picker("Physical panel", selection: Binding(
@@ -360,6 +422,7 @@ private struct DisplayTab: View {
                     + "while engaged the Mac CANNOT be locked. “Blank (lockable)” shields with a black "
                     + "window and stays lockable.")
                     .font(.caption).foregroundColor(.secondary)
+                        .lineLimit(nil).fixedSize(horizontal: false, vertical: true)
             }
             Section("Lock while away (experimental)") {
                 let headless = model.primaryMode != "none"
@@ -372,16 +435,19 @@ private struct DisplayTab: View {
                 if !headless {
                     Text("Needs one of the Detach/Blank modes above.")
                         .font(.caption).foregroundColor(.secondary)
+                        .lineLimit(nil).fixedSize(horizontal: false, vertical: true)
                 } else if model.bool("LOCK_ON_DISCONNECT") && !model.bool("AUTO_UNLOCK") {
                     Text("Without automatic unlock you'll need to be at the Mac to unlock it — "
                         + "a remote-only Mac would be unreachable once it locks.")
                         .font(.caption).foregroundColor(.orange)
+                        .lineLimit(nil).fixedSize(horizontal: false, vertical: true)
                 }
                 Text("Locking starts the screen saver about 25 s after you leave; it's only a real lock "
                     + "if “Require password after screen saver begins” is set to Immediately "
                     + "(Lock Screen settings). Automatic unlock types your account password into the "
                     + "lock screen — while it's unlocked, anyone at the Mac has your desktop.")
                     .font(.caption).foregroundColor(.secondary)
+                        .lineLimit(nil).fixedSize(horizontal: false, vertical: true)
             }
         }
         .formStyle(.grouped)
@@ -550,12 +616,14 @@ private struct PermissionsTab: View {
     @ObservedObject var model: SettingsModel
     @State private var screen: Bool?
     @State private var accessibility: Bool?
+    @State private var statusNote = "Reading the server's startup permission checks…"
 
     var body: some View {
         Form {
             Text("macrdp needs these grants (owned by the server binary, not this controller). "
-                + "Status is read from the server log.")
+                + "These are startup checks, not live TCC status.")
                 .font(.caption).foregroundColor(.secondary)
+            Text(statusNote).font(.caption).foregroundColor(.secondary)
             Section("Screen Recording") {
                 permRow(granted: screen) { model.controller.openScreenRecording() }
             }
@@ -569,18 +637,35 @@ private struct PermissionsTab: View {
     }
 
     private func refresh() {
-        let ps = model.controller.permissionStatus()
-        screen = ps.screen
-        accessibility = ps.accessibility
+        let controller = model.controller
+        DispatchQueue.global(qos: .utility).async {
+            let result = Result { () throws -> DisplaySnapshot in
+                let snapshot = try controller.displaySnapshot()
+                guard let pid = controller.agentState().pid, snapshot.pid == pid else {
+                    throw ConfigError.invalid("No permission checks from the current server process.")
+                }
+                return snapshot
+            }
+            DispatchQueue.main.async {
+                switch result {
+                case .success(let snapshot):
+                    screen = snapshot.startup["screen_recording"] as? Bool
+                    accessibility = snapshot.startup["accessibility"] as? Bool
+                    statusNote = "Reported by the current server at startup. Restart after changing permissions to recheck."
+                case .failure(let error):
+                    screen = nil; accessibility = nil; statusNote = error.localizedDescription
+                }
+            }
+        }
     }
 
     @ViewBuilder private func permRow(granted: Bool?, open: @escaping () -> Void) -> some View {
         HStack {
             switch granted {
             case .some(true):
-                Label("Granted", systemImage: "checkmark.circle.fill").foregroundColor(.green)
+                Label("Granted at startup", systemImage: "checkmark.circle.fill").foregroundColor(.green)
             case .some(false):
-                Label("Not granted", systemImage: "xmark.circle.fill").foregroundColor(.red)
+                Label("Not granted at startup", systemImage: "xmark.circle.fill").foregroundColor(.red)
             case .none:
                 Label("Unknown — open to grant", systemImage: "questionmark.circle").foregroundColor(.secondary)
             }
@@ -603,14 +688,11 @@ struct ServerStats {
     static let stopped = ServerStats(running: false, pid: 0, uptime: "", rssMB: 0, cpu: 0, memPct: 0)
 }
 
-/// The currently-connected RDP client, from `lsof` (established TCP on the RDP
-/// port) + the server log's fingerprint line.
+/// An observed TCP peer; it may still be authenticating and has no verified identity.
 struct ConnectionInfo {
     let connected: Bool
     let ip: String?
-    let name: String?
-    let build: String?
-    static let none = ConnectionInfo(connected: false, ip: nil, name: nil, build: nil)
+    static let none = ConnectionInfo(connected: false, ip: nil)
 }
 
 /// Live H.264 telemetry from the server's opt-in loopback stats endpoint.
@@ -629,6 +711,9 @@ private struct StatusView: View {
     @State private var stats: ServerStats = .stopped
     @State private var conn: ConnectionInfo = .none
     @State private var live: LiveStats?
+    @State private var displayStatus: DisplaySnapshot?
+    @State private var displayError: String?
+    @State private var refreshing = false
     // Only ticks while this pane is on screen (subscription cancels on disappear).
     private let tick = Timer.publish(every: 2, on: .main, in: .common).autoconnect()
 
@@ -642,17 +727,48 @@ private struct StatusView: View {
                     row("CPU", String(format: "%.1f%%", stats.cpu))
                 }
             }
-            Section("Connection") {
-                if conn.connected {
-                    row("Client", conn.name ?? "connected")
-                    if let ip = conn.ip { row("Address", ip) }
-                    if let b = conn.build { row("Windows build", b) }
+            Section("Remote display — reported by server") {
+                if let d = displayStatus {
+                    row("Server startup", d.startup["phase"] as? String ?? "Unknown")
+                    row("Display state", d.phase ?? "Unknown")
+                    row("Client-requested pixels", d.dimensions("requested"))
+                    row("Client-requested scale", d.scale("requested"))
+                    row("RDP output pixels", d.dimensions("wire"))
+                    row("Mac workspace (points)", d.dimensions("actual", width: "points_width", height: "points_height"))
+                    row("Mac backing pixels", d.dimensions("actual", width: "backing_width", height: "backing_height"))
+                    row("Remote interface scale", d.scale("actual"))
+                    row("Mac rendering scale", d.scale("actual", key: "backing_scale_percent"))
+                    row("Native pixel capture", ((d.display["actual"] as? [String: Any])?["native_capture"] as? Bool).map { $0 ? "Yes" : "No" } ?? "Unknown")
+                    if d.phase == "idle" {
+                        Text("No display request has been applied in this session.").font(.caption).foregroundColor(.secondary)
+                        .lineLimit(nil).fixedSize(horizontal: false, vertical: true)
+                    }
+                    if d.phase == "degraded", let reason = d.display["fallback_reason"] as? String {
+                        Text(reason).font(.caption).foregroundColor(.orange)
+                        .lineLimit(nil).fixedSize(horizontal: false, vertical: true)
+                    }
                 } else {
-                    Text(stats.running ? "No client connected." : "Server not running.")
-                        .foregroundColor(.secondary)
+                    Text(displayError ?? "Waiting for status…").font(.caption).foregroundColor(.secondary)
+                        .lineLimit(nil).fixedSize(horizontal: false, vertical: true)
+                    Text("Requested settings are not proof of the active display mode.").font(.caption).foregroundColor(.secondary)
+                        .lineLimit(nil).fixedSize(horizontal: false, vertical: true)
                 }
             }
-            if conn.connected {
+            Section("Connection") {
+                if let connected = displayStatus?.object["connected"] as? Bool {
+                    row("RDP session", connected ? "Connected (server reported)" : "Disconnected (server reported)")
+                    row("Client identity", "Unknown")
+                } else {
+                    Text(conn.connected ? "TCP connection observed; RDP session is unverified." : "No TCP connection observed; RDP session status is unknown.")
+                        .foregroundColor(.secondary)
+                        .lineLimit(nil).fixedSize(horizontal: false, vertical: true)
+                }
+                if let ip = conn.ip { row("Observed TCP peer", ip) }
+                Text("Client support for live resolution changes is unknown until it sends a request.")
+                    .font(.caption).foregroundColor(.secondary)
+                        .lineLimit(nil).fixedSize(horizontal: false, vertical: true)
+            }
+            if displayStatus?.object["connected"] as? Bool == true {
                 Section("Video (H.264)") {
                     if let l = live {
                         row("Bitrate", bitrateText(l))
@@ -664,6 +780,7 @@ private struct StatusView: View {
                         Text("Turn on “Live statistics endpoint” in Advanced (then Apply) to see "
                             + "bitrate, link RTT and frame-rate here. Shown only over H.264.")
                             .font(.caption).foregroundColor(.secondary)
+                        .lineLimit(nil).fixedSize(horizontal: false, vertical: true)
                     }
                 }
             }
@@ -674,6 +791,8 @@ private struct StatusView: View {
     }
 
     private func refresh() {
+        guard !refreshing else { return }
+        refreshing = true
         // Gather off the main thread — serverStats/currentConnection/liveStats each
         // shell out (launchctl/ps/lsof/nc); doing that on the main thread every 2 s
         // would jank the UI. Publish the results back on main.
@@ -681,11 +800,20 @@ private struct StatusView: View {
         DispatchQueue.global(qos: .utility).async {
             let s = controller.serverStats()
             let c = controller.currentConnection()
-            let l = c.connected ? controller.liveStats() : nil
+            let display = Result { try controller.displaySnapshot() }
             DispatchQueue.main.async {
                 stats = s
                 conn = c
-                live = l
+                refreshing = false
+                switch display {
+                case .success(let snapshot) where snapshot.pid == s.pid && s.running:
+                    displayStatus = snapshot; displayError = nil
+                    live = controller.liveStats(from: snapshot.object)
+                case .success:
+                    displayStatus = nil; live = nil; displayError = "Display status belongs to a different process; waiting for the current server."
+                case .failure(let error):
+                    displayStatus = nil; live = nil; displayError = error.localizedDescription
+                }
             }
         }
     }
@@ -709,14 +837,6 @@ private struct StatusView: View {
 
 // MARK: - Stats gathering + About (controller-side, no server change)
 
-/// Pull `client_name=…` / `client_build=…` style values out of a log line.
-private func logCapture(_ line: String, _ pattern: String) -> String? {
-    guard let r = line.range(of: pattern, options: .regularExpression) else { return nil }
-    let m = String(line[r])
-    if let eq = m.firstIndex(of: "=") { return String(m[m.index(after: eq)...]) }
-    return m
-}
-
 extension AppController {
     /// Live RSS / CPU / uptime of the server process (via `ps`).
     func serverStats() -> ServerStats {
@@ -731,12 +851,11 @@ extension AppController {
             rssMB: (Double(f[0]) ?? 0) / 1024, cpu: Double(f[1]) ?? 0, memPct: Double(f[3]) ?? 0)
     }
 
-    /// The connected RDP client, if any (established TCP on the RDP port via
-    /// `lsof`, with client name/build best-effort from the server log).
+    /// An observed TCP peer, not proof of an authenticated RDP session.
     func currentConnection() -> ConnectionInfo {
         guard let pid = agentState().pid else { return .none }
         let port = (readConfig()["BIND"] ?? "127.0.0.1:3390").split(separator: ":").last.map(String.init) ?? "3390"
-        let out = run("/usr/sbin/lsof", ["-nP", "-p", String(pid), "-iTCP", "-sTCP:ESTABLISHED"])
+        let out = run("/usr/sbin/lsof", ["-nP", "-a", "-p", String(pid), "-iTCP", "-sTCP:ESTABLISHED"])
         var ip: String?
         for raw in out.stdout.split(separator: "\n") {
             let line = String(raw)
@@ -744,32 +863,19 @@ extension AppController {
             // The RDP client connection is the one whose LOCAL endpoint is the RDP
             // port (loopback helper channels have other local ports).
             guard line[..<arrow.lowerBound].hasSuffix(":\(port)") else { continue }
-            let host = line[arrow.upperBound...].split(separator: ":").first.map(String.init)
-            if let h = host, h != "127.0.0.1", h != "::1", !h.isEmpty { ip = h; break }
+            let remote = line[arrow.upperBound...].split(whereSeparator: { $0.isWhitespace }).first ?? ""
+            if let colon = remote.lastIndex(of: ":") {
+                let host = String(remote[..<colon]).trimmingCharacters(in: CharacterSet(charactersIn: "[]"))
+                if !host.isEmpty { ip = host; break }
+            }
         }
         guard let clientIP = ip else { return .none }
-        var name: String?
-        var build: String?
-        for line in logTail() where line.contains("client fingerprint client_name=") {
-            name = logCapture(line, #"client_name=(\S+)"#)   // later lines win
-            build = logCapture(line, #"client_build=(\d+)"#)
-        }
-        return ConnectionInfo(connected: true, ip: clientIP, name: name, build: build)
+        return ConnectionInfo(connected: true, ip: clientIP)
     }
 
-    /// Live H.264 telemetry from the server's opt-in loopback stats endpoint
-    /// (nil if it isn't enabled / not reachable). `nc` reads the single JSON line
-    /// the endpoint writes on connect, then exits when the server closes; `</dev/null`
-    /// so it never waits on stdin and `-w 1` caps it if the port isn't listening.
-    func liveStats() -> LiveStats? {
-        // The port is interpolated into a shell command below, and config.env is
-        // user-editable — so validate it's a real port number (digits, 1…65535).
-        // A non-numeric value can never reach the shell; it falls back to 40245.
-        let raw = readConfig()["STATS_PORT"].flatMap { $0.isEmpty ? nil : $0 } ?? "40245"
-        let port = UInt16(raw).flatMap { $0 == 0 ? nil : String($0) } ?? "40245"
-        let out = run("/bin/bash", ["-c", "/usr/bin/nc -w 1 127.0.0.1 \(port) </dev/null 2>/dev/null"])
-        guard let data = out.stdout.data(using: .utf8),
-              let o = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
+    /// H.264 telemetry from the same process-checked status snapshot as display state.
+    func liveStats(from o: [String: Any]) -> LiveStats? {
+        guard (o["frames_sent"] as? NSNumber)?.intValue ?? 0 > 0 else { return nil }
         func int(_ k: String) -> Int { (o[k] as? NSNumber)?.intValue ?? 0 }
         func bool(_ k: String) -> Bool { (o[k] as? NSNumber)?.boolValue ?? false }
         return LiveStats(
