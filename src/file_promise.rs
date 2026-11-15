@@ -141,6 +141,152 @@ pub struct RemoteEntry {
     pub relative_path: Option<String>,
 }
 
+/// Image-only virtual-file copies are fully downloaded and decoded before URLs
+/// become visible. Apps that bypass NSFileCoordinator must never read holes.
+pub fn spawn_remote_images(
+    entries: Vec<RemoteEntry>,
+    router: DownloadRouter,
+    sender: EventSender,
+    current_temp_dir: Arc<Mutex<Option<PathBuf>>>,
+    self_change_count: SelfChangeCount,
+    ticket: crate::clipboard_image::CopyTicket,
+) {
+    let Ok(rt) = tokio::runtime::Handle::try_current() else {
+        return;
+    };
+    crate::file_promise_lazy::cleanup_previous(&current_temp_dir);
+    let dir = match make_temp_dir() {
+        Ok(dir) => dir,
+        Err(error) => {
+            warn!(%error, "image clipboard staging failed");
+            return;
+        }
+    };
+    use std::os::unix::fs::PermissionsExt;
+    let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+    *current_temp_dir.lock().unwrap() = Some(dir.clone());
+    rt.spawn(async move {
+        let work = async {
+            let mut paths = Vec::new();
+            for entry in &entries {
+                let path = resolve_dest(&dir, entry)
+                    .ok_or_else(|| anyhow::anyhow!("unsafe image path"))?;
+                anyhow::ensure!(!paths.contains(&path), "duplicate image path");
+                paths.push(path);
+            }
+            let specs = entries
+                .iter()
+                .map(|e| crate::clipboard_image::ImageSpec {
+                    index: e.index,
+                    size: e.size,
+                })
+                .collect();
+            let images = crate::clipboard_image::prepare_images(specs, &ticket, |spec, budget| {
+                let router = router.clone();
+                let sender = sender.clone();
+                let path =
+                    paths[entries.iter().position(|e| e.index == spec.index).unwrap()].clone();
+                async move {
+                    let total = match spec.size {
+                        Some(size) => size,
+                        None => fetch_size(spec.index, &router, &sender)
+                            .await
+                            .map_err(anyhow::Error::msg)?,
+                    };
+                    anyhow::ensure!(
+                        total > 0 && total <= budget,
+                        "image download byte limit exceeded"
+                    );
+                    fetch_one_file(
+                        spec.index,
+                        Some(total),
+                        &path,
+                        &router,
+                        &sender,
+                        LAZY_PARALLEL_CHUNKS,
+                        LAZY_CHUNK_SIZE,
+                    )
+                    .await
+                    .map_err(anyhow::Error::msg)?;
+                    Ok(tokio::task::spawn_blocking(move || std::fs::read(path)).await??)
+                }
+            })
+            .await?;
+            anyhow::ensure!(
+                publish_ready_images(
+                    &paths,
+                    &images,
+                    &ticket,
+                    &current_temp_dir,
+                    &dir,
+                    &self_change_count
+                ),
+                "image copy superseded before publication"
+            );
+            info!(
+                count = images.len(),
+                "validated image clipboard published (complete files and PNG data)"
+            );
+            Ok(())
+        };
+        let result: anyhow::Result<()> = tokio::select! {
+            result = tokio::time::timeout(std::time::Duration::from_secs(120), work) => result.unwrap_or_else(|_| Err(anyhow::anyhow!("image download timed out"))),
+            _ = ticket.superseded() => Err(anyhow::anyhow!("clipboard copy superseded")),
+        };
+        if let Err(error) = result {
+            warn!(%error, "image clipboard not published");
+            let mut current = current_temp_dir.lock().unwrap();
+            if current.as_ref() == Some(&dir) {
+                current.take();
+            }
+            drop(current);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    });
+}
+
+fn publish_ready_images(
+    paths: &[PathBuf],
+    images: &[Vec<u8>],
+    ticket: &crate::clipboard_image::CopyTicket,
+    current_temp_dir: &Arc<Mutex<Option<PathBuf>>>,
+    dir: &Path,
+    mark: &SelfChangeCount,
+) -> bool {
+    use objc2_app_kit::{NSPasteboardItem, NSPasteboardTypeFileURL, NSPasteboardTypePNG};
+    use objc2_foundation::NSData;
+    let _guard = crate::clipboard::pasteboard_guard();
+    let current = current_temp_dir.lock().unwrap();
+    unsafe {
+        let pb = crate::clipboard::pasteboard();
+        if !ticket.may_publish(pb.changeCount() as i64) || current.as_deref() != Some(dir) {
+            return false;
+        }
+        let mut writers: Vec<Retained<ProtocolObject<dyn objc2_app_kit::NSPasteboardWriting>>> =
+            Vec::new();
+        for (path, png) in paths.iter().zip(images) {
+            let Some(path) = path.to_str() else {
+                return false;
+            };
+            let url = NSURL::fileURLWithPath(&NSString::from_str(path));
+            let item = NSPasteboardItem::new();
+            let Some(url_string) = url.absoluteString() else {
+                return false;
+            };
+            if !item.setString_forType(&url_string, NSPasteboardTypeFileURL)
+                || !item.setData_forType(&NSData::with_bytes(png), NSPasteboardTypePNG)
+            {
+                return false;
+            }
+            writers.push(ProtocolObject::from_retained(item));
+        }
+        crate::clipboard::begin_local_write(&pb);
+        let ok = pb.writeObjects(&NSArray::from_vec(writers));
+        mark.store(pb.changeCount() as i64, Ordering::Relaxed);
+        ok
+    }
+}
+
 /// Spawned by `on_remote_file_list`: downloads every entry in `entries`
 /// into a fresh temp directory (recreating the directory structure from
 /// the `relative_path` fields), then publishes the **top-level** paths
@@ -535,28 +681,38 @@ async fn chunk_task(
     file: Arc<std::fs::File>,
 ) -> Result<(), String> {
     use std::os::unix::fs::FileExt;
-    let bytes = fetch_range(index, position, requested_size, &router, &sender).await?;
-    if bytes.is_empty() {
-        return Err(format!(
-            "short read at {position}; expected {requested_size} bytes, got 0"
-        ));
-    }
-    // pwrite (write_at) is positional — no shared offset on the fd, so
-    // concurrent chunk tasks writing to disjoint byte ranges are safe
-    // on the same Arc<File>. A short write here means the underlying
-    // pwrite returned fewer bytes than requested; loop until done.
-    let mut written = 0usize;
-    while written < bytes.len() {
-        let n = file
-            .write_at(&bytes[written..], position + written as u64)
-            .map_err(|e| format!("write_at @ {}: {e}", position + written as u64))?;
-        if n == 0 {
+    let mut received = 0u32;
+    while received < requested_size {
+        let remaining = requested_size - received;
+        let bytes = fetch_range(
+            index,
+            position + u64::from(received),
+            remaining,
+            &router,
+            &sender,
+        )
+        .await?;
+        if bytes.is_empty() || bytes.len() > remaining as usize {
             return Err(format!(
-                "write_at @ {} returned 0 bytes",
-                position + written as u64
+                "invalid range read at {}: expected 1..={remaining}, got {}",
+                position + u64::from(received),
+                bytes.len()
             ));
         }
-        written += n;
+        let mut written = 0usize;
+        while written < bytes.len() {
+            let n = file
+                .write_at(
+                    &bytes[written..],
+                    position + u64::from(received) + written as u64,
+                )
+                .map_err(|e| format!("write_at: {e}"))?;
+            if n == 0 {
+                return Err("write_at returned zero".into());
+            }
+            written += n;
+        }
+        received += bytes.len() as u32;
     }
     Ok(())
 }
@@ -684,5 +840,203 @@ mod tests {
             resolve_dest(root, &entry("a.txt", Some(""))).unwrap(),
             std::path::PathBuf::from("/tmp/root/a.txt")
         );
+    }
+    #[tokio::test]
+    async fn short_range_reads_are_completed_without_zero_filled_tails() {
+        let dir = make_temp_dir().unwrap();
+        let path = dir.join("bytes");
+        let router = DownloadRouter::default();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let sender = Arc::new(Mutex::new(Some(tx)));
+        let route = router.clone();
+        let remote = tokio::spawn(async move {
+            for (position, payload) in [(0, b"abc".as_slice()), (3, b"def".as_slice())] {
+                let ServerEvent::Clipboard(ClipboardMessage::SendFileContentsRequest(req)) =
+                    rx.recv().await.unwrap()
+                else {
+                    panic!("unexpected event");
+                };
+                assert_eq!(req.position, position);
+                assert_eq!(req.requested_size, 6 - position as u32);
+                route.deliver(FileContentsResponse::new_data_response(
+                    req.stream_id,
+                    payload.to_vec(),
+                ));
+            }
+        });
+        fetch_one_file(0, Some(6), &path, &router, &sender, 1, 6)
+            .await
+            .unwrap();
+        remote.await.unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"abcdef");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[tokio::test]
+    async fn empty_and_oversized_ranges_fail_instead_of_publishing_holes() {
+        for payload in [vec![], vec![1; 7]] {
+            let dir = make_temp_dir().unwrap();
+            let path = dir.join("bytes");
+            let router = DownloadRouter::default();
+            let (tx, mut rx) = mpsc::unbounded_channel();
+            let sender = Arc::new(Mutex::new(Some(tx)));
+            let route = router.clone();
+            let remote = tokio::spawn(async move {
+                let ServerEvent::Clipboard(ClipboardMessage::SendFileContentsRequest(req)) =
+                    rx.recv().await.unwrap()
+                else {
+                    panic!("unexpected event");
+                };
+                route.deliver(FileContentsResponse::new_data_response(
+                    req.stream_id,
+                    payload,
+                ));
+            });
+            assert!(fetch_one_file(0, Some(6), &path, &router, &sender, 1, 6)
+                .await
+                .is_err());
+            remote.await.unwrap();
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+    }
+    #[test]
+    fn ready_image_publication_includes_real_file_and_rejects_local_copy_races() {
+        use image::ImageEncoder;
+        let dir = make_temp_dir().unwrap();
+        let path = dir.join("Screenshot.png");
+        let mut png = Vec::new();
+        image::codecs::png::PngEncoder::new(&mut png)
+            .write_image(&[20, 50, 90, 255], 1, 1, image::ExtendedColorType::Rgba8)
+            .unwrap();
+        std::fs::write(&path, &png).unwrap();
+        let slot = Arc::new(Mutex::new(Some(dir.clone())));
+        let mark = Arc::new(AtomicI64::new(-1));
+        let epoch = Arc::new(std::sync::atomic::AtomicU64::new(1));
+        let cc = {
+            let _g = crate::clipboard::pasteboard_guard();
+            unsafe { crate::clipboard::pasteboard().changeCount() as i64 }
+        };
+        let ticket = crate::clipboard_image::CopyTicket::new(epoch, cc);
+        assert!(publish_ready_images(
+            std::slice::from_ref(&path),
+            &[png.clone()],
+            &ticket,
+            &slot,
+            &dir,
+            &mark
+        ));
+        assert_eq!(std::fs::read(&path).unwrap(), png);
+        let _guard = crate::clipboard::pasteboard_guard();
+        unsafe {
+            let pb = crate::clipboard::pasteboard();
+            assert!(pb.dataForType(objc2_app_kit::NSPasteboardTypePNG).is_some());
+            assert!(pb
+                .stringForType(objc2_app_kit::NSPasteboardTypeFileURL)
+                .is_some());
+            pb.clearContents();
+            pb.setString_forType(
+                &NSString::from_str("new local copy"),
+                objc2_app_kit::NSPasteboardTypeString,
+            );
+        }
+        drop(_guard);
+        assert!(!publish_ready_images(
+            &[path],
+            &[png],
+            &ticket,
+            &slot,
+            &dir,
+            &mark
+        ));
+        let _guard = crate::clipboard::pasteboard_guard();
+        unsafe {
+            assert_eq!(
+                crate::clipboard::pasteboard()
+                    .stringForType(objc2_app_kit::NSPasteboardTypeString)
+                    .unwrap()
+                    .to_string(),
+                "new local copy"
+            );
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[tokio::test(flavor = "current_thread")]
+    async fn virtual_screenshot_publishes_nothing_until_every_byte_arrives() {
+        use image::ImageEncoder;
+        let mut png = Vec::new();
+        image::codecs::png::PngEncoder::new(&mut png)
+            .write_image(&[7, 18, 29, 255], 1, 1, image::ExtendedColorType::Rgba8)
+            .unwrap();
+        let initial = {
+            let _guard = crate::clipboard::pasteboard_guard();
+            unsafe {
+                let pb = crate::clipboard::pasteboard();
+                pb.clearContents();
+                pb.changeCount() as i64
+            }
+        };
+        let ticket = crate::clipboard_image::CopyTicket::new(
+            Arc::new(std::sync::atomic::AtomicU64::new(1)),
+            initial,
+        );
+        let router = DownloadRouter::default();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mark = Arc::new(AtomicI64::new(-1));
+        let slot = Arc::new(Mutex::new(None));
+        spawn_remote_images(
+            vec![RemoteEntry {
+                size: Some(png.len() as u64),
+                ..entry("Screenshot.png", None)
+            }],
+            router.clone(),
+            Arc::new(Mutex::new(Some(tx))),
+            slot.clone(),
+            mark.clone(),
+            ticket,
+        );
+        let ServerEvent::Clipboard(ClipboardMessage::SendFileContentsRequest(req)) =
+            rx.recv().await.unwrap()
+        else {
+            panic!("unexpected event");
+        };
+        {
+            let _guard = crate::clipboard::pasteboard_guard();
+            unsafe {
+                assert_eq!(crate::clipboard::pasteboard().changeCount() as i64, initial);
+            }
+        }
+        // A short response must cause a new request, without publishing the sparse file.
+        router.deliver(FileContentsResponse::new_data_response(
+            req.stream_id,
+            png[..20].to_vec(),
+        ));
+        let ServerEvent::Clipboard(ClipboardMessage::SendFileContentsRequest(req)) =
+            rx.recv().await.unwrap()
+        else {
+            panic!("unexpected event");
+        };
+        assert_eq!(req.position, 20);
+        assert_eq!(mark.load(Ordering::Relaxed), -1);
+        router.deliver(FileContentsResponse::new_data_response(
+            req.stream_id,
+            png[20..].to_vec(),
+        ));
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while mark.load(Ordering::Relaxed) == -1 {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let dir = slot.lock().unwrap().take().unwrap();
+        assert_eq!(std::fs::read(dir.join("Screenshot.png")).unwrap(), png);
+        {
+            let _guard = crate::clipboard::pasteboard_guard();
+            unsafe {
+                assert!(crate::clipboard::pasteboard()
+                    .dataForType(objc2_app_kit::NSPasteboardTypePNG)
+                    .is_some());
+            }
+        }
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

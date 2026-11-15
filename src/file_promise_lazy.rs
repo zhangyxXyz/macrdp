@@ -418,7 +418,7 @@ pub fn spawn_lazy_paste(
     true
 }
 
-fn cleanup_previous(current_temp_dir: &Arc<Mutex<Option<PathBuf>>>) {
+pub(crate) fn cleanup_previous(current_temp_dir: &Arc<Mutex<Option<PathBuf>>>) {
     if let Some(old) = current_temp_dir.lock().unwrap().take() {
         let _ = std::fs::remove_dir_all(&old);
     }

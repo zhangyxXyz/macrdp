@@ -69,6 +69,7 @@ const RTF_FORMAT_ID: u32 = 0xC0F1;
 enum Want {
     Text(ClipboardFormatId),
     Image(ClipboardFormatId),
+    EncodedImage(ClipboardFormatId),
     Html(ClipboardFormatId),
     Rtf(ClipboardFormatId),
     /// A request whose reply isn't ours to decode here (the file-list
@@ -79,9 +80,12 @@ enum Want {
 impl Want {
     fn id(self) -> ClipboardFormatId {
         match self {
-            Want::Text(id) | Want::Image(id) | Want::Html(id) | Want::Rtf(id) | Want::Other(id) => {
-                id
-            }
+            Want::Text(id)
+            | Want::Image(id)
+            | Want::EncodedImage(id)
+            | Want::Html(id)
+            | Want::Rtf(id)
+            | Want::Other(id) => id,
         }
     }
 }
@@ -95,7 +99,8 @@ enum RemotePlan {
     Nothing,
 }
 
-/// Decide what to fetch for a remote copy. Files ALWAYS win and are decided
+/// Decide what to fetch for a remote copy. Actual image data takes priority
+/// over file representations; files without image data are decided
 /// first — a copy that also offers rich text must still take the file path,
 /// exactly as before rich text existed. Otherwise fetch every representation
 /// we can use, so a copy that offers an image AND rich text (Chrome's "Copy
@@ -125,17 +130,17 @@ fn plan_remote_fetch(formats: &[ClipboardFormat], rich: bool) -> RemotePlan {
             })
             .map(|f| f.id)
     };
-    // FileGroupDescriptorW is identified by name per MS-RDPECLIP — the
-    // numeric ID is assigned by the remote and varies.
-    if let Some(fmt) = formats.iter().find(|f| {
-        f.name
-            .as_ref()
-            .map(|n| n.value() == "FileGroupDescriptorW")
-            .unwrap_or(false)
-    }) {
-        return RemotePlan::Files(fmt.id);
-    }
+    let file_format = named("FileGroupDescriptorW");
     let has = |id: ClipboardFormatId| formats.iter().any(|f| f.id == id);
+    let dib = [ClipboardFormatId::CF_DIBV5, ClipboardFormatId::CF_DIB]
+        .into_iter()
+        .find(|&id| has(id));
+    let png = named("PNG");
+    // Screenshot tools can advertise both bitmap and virtual PNG-file forms.
+    // Prefer actual image data; retain files as a fallback if all image decodes fail.
+    if let Some(id) = file_format.filter(|_| dib.is_none() && png.is_none()) {
+        return RemotePlan::Files(id);
+    }
 
     let mut wants = Vec::new();
     if has(ClipboardFormatId::CF_UNICODETEXT) {
@@ -148,11 +153,16 @@ fn plan_remote_fetch(formats: &[ClipboardFormat], rich: bool) -> RemotePlan {
             wants.push(Want::Rtf(id));
         }
     }
-    if let Some(id) = [ClipboardFormatId::CF_DIBV5, ClipboardFormatId::CF_DIB]
-        .into_iter()
-        .find(|&id| has(id))
-    {
-        wants.push(Want::Image(id));
+    if let Some(id) = png {
+        wants.push(Want::EncodedImage(id));
+    }
+    for id in [ClipboardFormatId::CF_DIBV5, ClipboardFormatId::CF_DIB] {
+        if has(id) {
+            wants.push(Want::Image(id));
+        }
+    }
+    if let Some(id) = file_format {
+        wants.push(Want::Other(id));
     }
     if wants.is_empty() {
         RemotePlan::Nothing
@@ -726,6 +736,10 @@ impl CliprdrBackendFactory for MacCliprdr {
             remote_write_cc: self.remote_write_cc.clone(),
             #[cfg(target_os = "macos")]
             session_end_cc: self.session_end_cc.clone(),
+            #[cfg(target_os = "macos")]
+            image_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            #[cfg(target_os = "macos")]
+            image_ticket: None,
             advertise_state: self.advertise_state.clone(),
             #[cfg(target_os = "macos")]
             lazy_paste: self.lazy_paste,
@@ -774,6 +788,10 @@ struct MacCliprdrBackend {
     session_end_cc: Arc<std::sync::atomic::AtomicI64>,
     // Lets the `on_format_list_response` hook tell the poller's retry loop
     // that the current advertise wave was accepted, so it stops re-advertising.
+    #[cfg(target_os = "macos")]
+    image_epoch: Arc<std::sync::atomic::AtomicU64>,
+    #[cfg(target_os = "macos")]
+    image_ticket: Option<crate::clipboard_image::CopyTicket>,
     advertise_state: Arc<AdvertiseState>,
     // Routes on_remote_file_list to the lazy NSFilePresenter path when
     // true (the default; --no-lazy-paste flips it). See MacCliprdr::lazy_paste.
@@ -846,6 +864,7 @@ impl Drop for MacCliprdrBackend {
         // Still pending means `on_ready` never fired: no client list was handled.
         #[cfg(target_os = "macos")]
         if !self.initial_advertise_pending {
+            self.invalidate_image_copy();
             crate::file_promise_lazy::cleanup_on_disconnect(
                 &self.paste_temp_dir,
                 &self.self_change_count,
@@ -884,6 +903,13 @@ impl MacCliprdrBackend {
         }
     }
 
+    #[cfg(target_os = "macos")]
+    fn invalidate_image_copy(&self) {
+        let _guard = pasteboard_guard();
+        self.image_epoch
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+    }
+
     fn push(&self, msg: ClipboardMessage) {
         if let Some(s) = self.sender.lock().unwrap().as_ref() {
             let _ = s.send(ServerEvent::Clipboard(msg));
@@ -904,6 +930,13 @@ impl MacCliprdrBackend {
     /// Request the next representation of the current remote copy, or — once
     /// the queue is drained — publish everything that arrived.
     fn request_next(&mut self) {
+        while self.fetch.got.png.is_some()
+            && self.fetch.queue.front().is_some_and(|w| {
+                matches!(w, Want::Image(_) | Want::EncodedImage(_) | Want::Other(_))
+            })
+        {
+            self.fetch.queue.pop_front();
+        }
         match self.fetch.queue.pop_front() {
             Some(want) => {
                 debug!(?want, "requesting remote format data");
@@ -1261,6 +1294,16 @@ impl CliprdrBackend for MacCliprdrBackend {
                 .collect::<Vec<_>>(),
             "remote clipboard format list received (connect-time announce or a live copy)"
         );
+        #[cfg(target_os = "macos")]
+        {
+            let _guard = pasteboard_guard();
+            self.image_epoch
+                .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+            self.image_ticket = Some(crate::clipboard_image::CopyTicket::new(
+                self.image_epoch.clone(),
+                unsafe { pasteboard().changeCount() as i64 },
+            ));
+        }
         let connect_time = std::mem::take(&mut self.initial_remote_copy_pending);
         #[cfg(target_os = "macos")]
         if connect_time
@@ -1365,6 +1408,25 @@ impl CliprdrBackend for MacCliprdrBackend {
                     }
                 })
                 .collect();
+            if !entries.is_empty()
+                && entries.iter().all(|e| {
+                    !e.is_dir
+                        && e.relative_path.as_ref().is_none_or(|p| p.is_empty())
+                        && crate::clipboard_image::is_image_name(&e.name)
+                })
+            {
+                if let Some(ticket) = self.image_ticket.clone() {
+                    crate::file_promise::spawn_remote_images(
+                        entries,
+                        self.download_router.clone(),
+                        self.sender.clone(),
+                        self.paste_temp_dir.clone(),
+                        self.self_change_count.clone(),
+                        ticket,
+                    );
+                }
+                return;
+            }
             let rt = tokio::runtime::Handle::current();
             // Try lazy first if enabled; it returns false for folder
             // copies (Phase 1 scope) and we fall through to eager.
@@ -1518,6 +1580,10 @@ impl CliprdrBackend for MacCliprdrBackend {
                     }
                 }
             }
+            Some(Want::EncodedImage(_)) => match crate::clipboard_image::normalize_image(data) {
+                Ok(png) => self.fetch.got.png = Some(png),
+                Err(e) => warn!(error = %e, "remote encoded image decode failed"),
+            },
             Some(Want::Image(_)) => match dib_to_png(data) {
                 Ok(png) => self.fetch.got.png = Some(png),
                 Err(e) => warn!("DIB decode failed: {e}"),
@@ -1578,6 +1644,7 @@ impl CliprdrBackend for MacCliprdrBackend {
     /// effectively zombies that get reaped on the next supersede.
     #[cfg(target_os = "macos")]
     fn on_outgoing_locks_expired(&mut self, _clip_data_ids: &[LockDataId]) {
+        self.invalidate_image_copy();
         crate::file_promise_lazy::clear_pasteboard_if_stale(&self.self_change_count);
     }
 }
@@ -2256,6 +2323,8 @@ mod tests {
             self_change_count: Arc::new(std::sync::atomic::AtomicI64::new(-1)),
             remote_write_cc: Arc::new(std::sync::atomic::AtomicI64::new(-1)),
             session_end_cc: Arc::new(std::sync::atomic::AtomicI64::new(-1)),
+            image_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            image_ticket: None,
             advertise_state: Arc::new(AdvertiseState::default()),
             lazy_paste: true,
             initial_advertise_pending: true,
@@ -2713,6 +2782,7 @@ mod tests {
             RemotePlan::Fetch(vec![
                 Want::Text(ClipboardFormatId::CF_UNICODETEXT),
                 Want::Image(ClipboardFormatId::CF_DIBV5),
+                Want::Image(ClipboardFormatId::CF_DIB),
             ])
         );
         assert_eq!(
@@ -3083,5 +3153,68 @@ mod tests {
         let ok = pb::walk_inner(&mut entries, &bogus, "root".to_owned());
         assert!(ok);
         assert!(entries.is_empty());
+    }
+    #[test]
+    fn screenshot_image_formats_precede_virtual_files_and_retain_fallbacks() {
+        let png = ClipboardFormatId::new(0xc127);
+        let formats = [
+            named(FGD, "FileGroupDescriptorW"),
+            named(png.value(), "pNg"),
+            ClipboardFormat::new(ClipboardFormatId::CF_DIBV5),
+            ClipboardFormat::new(ClipboardFormatId::CF_DIB),
+        ];
+        assert_eq!(
+            plan_remote_fetch(&formats, true),
+            RemotePlan::Fetch(vec![
+                Want::EncodedImage(png),
+                Want::Image(ClipboardFormatId::CF_DIBV5),
+                Want::Image(ClipboardFormatId::CF_DIB),
+                Want::Other(ClipboardFormatId::new(FGD))
+            ])
+        );
+    }
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn corrupt_encoded_screenshot_falls_back_to_bitmap_then_files() {
+        let (mut backend, mut rx) = test_backend();
+        backend.on_remote_copy(&[
+            named(FGD, "FileGroupDescriptorW"),
+            named(0xc127, "PNG"),
+            ClipboardFormat::new(ClipboardFormatId::CF_DIB),
+        ]);
+        assert!(
+            matches!(rx.try_recv().unwrap(), ServerEvent::Clipboard(ClipboardMessage::SendInitiatePaste(id)) if id.value() == 0xc127)
+        );
+        backend.on_format_data_response(FormatDataResponse::new_data(b"broken"));
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            ServerEvent::Clipboard(ClipboardMessage::SendInitiatePaste(
+                ClipboardFormatId::CF_DIB
+            ))
+        ));
+        backend.on_format_data_response(FormatDataResponse::new_data(b"broken"));
+        assert!(
+            matches!(rx.try_recv().unwrap(), ServerEvent::Clipboard(ClipboardMessage::SendInitiatePaste(id)) if id.value() == FGD)
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn valid_screenshot_skips_bitmap_and_virtual_file_fallbacks() {
+        use image::ImageEncoder;
+        let (mut backend, mut rx) = test_backend();
+        let mut png = Vec::new();
+        image::codecs::png::PngEncoder::new(&mut png)
+            .write_image(&[1, 2, 3, 255], 1, 1, image::ExtendedColorType::Rgba8)
+            .unwrap();
+        backend.on_remote_copy(&[
+            named(FGD, "FileGroupDescriptorW"),
+            named(0xc127, "PNG"),
+            ClipboardFormat::new(ClipboardFormatId::CF_DIB),
+        ]);
+        rx.try_recv().unwrap();
+        backend.on_format_data_response(FormatDataResponse::new_data(&png));
+        assert!(rx.try_recv().is_err());
+        assert_eq!(pb::read_image_bytes().unwrap().1, png);
     }
 }

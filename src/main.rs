@@ -17,6 +17,7 @@ mod avc444;
 mod camera;
 mod capture;
 mod clipboard;
+mod clipboard_image;
 mod clipboard_rich;
 mod config;
 mod conn_hooks;
