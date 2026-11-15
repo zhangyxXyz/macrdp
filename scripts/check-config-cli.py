@@ -29,7 +29,7 @@ def invoke(*args, expected=0):
 caps = invoke("--capabilities")
 assert caps["schema_version"] == 1
 assert {"config_validation", "display_state_v2"} <= set(caps["features"])
-assert {"RESOLUTION_POLICY", "LIVE_RESIZE", "VD_HIDPI"} <= set(caps["supported_config_keys"])
+assert {"RESOLUTION_POLICY", "LIVE_RESIZE", "VD_HIDPI", "CAPTURE_NV12"} <= set(caps["supported_config_keys"])
 
 with tempfile.TemporaryDirectory(prefix="macrdp-config-smoke-") as temporary:
     directory = Path(temporary)
@@ -62,6 +62,23 @@ with tempfile.TemporaryDirectory(prefix="macrdp-config-smoke-") as temporary:
     assert extra["effective"]["modifier_layout"] == "swap-left-win-alt"
     for invalid in ["MODIFIER_LAYOUT=swap\n", 'MODIFIER_LAYOUT=standard\nEXTRA_FLAGS="--modifier-layout standard"\n', 'MAP_CTRL_TO_CMD=0\nEXTRA_FLAGS="--map-ctrl-to-cmd"\n']:
         validate(invalid, valid=False)
+
+    disabled = validate("ENABLE_H264=1\n")
+    assert disabled["effective"]["capture_nv12"] is False
+    for codec in [0, 1]:
+        for nv12 in [0, 1]:
+            text = f"ENABLE_H264={codec}\nCAPTURE_NV12={nv12}\n"
+            report = validate(text)
+            assert not report["warnings"], report["warnings"]
+            assert report["effective"]["capture_nv12_requested"] is bool(nv12)
+            assert report["effective"]["capture_nv12"] is bool(nv12 and codec)
+    validate("CAPTURE_NV12=yes\n", valid=False)
+    validate('CAPTURE_NV12=0\nEXTRA_FLAGS="--capture-nv12"\n', valid=False)
+    mixed = validate(base + "ENABLE_H264=1\nCAPTURE_NV12=1\nAUTO_UNLOCK=1\nLOCK_ON_DISCONNECT=1\nMODIFIER_LAYOUT=swap-left-win-alt\nMAP_CTRL_TO_CMD=0\n")
+    assert mixed["effective"]["capture_nv12"] is True
+    assert mixed["effective"]["modifier_layout"] == "swap-left-win-alt"
+    assert mixed["effective"]["map_ctrl_to_cmd"] is False
+    assert mixed["effective"]["vd_width"] == 3840 and mixed["effective"]["vd_hidpi"] == "1"
 
     follow = validate("export\t VIRTUAL_DISPLAY='1'\nVD_WIDTH=3840\nVD_HEIGHT=2160\n"
                       'VD_HIDPI="auto"\nRESOLUTION_POLICY=client\nUNKNOWN_FUTURE_KEY=keep\n')

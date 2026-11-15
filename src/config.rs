@@ -187,6 +187,7 @@ impl Document {
         // A dedicated display field and an escape-hatch flag must never silently
         // disagree. Even equal duplicates are rejected: clap rejects them too.
         for (key, flag) in [
+            ("CAPTURE_NV12", "--capture-nv12"),
             ("MODIFIER_LAYOUT", "--modifier-layout"),
             ("MAP_CTRL_TO_CMD", "--map-ctrl-to-cmd"),
             ("RESOLUTION_POLICY", "--resolution-policy"),
@@ -360,6 +361,7 @@ pub const SUPPORTED_KEYS: &[&str] = &[
     "BLANK_RECOVERY_REACTIVATE",
     "BLANK_RECOVERY_RETRY_MS",
     "CAMERA_DUMP",
+    "CAPTURE_NV12",
     "CAPTURE_PRIMARY",
     "CONN_GUARD",
     "DETACH_RESTART_ON_STUCK",
@@ -423,6 +425,7 @@ const BOOL_KEYS: &[&str] = &[
     "ALT_TAB_SWITCH",
     "APP_SWITCHER_HUD",
     "AUTO_UNLOCK",
+    "CAPTURE_NV12",
     "CAPTURE_PRIMARY",
     "ENABLE_AAC",
     "ENABLE_CAMERA_REDIRECTION",

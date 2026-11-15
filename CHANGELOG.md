@@ -7,12 +7,14 @@ Only implemented behavior and completed checks are recorded here. Client-side ma
 
 ### English
 
+- Merge upstream cef6073 (#204), retaining opt-in NV12 capture, bitmap fallback, immutable capture-buffer retention and the fork lock/clipboard/display policies. Add strict CAPTURE_NV12 validation and requested/effective inspection; keep the feature off in existing configs. Upstream performance reports are not local results; merged Windows rendering is not yet manually tested.
 - Run opt-in auto-unlock after credential/ARC validation, before display synchronization and capture; wait at most 8s for the requested SCK display after confirmed unlock. Preserve skip-auth gating, serialized real submissions and the shared two-submission budget; report unsafe/budget failures explicitly.
 - Request a true immediate lock via runtime-resolved login.framework and independently confirm the lock flag within 2s. No screen-saver fallback or password-delay policy changes. Preserve display restoration, disconnect grace, safety delay and bounded reconnect hold.
 - Add regression coverage and a build-only Actions workflow that verifies packaged apps without publishing releases or uploading artifacts. Local installation and live Windows lock/reconnect validation are deferred.
 
 ### 简体中文
 
+- 合入上游 cef6073（#204），保留主动开启的 NV12 捕获、位图回退和捕获缓冲区保留，同时保留本 fork 锁屏／剪贴板／显示策略。补齐 CAPTURE_NV12 严格校验和请求／有效状态检查；现有配置保持默认关闭。上游性能数据不是本机实测，合并后 Windows 显示待手动验证。
 - 主动开启的自动解锁改在凭证／ARC 校验后、显示调整与捕获前执行；确认解锁后最多等待 8 秒 SCK 显示器就绪。保留 skip-auth 限制、串行真实提交和共享两次密码预算，明确报告不安全／预算耗尽错误。
 - 运行时解析 login.framework 请求真正立即锁定，并在 2 秒内独立确认锁定标志；不回退屏保、不修改密码延迟策略。保留实体屏恢复、断线宽限、安全等待和有上限的重连保护。
 - 补充回归及只验证打包的 Actions，不发布 Release、不上传归档。本机安装与 Windows 锁屏重连实测留待后续。

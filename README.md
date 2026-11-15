@@ -81,6 +81,21 @@ and conflicting dedicated/extra-flag mappings fail validation. Automated checks
 cover the mapping and state transitions; this new feature has not yet been
 validated with real Windows shortcut/AltGr input.
 
+## Upstream NV12 capture experiment
+
+Merged upstream [cef6073](https://github.com/clintcan/macrdp/commit/cef6073ba461c595261a2705a2c84888cd522673)
+([#204](https://github.com/clintcan/macrdp/pull/204)): `--capture-nv12` /
+`CAPTURE_NV12=1` lets ScreenCaptureKit produce full-range BT.709 NV12 for direct
+VideoToolbox encoding. It requires H.264 to have an effect and remains **off by
+default**. Non-AVC/initial bitmap frames still use a BGRA fallback. The upstream
+CPU improvement measurements are upstream results, not measurements on this Mac.
+
+The merge preserves authenticated pre-capture unlocking, fixed 4K/200% display
+policy, keyboard mapping and File Provider clipboard handling. Config inspection
+reports requested versus effective NV12, validates its boolean and rejects a
+dedicated-key/Extra-flags duplicate. No local configuration is enabled or changed.
+Actual Windows/NV12 rendering after this merge remains pending manual validation.
+
 ## Locked connections and disconnect locking
 
 With a headless display mode and `AUTO_UNLOCK=1`, the fork prepares the desktop

@@ -533,6 +533,16 @@ struct Args {
     #[arg(long, default_value_t = 4)]
     flush_frames: u32,
 
+    /// EXPERIMENTAL (only with --enable-h264): have ScreenCaptureKit deliver
+    /// full-range BT.709 NV12 and hand those buffers straight to VideoToolbox,
+    /// instead of BGRA that macrdp converts to NV12 on the CPU every frame.
+    /// Measured at a 3456x2168 virtual display: 14.3 → 3.3 ms of CPU per
+    /// encoded frame. Frames that still go out as legacy bitmaps (before H.264
+    /// is up, or a client without AVC) are converted back to BGRA on the CPU.
+    /// Config: CAPTURE_NV12.
+    #[arg(long)]
+    capture_nv12: bool,
+
     /// Download Windows→Mac file copies completely before publishing them.
     /// By default a bundled macOS 15+ File Provider offers system dataless files
     /// that also work with direct file readers. If the extension is unavailable,
@@ -2603,6 +2613,8 @@ fn effective_config(args: &Args, document: &config::Document) -> serde_json::Val
         "primary_mode": if args.detach_primary { "detach" } else if args.capture_primary { "capture" } else if args.shield_primary { "shield" } else { "none" },
         "hidpi": args.hidpi, "fps": args.fps.unwrap_or(if args.enable_h264 { 60 } else { 15 }),
         "enable_h264": args.enable_h264, "bitrate": args.bitrate,
+        "capture_nv12_requested": args.capture_nv12,
+        "capture_nv12": args.capture_nv12 && args.enable_h264,
         "max_client_size": args.max_client_size.map(|(w,h)| format!("{w}x{h}")),
         "stats_endpoint": args.stats_endpoint,
         "stats_port": document.values.get("STATS_PORT").and_then(|v| v.parse::<u16>().ok()).unwrap_or(40245),
@@ -2758,6 +2770,9 @@ fn args_from_config_values(path: &Path, document: &config::Document) -> Result<A
     }
     if on("STATS_ENDPOINT", false) {
         argv.push("--stats-endpoint".into());
+    }
+    if on("CAPTURE_NV12", false) {
+        argv.push("--capture-nv12".into());
     }
     if let Some(layout) = cfg.get("MODIFIER_LAYOUT") {
         argv.extend(["--modifier-layout".into(), layout.clone()]);
@@ -3468,6 +3483,9 @@ async fn async_main(mut args: Args, document: Option<config::Document>) -> Resul
              For crisp H.264 on capable clients (mstsc, Microsoft Remote Desktop, FreeRDP, \
              Thincast) pass --enable-h264 (AVC420 over EGFX)."
         );
+        if args.capture_nv12 {
+            warn!("--capture-nv12 has no effect without --enable-h264; capturing BGRA");
+        }
     }
 
     crate::input::set_unminimize_on_switch(args.unminimize_on_switch);
@@ -3631,6 +3649,7 @@ async fn async_main(mut args: Args, document: Option<config::Document>) -> Resul
         keyframe_on_change,
         click_signal: click_signal.clone(),
         flush_frames: args.flush_frames,
+        capture_nv12: args.capture_nv12,
         display_suppressed: Some(display_suppressed.clone()),
         // Live in-session resize (client drags its window, sending an
         // MS-RDPEDISP monitor-layout PDU) — the counterpart to the

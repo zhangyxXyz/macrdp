@@ -71,6 +71,18 @@ CLI 参数为 `--modifier-layout standard|swap-left-win-alt|swap-win-alt`，
 `--map-ctrl-to-cmd` 独立控制编辑兼容。应用配置会重启服务；未知布局以及专用字段与 Extra flags 的重复映射会被校验拒绝。
 自动检查覆盖映射和状态变化，但新增功能尚未用真实 Windows 快捷键和 AltGr 输入完成验证。
 
+## 上游 NV12 捕获实验
+
+已合入上游 [cef6073](https://github.com/clintcan/macrdp/commit/cef6073ba461c595261a2705a2c84888cd522673)
+（[#204](https://github.com/clintcan/macrdp/pull/204)）：`--capture-nv12` /
+`CAPTURE_NV12=1` 让 ScreenCaptureKit 输出全范围 BT.709 NV12，直接交给 VideoToolbox，
+减少逐帧 CPU 色彩转换和复制。需要 H.264 才生效，**默认关闭**；初始化及不支持 AVC
+的客户端仍有 BGRA 位图回退。上游报告的性能提升不能视为本机 4K 实测结果。
+
+合并保留已认证连接的捕获前解锁、固定 4K/200% 策略、键盘映射及 File Provider 剪贴板。
+配置检查区分 NV12 请求值和实际启用条件，校验布尔值并拒绝专用字段／Extra flags 重复。
+没有为本机开启此选项。此次合并后的真实 Windows／NV12 显示仍待手动验证。
+
 ## 锁屏连接与断开锁屏
 
 使用无头显示模式并开启 `AUTO_UNLOCK=1` 时，自动解锁现在在 **RDP 凭证／ARC
