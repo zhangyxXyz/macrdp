@@ -99,7 +99,7 @@ CLI 参数为 `--modifier-layout standard|swap-left-win-alt|swap-win-alt`，
 自动解锁会影响实体 Mac 桌面；私有 macOS API 存在随系统升级变化的风险。
 
 回归覆盖准备顺序／失败、串行调用、显示器选择、真实状态确认，以及已有重连保护和
-密码预算策略。**这次构建尚未安装，也未进行 Windows 锁屏实测。** 构建校验不会
+密码预算策略。**此次构建的真实 Windows 锁屏实测仍待完成。** 构建校验不会
 修改正在运行的 app 或刷新 TCC 授权。
 
 ## Windows 剪贴板图片与文件

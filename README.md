@@ -117,8 +117,7 @@ reconnect hold remain; **disconnect locking is delayed, not instantaneous**.
 Auto-unlock affects the physical desktop, and these private macOS APIs may change.
 
 Regression tests cover preparation ordering/failure, serialization, display
-selection, lock confirmation and existing reconnect/budget policy. **The rebuilt
-version has not yet been installed or tested with Windows on a locked Mac.**
+selection, lock confirmation and existing reconnect/budget policy. **Live Windows locked-session testing of this rebuild is pending.**
 Build verification does not grant TCC permissions or change the running app.
 
 ## Windows clipboard images and files
