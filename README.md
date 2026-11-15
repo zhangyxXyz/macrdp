@@ -17,6 +17,13 @@ The initial development base is upstream commit
 The upstream README is retained as [README_UPSTREAM.md](README_UPSTREAM.md);
 its release, verification, and support claims belong to upstream, not this fork.
 
+## Pending changes
+
+Upstream Windows 10 mstsc black-screen fix [#228](https://github.com/clintcan/macrdp/pull/228)
+is merged into `dev`. This merge is **not built or tested yet**, as requested;
+it is not included in the published/installed `v0.10.6-dev`. See
+[unreleased changes](CHANGELOG.md#unreleased--未发布).
+
 ## Changes on dev
 
 | Area | Implemented behavior |
@@ -179,7 +186,7 @@ readiness after accept was about 0.73–0.75 seconds on reconnect; this does not
 measure client-visible first-frame latency. Physical-screen transitions still
 took about 10.5 seconds. A 60 Hz mode / 60 fps target is not a sustained-fps guarantee.
 
-Local checks: 412 Rust tests passed, 7 ignored; 10 Foundation configuration
+For the published `v0.10.6-dev`: 430 Rust tests passed, 8 ignored; 10 Foundation configuration
 checks and 25 configuration CLI process checks passed. Hardware behavior,
 permissions, and actual client rendering still require manual validation.
 Client-following and live resizing depend on the client sending the relevant

@@ -15,6 +15,12 @@
 [`29d01ed`](https://github.com/clintcan/macrdp/commit/29d01ed72946ebde25ca08c924429b5fc37de7c5)。
 [README_UPSTREAM.md](README_UPSTREAM.md) 保留上游原文，其中的发布、验证和支持声明属于上游，不能视为本 fork 的验证结果。
 
+## 待构建的变更
+
+上游 Windows 10 mstsc 黑屏修复 [#228](https://github.com/clintcan/macrdp/pull/228)
+已合入 `dev`。按要求，**本次合入尚未构建或运行测试**，不包含在已发布／已安装的
+`v0.10.6-dev` 中。详见[未发布记录](CHANGELOG.md#unreleased--未发布)。
+
 ## dev 分支的差异
 
 | 范围 | 已实现行为 |
@@ -148,7 +154,7 @@ BLANK_RECOVERY=0
 这不代表客户端实际首帧显示时间。实体屏切换本身仍约需 10.5 秒。
 60Hz 模式与 60fps 目标也不等于持续帧率保证。
 
-当前本地检查：430 项 Rust 测试通过、8 项默认忽略；显式运行的真实 OS broker 测试另行通过。
+已发布 `v0.10.6-dev` 的本地检查：430 项 Rust 测试通过、8 项默认忽略；显式运行的真实 OS broker 测试另行通过。
 10 项 Foundation 配置、25 项 CLI 进程、13 项发布脚本、9 项适配层、6 项真实 File Provider 检查通过。
 硬件行为、权限和客户端实际显示仍需手动验证。跟随客户端与动态调整依赖客户端发送对应请求，
 固定 4K 的 mstsc 测试不能代表所有客户端和缩放策略。本 fork 不额外宣称长期压力测试或生产成熟度。

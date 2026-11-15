@@ -3,6 +3,13 @@
 Only implemented behavior and completed checks are recorded here. Client-side manual checks are identified separately.
 这里只记录已实现的行为和已完成的检查；客户端实测另行注明。
 
+## Unreleased / 未发布
+
+- Merge upstream [#228](https://github.com/clintcan/macrdp/pull/228): Windows 10 mstsc black-screen compatibility for RemoteFX surface commands and H.264 SPS bitstream restrictions. Include its vendored encoder tests and CI step; keep the fork's clipboard maintenance/leases and use the local CLIPRDR patch in standalone server checks.
+- 合入上游 #228：修复 Win10 mstsc 在 RemoteFX 指令及 H.264 参数上的黑屏兼容问题，保留本 fork 的剪贴板维护和租约，并使独立 server 检查使用相同的本地 CLIPRDR。
+- **Not built or tested after this merge, at user request.** No new tag/release/install; the installed release remains `v0.10.6-dev` from `92f4c8c`.
+- **按用户要求，本次合入不构建、不运行测试。** 未新增 tag／发布／安装；本机仍为 `92f4c8c` 对应的 `v0.10.6-dev`。
+
 ## v0.10.6-dev
 
 ### English
