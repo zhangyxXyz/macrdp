@@ -26,6 +26,23 @@ requires a post-update manual check; upstream's frozen-start fix #230 is include
 
 ## This same-version rebuild
 
+Manual feedback on build `31ee2fb`: remote audio and file copies from the Windows
+desktop work; Directory Opus file copies still fail. The follow-up gives a failed
+`FileGroupDescriptorW` request one retry and reports a second failure explicitly,
+without substituting text or old images. This fixes an error-handling gap, not a
+verified Directory Opus compatibility fix; Explorer is the comparison path for
+client testing.
+
+Detach restoration now retains every display the server disabled, even if it
+disappears from CoreGraphics' online list. A successful transaction alone no
+longer counts as recovery: every saved display must be confirmed active. Failed
+restoration uses bounded recovery; with disconnect locking enabled, a recovery
+restart requires a confirmed lock and must not interrupt a newer session.
+Real two-monitor disconnect/reconnect verification of this follow-up is pending.
+In the reported failure, restarting the old server did not restore either output;
+reconnecting a display cable restored both. Process restart is a recovery attempt,
+not a guarantee that a stuck display link will recover.
+
 New remote clipboard announcements now invalidate old text/images even when no
 supported format is offered. File URLs are explicitly serialized and read back
 before publication is reported as successful; File Provider downloads remain
@@ -58,8 +75,8 @@ backoff; initial permission failures require correction. The existing
 minimize policy still pauses forwarded audio; disconnect destroys the tap to restore
 local playback. Status reports capture state/errors, not confirmed client audibility.
 An isolated local probe captured a nonzero 48 kHz test tone and destroyed the tap
-successfully. Playback through the rebuilt server/mstsc, output-device changes,
-reconnects and abnormal exit still need live validation. The direct speaker-mute
+successfully. The user confirmed mstsc playback on `31ee2fb`; output-device
+changes, reconnects and abnormal exit still need live validation. The direct speaker-mute
 control test did not preserve the remote tone, so that approach is not used.
 The earlier intermittent Mac-only playback recovered after restart; its separate
 root cause is not yet confirmed. Disconnect locking additionally checks capture

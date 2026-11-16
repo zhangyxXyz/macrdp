@@ -103,6 +103,25 @@ impl RestoreState {
             self.pending_failure = failed;
         }
     }
+    /// A reconnect can install an empty guard when all previously disabled
+    /// screens disappeared from enumeration. Dropping that guard reports no
+    /// new failure; it does not prove the earlier failure was repaired.
+    pub fn observe_verified(
+        &mut self,
+        outcome: RestoreOutcome,
+        other: Option<OtherDisplays>,
+    ) -> RestoreOutcome {
+        let outcome = if self.pending_failure
+            && outcome == (RestoreOutcome::Removed { failed: false })
+            && other != Some(OtherDisplays::Active)
+        {
+            RestoreOutcome::Removed { failed: true }
+        } else {
+            outcome
+        };
+        self.observe(outcome);
+        outcome
+    }
     pub fn restart_due(&self, connected: bool) -> bool {
         self.pending_failure && !connected
     }
@@ -130,11 +149,238 @@ pub fn reconcile(engaged: bool, connected: bool) -> (bool, bool) {
     (!engaged, engaged != connected)
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DisconnectCompletion {
+    Completed,
+    Cancelled,
+    LockFailed,
+}
+
+/// An unresolved failed restore must retain its surface even when CoreGraphics
+/// no longer lists the disabled physical screens. A new capture owns its own
+/// lease; otherwise only a positively active other display permits release.
+pub fn recovery_surface_can_release(connected: bool, other: Option<OtherDisplays>) -> bool {
+    connected || matches!(other, Some(OtherDisplays::Active))
+}
+
+/// Run irreversible recovery only after the requested lock is confirmed.
+/// `acquire` waits for reconnect activity and takes the auto-unlock serial gate,
+/// or cancels a superseded disconnect. Its original disconnect/deadline must
+/// remain fixed across retries. If a handshake starts during native lock
+/// confirmation, release the gate and wait again in this same operation.
+/// With locking disabled, `lock` is an explicit successful no-op.
+pub fn complete_disconnect<G>(
+    mut acquire: impl FnMut() -> Option<G>,
+    mut current: impl FnMut() -> bool,
+    mut lock: impl FnMut() -> bool,
+    recover: impl FnOnce(),
+) -> DisconnectCompletion {
+    loop {
+        let Some(_serial) = acquire() else {
+            return DisconnectCompletion::Cancelled;
+        };
+        if !current() {
+            continue;
+        }
+        if !lock() {
+            return DisconnectCompletion::LockFailed;
+        }
+        if !current() {
+            continue;
+        }
+        recover();
+        return DisconnectCompletion::Completed;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::{mpsc, Mutex as StdMutex};
     use std::time::Duration;
+
+    #[test]
+    fn failed_restore_locks_before_committing_recovery() {
+        let calls = std::cell::RefCell::new(Vec::new());
+        assert_eq!(
+            complete_disconnect(
+                || Some(()),
+                || {
+                    calls.borrow_mut().push("current");
+                    true
+                },
+                || {
+                    calls.borrow_mut().push("lock confirmed");
+                    true
+                },
+                || calls.borrow_mut().push("cleanup and exit"),
+            ),
+            DisconnectCompletion::Completed,
+        );
+        assert_eq!(
+            *calls.borrow(),
+            ["current", "lock confirmed", "current", "cleanup and exit"]
+        );
+    }
+
+    #[test]
+    fn unconfirmed_lock_never_restarts_or_cleans_up() {
+        assert_eq!(
+            complete_disconnect(
+                || Some(()),
+                || true,
+                || false,
+                || panic!("must preserve running services")
+            ),
+            DisconnectCompletion::LockFailed,
+        );
+    }
+
+    #[test]
+    fn reconnect_before_or_during_lock_cancels_recovery() {
+        assert_eq!(
+            complete_disconnect(
+                || None::<()>,
+                || false,
+                || panic!("stale disconnect must not lock"),
+                || panic!("must not restart")
+            ),
+            DisconnectCompletion::Cancelled,
+        );
+        let epoch = std::cell::Cell::new(7);
+        assert_eq!(
+            complete_disconnect(
+                || (epoch.get() == 7).then_some(()),
+                || epoch.get() == 7,
+                || {
+                    epoch.set(8);
+                    true
+                },
+                || panic!("must not kill the newer session")
+            ),
+            DisconnectCompletion::Cancelled,
+        );
+        // Preserve failed restoration so the new session's disconnect owns
+        // recovery, even if it finishes entirely between watcher polls.
+        let mut restore = RestoreState::default();
+        restore.observe(RestoreOutcome::Removed { failed: true });
+        assert_eq!(restore.reconcile(false, true), (true, true));
+        assert_eq!(restore.reconcile(false, false), (false, true));
+    }
+
+    #[test]
+    fn failed_restoration_keeps_the_only_surface_until_real_progress() {
+        // Disabled external screens can disappear from BOTH enumeration lists.
+        // That is safe for an ordinary idle headless session, but not evidence
+        // that an unresolved failed restoration may release its last surface.
+        assert!(!recovery_surface_can_release(
+            false,
+            Some(OtherDisplays::None)
+        ));
+        assert!(!recovery_surface_can_release(
+            false,
+            Some(OtherDisplays::Inactive)
+        ));
+        assert!(!recovery_surface_can_release(false, None)); // enumeration failed
+        assert!(recovery_surface_can_release(
+            false,
+            Some(OtherDisplays::Active)
+        ));
+        assert!(recovery_surface_can_release(true, None)); // capture owns a lease
+    }
+
+    #[test]
+    fn handshake_during_lock_releases_serial_and_keeps_the_original_hold_cap() {
+        use crate::lock_activity::{self, LockDecision};
+        use std::cell::Cell;
+        let serial = StdMutex::new(());
+        let now_ms = Cell::new(1_u64);
+        let auth_ms = Cell::new(None::<u64>);
+        let disconnect_ms = 1;
+        let due_ms = 1;
+        let locks = Cell::new(0);
+        let acquisitions = Cell::new(0);
+        let recovered = Cell::new(false);
+        let decision = || {
+            lock_activity::decide(
+                false, // no SessionTracker epoch/count change during handshake
+                None,
+                auth_ms
+                    .get()
+                    .filter(|at| *at > disconnect_ms)
+                    .map(|at| Duration::from_millis(now_ms.get() - at)),
+                Duration::from_millis(now_ms.get() - due_ms),
+            )
+        };
+        assert_eq!(
+            complete_disconnect(
+                || {
+                    assert!(
+                        serial.try_lock().is_ok(),
+                        "hold must release auto-unlock's gate"
+                    );
+                    if acquisitions.get() == 1 {
+                        assert_eq!(
+                            decision(),
+                            LockDecision::Hold,
+                            "keep the original disconnect timestamp"
+                        );
+                        // Even another fresh authentication cannot reset this
+                        // disconnect's already-running 30-second hold budget.
+                        now_ms.set(due_ms + lock_activity::MAX_HOLD.as_millis() as u64);
+                        auth_ms.set(Some(now_ms.get() - 1));
+                    }
+                    assert_eq!(decision(), LockDecision::Lock);
+                    acquisitions.set(acquisitions.get() + 1);
+                    Some(serial.lock().unwrap())
+                },
+                || decision() == LockDecision::Lock,
+                || {
+                    if locks.get() == 0 {
+                        now_ms.set(2_001);
+                        auth_ms.set(Some(2_001)); // arrived DURING lock confirmation
+                    }
+                    locks.set(locks.get() + 1);
+                    true
+                },
+                || recovered.set(true),
+            ),
+            DisconnectCompletion::Completed,
+        );
+        assert_eq!(acquisitions.get(), 2);
+        assert_eq!(locks.get(), 2);
+        assert!(recovered.get());
+    }
+
+    #[test]
+    fn handshake_that_finishes_after_lock_confirmation_cancels_old_recovery() {
+        use std::cell::Cell;
+        let serial = StdMutex::new(());
+        let handshaking = Cell::new(false);
+        let acquisitions = Cell::new(0);
+        assert_eq!(
+            complete_disconnect(
+                || {
+                    assert!(serial.try_lock().is_ok());
+                    acquisitions.set(acquisitions.get() + 1);
+                    if handshaking.get() {
+                        // The original wait now observes the live session and
+                        // cancels; it never creates a new disconnect deadline.
+                        return None;
+                    }
+                    Some(serial.lock().unwrap())
+                },
+                || !handshaking.get(),
+                || {
+                    handshaking.set(true);
+                    true
+                },
+                || panic!("must not restart over the new connection"),
+            ),
+            DisconnectCompletion::Cancelled,
+        );
+        assert_eq!(acquisitions.get(), 2);
+    }
 
     #[test]
     fn latest_state_reconciles_install_restore_and_brief_reconnect() {
@@ -165,6 +411,32 @@ mod tests {
             !state.restart_due(false),
             "a later successful restore clears it"
         );
+    }
+
+    #[test]
+    fn an_empty_reconnect_guard_cannot_clear_an_unresolved_restore_failure() {
+        let mut state = RestoreState::default();
+        state.observe(RestoreOutcome::Removed { failed: true });
+        for topology in [
+            Some(OtherDisplays::None),
+            Some(OtherDisplays::Inactive),
+            None,
+        ] {
+            assert_eq!(
+                state.observe_verified(RestoreOutcome::Removed { failed: false }, topology),
+                RestoreOutcome::Removed { failed: true },
+            );
+            assert!(state.restart_due(false));
+            assert!(!state.restart_due(true));
+        }
+        assert_eq!(
+            state.observe_verified(
+                RestoreOutcome::Removed { failed: false },
+                Some(OtherDisplays::Active)
+            ),
+            RestoreOutcome::Removed { failed: false },
+        );
+        assert!(!state.pending_failure());
     }
 
     #[test]

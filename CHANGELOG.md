@@ -7,6 +7,13 @@ Only implemented behavior and completed checks are recorded here. Client-side ma
 
 ### 2026-11-17 rebuild / 同版本重构建
 
+- Follow-up to manual feedback on `31ee2fb`: audio and Windows desktop file copies work, while Directory Opus copies and two-monitor restoration still have failures. Keep saved detach targets even when disabled displays disappear from the online list; attempt every enable and verify each display is active. Recovery restart must preserve disconnect locking and newer-session protection. Actual hardware verification of the correction is pending.
+- 根据 `31ee2fb` 的用户实测继续修正：音频和 Windows 桌面文件复制正常，Directory Opus 复制及双屏恢复仍有失败。保留从在线列表消失的已禁用屏幕，逐个尝试启用并确认活动状态；恢复重启须保留断开锁屏及新会话保护。修正版的真实硬件验证待完成。
+- Retry a failed remote file descriptor once, like other clipboard formats, instead of dropping it as an unexpected format. A second failure stops with a clear diagnostic; malformed successful responses are not decoded as text. This does not claim to fix a client's persistent inability to supply file data.
+- 远端文件描述符失败时与其他格式一样最多重试一次，不再当作意外格式直接丢弃；第二次失败明确记录并停止，损坏的成功回复也不解码成文本。不宣称能修复客户端持续无法提供文件数据的情况。
+- Follow-up validation: 506 Rust tests passed (8 ignored), strict Clippy and formatting checks. Tests cover lost dual-display targets, partial restoration, lock-before-restart ordering, retention of the sole display after lock failure, reconnects during lock confirmation and stale clipboard replies. The installed Windows client/hardware checks are separate.
+- 后续修正验证：506 项 Rust 测试通过（8 项忽略），严格 Clippy 及格式检查通过。覆盖双屏目标消失、部分恢复、锁屏先于恢复重启、锁屏失败保留唯一显示面、锁屏确认期间重连及过期剪贴板回复；安装后的 Windows 客户端及硬件实测另行确认。
+
 - Add an optional Intel macOS runner fallback when hosted ARM64 capacity is unavailable. Keep native host regression gates and separately check ARM64; explicitly cross-build all app components, verify every Mach-O contains ARM64 and four bundle source markers match, and record the build host in `BUILD_INFO.json`. This does not claim ARM64 execution on Intel. Fix the Linux gate for a macOS-only clipboard test helper.
 - 托管 ARM64 容量不足时可选 Intel macOS runner：保留主机原生回归，另查 ARM64，所有应用组件显式交叉编译，逐个核对 Mach-O 的 ARM64 架构及四份 bundle 源提交，并在 `BUILD_INFO.json` 记录构建主机，不把 Intel 检查说成 ARM64 运行验证。补齐剪贴板原生测试的 Linux 平台条件。
 

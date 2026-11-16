@@ -737,10 +737,18 @@ table and validation limits in [README](../README.md#modifier-positions-and-ctrl
 `--virtual-display` (`VIRTUAL_DISPLAY=1`) stores its width/height/scale at startup,
 but creates the display only during authenticated capture. `--make-primary` also
 applies per active display and restores on release. A 2.5s reactivation grace and
-physical restoration precede last-capture cleanup. Retain the virtual display if
-an online physical display has not recovered. If no other display is online, it
-can be released after the disconnect lock completes or is cancelled. SCK registration after creation or confirmed
-unlock has a fixed 8s maximum, polled every 200ms with immediate success.
+physical restoration precede last-capture cleanup. Detach preserves all saved
+disabled display IDs even when they disappear from the online list; it queues
+every re-enable and confirms all targets active before reporting success. After
+three unsuccessful attempts, the existing launchd process recovery is best effort.
+On a tested macOS 27 dual-monitor setup, neither restart nor restoring the permanent
+display configuration revived outputs after a skipped restore; reconnecting a
+video cable did. The corrected saved-target restore path still needs a live test.
+An absent online ID alone is not evidence of a pulled cable. Retain the virtual
+display while physical restoration is outstanding. With no outstanding restore,
+if no other display is online, it can be released after the disconnect lock completes
+or is cancelled. SCK registration after creation or confirmed unlock has a fixed 8s
+maximum, polled every 200ms with immediate success.
 Publishing/building does not activate this behavior in an older installed app.
 
 ### Cross-packaging Apple Silicon apps

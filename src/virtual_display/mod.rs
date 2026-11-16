@@ -30,6 +30,32 @@ fn shield_ack_sufficient(ack: Option<u16>, targets: usize) -> bool {
     ack.is_some_and(|n| usize::from(n) >= targets)
 }
 
+/// Disabled displays can disappear from CG's online list. The saved detach
+/// targets remain authoritative until each enable has been queued and observed.
+/// Try every target even when an earlier queue operation fails.
+#[cfg(any(target_os = "macos", test))]
+fn queue_detached_restore(
+    targets: &[(u32, (i32, i32))],
+    mut enable: impl FnMut(u32) -> bool,
+) -> bool {
+    let mut all_queued = true;
+    for (id, _) in targets {
+        all_queued &= enable(*id);
+    }
+    all_queued
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn detach_restore_confirmed(
+    targets: &[(u32, (i32, i32))],
+    all_queued: bool,
+    active: Option<&[u32]>,
+) -> bool {
+    targets.is_empty()
+        || (all_queued
+            && active.is_some_and(|active| targets.iter().all(|(id, _)| active.contains(id))))
+}
+
 /// Query failures remain errors: never interpret a failed enumeration as unplugged.
 #[cfg(target_os = "macos")]
 pub fn other_displays(
@@ -203,16 +229,15 @@ mod macos {
     // race and reject the second with CGError 1001.
     const TX_SETTLE: Duration = Duration::from_millis(200);
 
-    /// Set true by `DetachedPrimary::drop` when its re-enable transaction is
-    /// exhausted (the panel is left disabled). On macOS 26.x the CGS app-scoped
-    /// display *disable* is not reversible in-process — only the process exiting
-    /// (which closes our CGS connection) reverts it — so a disconnect that hits
-    /// this leaves the built-in panel dark until macrdp restarts (#168). The
-    /// overlay watcher reads-and-clears this after `drop`, and under launchd
-    /// deliberately exits so KeepAlive restarts a fresh process (panel back in
-    /// ~2-3 s) instead of leaving it dark indefinitely. Process-global because
-    /// detach is single-instance and `Drop` can't return a value to the
-    /// (guard-type-generic) watcher.
+    /// Set true by `DetachedPrimary::drop` when bounded re-enable attempts fail
+    /// to confirm every saved display active. The overlay watcher consumes this
+    /// result and can request a launchd restart after disconnect locking (#168).
+    /// Restart is best-effort recovery: on the tested macOS 27 dual-monitor setup,
+    /// neither process restart nor CGRestorePermanentDisplayConfiguration revived
+    /// outputs after restore was skipped; reconnecting a video cable did. Do not
+    /// treat ForAppOnly scope as a guarantee that physical output will return.
+    /// Process-global because detach is single-instance and `Drop` can't return
+    /// a value to the (guard-type-generic) watcher.
     static DETACH_REENABLE_FAILED: std::sync::atomic::AtomicBool =
         std::sync::atomic::AtomicBool::new(false);
 
@@ -906,12 +931,12 @@ mod macos {
     /// off, no menu bar, no windows can be placed there, cursor can't
     /// cross onto them.
     ///
-    /// Drop re-enables every detached display and restores its
-    /// original origin. All CGConfigure transactions here use
-    /// `ConfigureForAppOnly`: macOS automatically reverts every
-    /// change when this process exits, so even a hard crash (signal,
-    /// SIGKILL, panic past unwinding) leaves the panel re-enabled —
-    /// no logout dance required. ForAppOnly also avoids the
+    /// Drop attempts to re-enable every saved detached display, verifies it is
+    /// active, then restores its original origin. All CGConfigure transactions
+    /// here use `ConfigureForAppOnly`, but process-scoped configuration does not
+    /// guarantee physical output recovery after exit: a macOS 27 dual-monitor
+    /// failure needed a video-cable reconnect even after process restart.
+    /// ForAppOnly also avoids the
     /// session-state accumulation that previously made the re-enable
     /// transaction synchronously reject with CGError 1001 on the
     /// second connect/disconnect cycle (and on first cycle of any
@@ -1049,15 +1074,12 @@ mod macos {
             let Some(enabler) = &self.enabler else {
                 return;
             };
-            // A monitor unplugged during RDP cannot be re-enabled. Do not spend
-            // retry delays or trigger a process restart for that absent device.
-            // On enumeration failure retain targets and the existing recovery.
-            if let Ok(online) = online_displays() {
-                self.detached.retain(|(id, _)| online.contains(id));
-                if self.detached.is_empty() {
-                    return;
-                }
-            }
+            // Keep EVERY display we disabled. CGGetOnlineDisplayList can omit
+            // those displays even while their cables remain connected (observed
+            // with two external monitors). Filtering against it skipped the
+            // entire restore and left both panels without a signal. A genuinely
+            // unplugged saved target is indistinguishable here: try bounded
+            // recovery and let the watcher perform the existing process reset.
             tracing::info!(
                 detached_count = self.detached.len(),
                 "DetachedPrimary::drop running — re-enabling physical displays"
@@ -1069,15 +1091,15 @@ mod macos {
             // (kCGErrorIllegalArgument) at complete-time — configure_display_origin
             // on a display that's transitioning disabled→enabled inside the
             // same transaction is rejected, which rolls back the enable too,
-            // leaving the displays dark until process exit (ForAppOnly).
+            // leaving the displays disabled until a later successful recovery.
             //
             // Enable-tx is retried on failure as a defensive measure; with
             // ForAppOnly scope the per-cycle state stacking that historically
             // forced retries should no longer occur, but CG occasionally
             // returns transient 1001s during display state transitions so the
-            // retry stays in as cheap insurance. If retries do exhaust, the
-            // ForAppOnly scope guarantees the displays come back the moment
-            // this process exits — no logout required.
+            // retry stays in as cheap insurance. If retries exhaust, the watcher
+            // can attempt process recovery. That is not a physical-output
+            // guarantee; the tested macOS 27 failure needed a cable reconnect.
             const MAX_ENABLE_ATTEMPTS: u32 = 3;
             const ENABLE_RETRY_BACKOFF: Duration = Duration::from_secs(2);
             let mut enable_ok = false;
@@ -1095,18 +1117,42 @@ mod macos {
                         continue;
                     }
                 };
-                for (id, _) in &self.detached {
-                    if let Err(e) = enabler.set(config, *id, true) {
+                let all_queued = super::queue_detached_restore(&self.detached, |id| match enabler
+                    .set(config, id, true)
+                {
+                    Ok(()) => true,
+                    Err(e) => {
                         tracing::warn!(attempt, "could not queue enable for display {id} ({e})");
+                        false
                     }
-                }
+                });
                 match any.complete_configuration(&config, CGConfigureOption::ConfigureForAppOnly) {
                     Ok(()) => {
-                        if attempt > 1 {
-                            tracing::info!(attempt, "enable-tx succeeded on retry");
+                        // A committed transaction is not proof that every
+                        // per-display enable succeeded or became active.
+                        std::thread::sleep(TX_SETTLE);
+                        let active = CGDisplay::active_displays();
+                        if super::detach_restore_confirmed(
+                            &self.detached,
+                            all_queued,
+                            active.as_deref().ok(),
+                        ) {
+                            if attempt > 1 {
+                                tracing::info!(attempt, "enable-tx succeeded on retry");
+                            }
+                            enable_ok = true;
+                            break;
                         }
-                        enable_ok = true;
-                        break;
+                        tracing::warn!(
+                            attempt,
+                            all_queued,
+                            ?active,
+                            targets = ?self.detached.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+                            "enable-tx committed but detached displays were not all confirmed active"
+                        );
+                        if attempt < MAX_ENABLE_ATTEMPTS {
+                            std::thread::sleep(ENABLE_RETRY_BACKOFF);
+                        }
                     }
                     Err(e) => {
                         tracing::warn!(attempt, "enable-tx complete failed (CGError {e})");
@@ -1117,22 +1163,20 @@ mod macos {
                 }
             }
             if !enable_ok {
-                // The panel is left disabled. On macOS 26.x this is not
-                // recoverable in-process (the CGS app-scoped disable only
-                // reverts when our CGS connection closes, i.e. on process
-                // exit) — so flag it for the overlay watcher, which under
-                // launchd will exit to trigger a clean restart (#168).
+                // Some saved targets are still unconfirmed. Request the existing
+                // best-effort process recovery after disconnect locking (#168).
+                // Restart alone may not revive the physical output; preserve
+                // that distinction in diagnostics instead of promising recovery.
                 DETACH_REENABLE_FAILED.store(true, std::sync::atomic::Ordering::SeqCst);
                 tracing::warn!(
-                    "exhausted enable-tx retries; the built-in display is left \
-                     disabled — it re-enables only when this process exits \
-                     (ForAppOnly scope). Under launchd macrdp will restart to \
-                     restore it (#168)."
+                    "exhausted enable-tx retries; not all detached displays were \
+                     confirmed active (a saved target may also have been unplugged). \
+                     Under launchd macrdp can restart for best-effort recovery \
+                     after disconnect locking (#168); if output stays absent, \
+                     reconnecting a video cable may be necessary."
                 );
                 return;
             }
-
-            std::thread::sleep(TX_SETTLE);
 
             // Now the displays are live again; queue origin restores in a
             // second transaction. Best-effort — a wrong origin is far less
@@ -2302,6 +2346,77 @@ mod stub {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn two_detached_monitors_missing_from_topology_are_still_reenabled() {
+        // Live regression: both attached monitors vanished from the online
+        // list after our disable, leaving only VD 7. They remain owned targets.
+        let saved = [(1, (0, 0)), (2, (1920, 0))];
+        let before = vec![7];
+        let mut queued = Vec::new();
+        let mut after = before.clone();
+        let all_queued = super::queue_detached_restore(&saved, |id| {
+            assert!(!before.contains(&id));
+            queued.push(id);
+            after.push(id);
+            true
+        });
+        assert_eq!(queued, [1, 2]);
+        assert!(!super::detach_restore_confirmed(
+            &saved,
+            all_queued,
+            Some(&before)
+        ));
+        assert!(super::detach_restore_confirmed(
+            &saved,
+            all_queued,
+            Some(&after)
+        ));
+    }
+
+    #[test]
+    fn partial_detach_enable_failure_still_attempts_every_saved_target() {
+        let saved = [(1, (0, 0)), (2, (1920, 0))];
+        let mut queued = Vec::new();
+        let all_queued = super::queue_detached_restore(&saved, |id| {
+            queued.push(id);
+            id != 1
+        });
+        assert_eq!(
+            queued,
+            [1, 2],
+            "one failure must not short-circuit the batch"
+        );
+        assert!(!all_queued);
+        // Even a successful complete-tx must not hide the earlier set failure.
+        assert!(!super::detach_restore_confirmed(
+            &saved,
+            all_queued,
+            Some(&[1, 2, 7])
+        ));
+    }
+
+    #[test]
+    fn empty_headless_detach_has_no_restoration_obligation() {
+        let all_queued = super::queue_detached_restore(&[], |_| {
+            panic!("a truly empty headless guard must not touch a display")
+        });
+        assert!(super::detach_restore_confirmed(&[], all_queued, None));
+    }
+
+    #[test]
+    fn unknown_or_partially_restored_detach_targets_require_recovery() {
+        let saved = [(1, (0, 0)), (2, (1920, 0))];
+        assert!(!super::detach_restore_confirmed(&saved, true, None));
+        assert!(!super::detach_restore_confirmed(
+            &saved,
+            true,
+            Some(&[1, 7])
+        ));
+        // A genuinely unplugged saved target cannot be distinguished from a
+        // failed disable reversal. Recovery remains bounded by the caller.
+        assert!(!super::detach_restore_confirmed(&saved, true, Some(&[7])));
+    }
+
     #[test]
     fn stretched_fallback_does_not_claim_a_uniform_remote_ui_scale() {
         let actual = super::DisplayMeasurement::from_dimensions(

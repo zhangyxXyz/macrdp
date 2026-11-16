@@ -1623,10 +1623,11 @@ impl CliprdrBackend for MacCliprdrBackend {
             debug!("ignoring unsolicited clipboard response");
             return;
         }
-        if let Some(Want::Other(id)) = want {
-            warn!(format_id = ?id, "unexpected format in data response");
-            return;
-        }
+        self.fetch.current_since = None;
+        // The channel handles successful file descriptors itself, but routes
+        // CB_RESPONSE_FAIL here. Apply the same bounded retry as other formats
+        // before handling an undecodable descriptor; otherwise a transient
+        // Windows clipboard failure abandons a file copy on the first reply.
         if response.is_error() {
             if let (Some(w), false) = (want, self.fetch.retried) {
                 debug!(want = ?w, "remote returned error for format data; retrying once");
@@ -1638,7 +1639,22 @@ impl CliprdrBackend for MacCliprdrBackend {
             }
             // One representation failing (e.g. an app that advertises HTML
             // but can't render it) mustn't cost the others: carry on.
-            warn!(?want, "remote returned error for format data");
+            if let Some(Want::Other(id)) = want {
+                warn!(
+                    format_id = ?id,
+                    "remote client could not provide FileGroupDescriptorW after one retry; no file URLs published"
+                );
+            } else {
+                warn!(?want, "remote returned error for format data");
+            }
+            self.request_next();
+            return;
+        }
+        if let Some(Want::Other(id)) = want {
+            warn!(
+                format_id = ?id,
+                "remote FileGroupDescriptorW response could not be decoded; no file URLs published"
+            );
             self.request_next();
             return;
         }
@@ -3010,6 +3026,95 @@ mod tests {
         }
         assert!(rx.try_recv().is_err(), "nothing else may be requested");
         assert!(backend.fetch.queue.is_empty());
+    }
+
+    /// A client may advertise a file list before its clipboard owner can
+    /// render it. Retry once, but never substitute filename text or stale data.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn file_descriptor_failure_retries_once_without_text_fallback() {
+        let (mut backend, mut rx) = test_backend();
+        let formats = [
+            named(FGD, "FileGroupDescriptorW"),
+            ClipboardFormat::new(ClipboardFormatId::CF_UNICODETEXT),
+        ];
+        pb::write_string("previous clipboard content");
+        backend.on_remote_copy(&formats);
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(ServerEvent::Clipboard(ClipboardMessage::SendInitiatePaste(id)))
+                if id == ClipboardFormatId::new(FGD)
+        ));
+        backend.on_format_data_response(FormatDataResponse::new_error());
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(ServerEvent::Clipboard(ClipboardMessage::SendInitiatePaste(id)))
+                if id == ClipboardFormatId::new(FGD)
+        ));
+        backend.on_format_data_response(FormatDataResponse::new_error());
+        assert!(
+            rx.try_recv().is_err(),
+            "the second failure must stop retries"
+        );
+        assert!(backend.fetch.current.is_none());
+        assert!(backend.fetch.current_since.is_none());
+        assert!(!pb::has_string() && !pb::has_files());
+
+        // A new copy receives its own retry allowance, even for the same format.
+        backend.on_remote_copy(&formats);
+        let _ = rx.try_recv().expect("new copy must request a descriptor");
+        backend.on_format_data_response(FormatDataResponse::new_error());
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(ServerEvent::Clipboard(ClipboardMessage::SendInitiatePaste(id)))
+                if id == ClipboardFormatId::new(FGD)
+        ));
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn superseded_file_descriptor_retry_does_not_overwrite_a_new_text_copy() {
+        let (mut backend, mut rx) = test_backend();
+        backend.on_remote_copy(&[named(FGD, "FileGroupDescriptorW")]);
+        let _ = rx.try_recv().expect("initial descriptor request");
+        backend.on_format_data_response(FormatDataResponse::new_error());
+        let _ = rx.try_recv().expect("one descriptor retry");
+
+        backend.on_remote_copy(&[ClipboardFormat::new(ClipboardFormatId::CF_UNICODETEXT)]);
+        assert!(rx.try_recv().is_err(), "wait for the old untagged reply");
+        backend.on_format_data_response(FormatDataResponse::new_error());
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(ServerEvent::Clipboard(ClipboardMessage::SendInitiatePaste(id)))
+                if id == ClipboardFormatId::CF_UNICODETEXT
+        ));
+        assert!(
+            rx.try_recv().is_err(),
+            "the superseded file request must not retry"
+        );
+
+        let text: Vec<u8> = "new copy\0"
+            .encode_utf16()
+            .flat_map(u16::to_le_bytes)
+            .collect();
+        backend.on_format_data_response(FormatDataResponse::new_data(text));
+        assert_eq!(pb::read_string().as_deref(), Some("new copy"));
+        assert!(backend.fetch.current.is_none());
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn undecodable_file_descriptor_is_not_retried_or_published_as_text() {
+        let (mut backend, mut rx) = test_backend();
+        backend.on_remote_copy(&[named(FGD, "FileGroupDescriptorW")]);
+        let _ = rx.try_recv().expect("descriptor request");
+        // The channel forwards a success response here only when descriptor
+        // decoding failed. Unlike CB_RESPONSE_FAIL, this isn't a transient
+        // inability to render the requested format.
+        backend.on_format_data_response(FormatDataResponse::new_data(b"invalid".to_vec()));
+        assert!(rx.try_recv().is_err());
+        assert!(backend.fetch.current.is_none());
+        assert!(!pb::has_string() && !pb::has_files());
     }
 
     /// Requests go out one at a time (see RemoteFetch), so the second
