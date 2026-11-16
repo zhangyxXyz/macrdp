@@ -201,6 +201,18 @@ Notes on the port:
 - **(18)** Fires for preemption candidates too (`NegotiationContext` carries the
   handler); #2065's shared handler makes that borrow-safe.
 
+## (35) Scoped asynchronous clipboard completions
+
+`ServerEvent::SessionClipboard` carries the producing backend's lifetime token
+and an optional producer-budget permit. The event is accepted only while that
+backend is alive, at dispatch time, not merely when the worker finishes. This
+closes the late-completion window after the previous session queue was drained.
+The permit bounds response payloads waiting in the global event queue. Ordinary
+`Clipboard` events and default wire processing are unchanged. Clipboard filesystem
+reads run outside the connection processor in macrdp's `clipboard_io` module;
+blocking File Provider hydration can therefore re-enter the serving connection.
+The standalone test retires an event after enqueue and checks dispatch rejection.
+
 ## Retired at e258f6a0 (upstream has it; what macrdp calls instead)
 
 - **(5) SuppressOutput** → builder `with_display_suppressed_handle`. **Behaviour

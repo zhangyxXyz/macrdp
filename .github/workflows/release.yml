@@ -36,6 +36,11 @@ jobs:
         with:
           toolchain: '1.95.0'
           components: rustfmt, clippy
+      - name: Reuse package dependency cache
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4
+        with:
+          shared-key: packaged-apps
+          key: fork-packaging-check
       - name: Regression gates
         run: |
           cargo fmt --all -- --check

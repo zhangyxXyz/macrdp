@@ -18,6 +18,7 @@ mod camera;
 mod capture;
 mod clipboard;
 mod clipboard_image;
+mod clipboard_io;
 #[cfg(test)]
 mod clipboard_protocol_tests;
 mod clipboard_rich;
@@ -26,6 +27,7 @@ mod conn_hooks;
 #[cfg(test)]
 mod conn_test;
 mod cursor;
+mod display_session;
 mod display_transition;
 #[cfg(target_os = "macos")]
 mod file_promise;
@@ -324,7 +326,9 @@ struct Args {
     /// THAT to the RDP client instead of mirroring the user's primary
     /// panel. Behaves like plugging in an external monitor — the local
     /// screen stays untouched and you can keep working on the Mac
-    /// locally while the remote session uses its own desktop.
+    /// locally while the remote session uses its own desktop. Created only
+    /// for authenticated capture; removed after the last capture ends and
+    /// physical-screen restoration finishes. No idle extended desktop.
     ///
     /// Requires --width and --height (the virtual display has no
     /// "native" size to fall back to). Backed by undocumented
@@ -354,7 +358,8 @@ struct Args {
     /// for the duration of the run — the one with the menu bar, where
     /// new app windows open. Use this when you want to drive the
     /// remote desktop as your "main" workspace (e.g. headless remote
-    /// use). Restored on clean exit; the underlying CGConfigure call is
+    /// use). Restored after the last remote capture or on clean exit;
+    /// the underlying CGConfigure call is
     /// session-scoped so the layout also reverts on user logout if
     /// macrdp exits uncleanly (signal, crash). Only valid with
     /// --virtual-display.
@@ -1941,7 +1946,7 @@ fn detach_restart_on_stuck(stdout_is_tty: bool, env_override: Option<&str>) -> b
 #[allow(clippy::too_many_arguments)]
 fn spawn_primary_overlay_watcher<T: Send + 'static>(
     label: &'static str,
-    vd_id: u32,
+    display: display_session::SharedDisplay,
     tracker: capture::SessionTracker,
     transitions: display_transition::Coordinator,
     slot: Arc<std::sync::Mutex<Option<T>>>,
@@ -2018,6 +2023,11 @@ fn spawn_primary_overlay_watcher<T: Send + 'static>(
                         (was_zero, reconcile) = restore_state.reconcile(false, false);
                         continue;
                     }
+                    let Some(vd_id) = display.lock().unwrap().id_if_active() else {
+                        (was_zero, reconcile) = restore_state
+                            .reconcile(false, tracker.count.load(Ordering::SeqCst) > 0);
+                        continue;
+                    };
                     let worker_slot = slot.clone();
                     let worker_tracker = tracker.clone();
                     let started = Instant::now();
@@ -3169,40 +3179,54 @@ async fn async_main(mut args: Args, document: Option<config::Document>) -> Resul
         Some(VdHidpiArg::On) => virtual_display::HidpiPolicy::On,
         Some(VdHidpiArg::Auto) => virtual_display::HidpiPolicy::Auto(client_scale_factor.clone()),
     };
-    let virtual_display: Option<Arc<std::sync::Mutex<virtual_display::VirtualDisplay>>> =
-        if args.virtual_display {
-            let w = args
-                .width
-                .ok_or_else(|| anyhow!("--virtual-display requires --width"))?;
-            let h = args
-                .height
-                .ok_or_else(|| anyhow!("--virtual-display requires --height"))?;
-            // 60 Hz: real displays bottom out around 24 Hz. Refresh rate is
-            // metadata here (capture cadence is governed by --fps); pass a
-            // safe value so CGVirtualDisplay doesn't reject the mode.
-            let vd = virtual_display::VirtualDisplay::new(
-                u32::from(w),
-                u32::from(h),
-                60,
-                vd_hidpi.capable(),
-                // Before any client: --width/--height are Retina pixels (the
-                // UI at half that), for `auto` too. Each connection then picks
-                // its own UI scale in `CaptureDisplay::sync_virtual_display`.
-                if vd_hidpi.capable() { 2 } else { 1 },
-            )
-            .context("attaching virtual display")?;
-            info!(
-                display_id = vd.display_id(),
-                origin = ?vd.origin_pts(),
-                size = ?vd.size_pts(),
-                hidpi = virtual_display::is_hidpi_virtual_display(vd.display_id()),
-                "virtual display attached — the RDP session uses this surface; \
-                 your primary panel is untouched"
-            );
-            Some(Arc::new(std::sync::Mutex::new(vd)))
-        } else {
-            None
+    let virtual_display = if args.virtual_display {
+        display_session::enable();
+        let width = args.width.context("--virtual-display requires --width")?;
+        let height = args.height.context("--virtual-display requires --height")?;
+        let (detached, captured, shielded) = (
+            detached_primary.clone(),
+            captured_primary.clone(),
+            shielded_primary.clone(),
+        );
+        let safe = move || {
+            if detached.lock().unwrap().is_some()
+                || captured.lock().unwrap().is_some()
+                || shielded.lock().unwrap().is_some()
+            {
+                return false;
+            }
+            #[cfg(target_os = "macos")]
+            {
+                core_graphics::display::CGDisplay::active_displays().is_ok_and(|ids| {
+                    ids.iter()
+                        .any(|id| Some(*id) != crate::display_session::active_display_id())
+                })
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                true
+            }
         };
+        info!(
+            width,
+            height, "virtual display configured; creation deferred until authenticated capture"
+        );
+        Some(display_session::ManagedDisplay::new(
+            display_session::Options {
+                width: u32::from(width),
+                height: u32::from(height),
+                hidpi: vd_hidpi.capable(),
+                scale: if vd_hidpi.capable() { 2 } else { 1 },
+            },
+            display_transitions.clone(),
+            safe,
+            (args.make_primary
+                && !(args.detach_primary || args.capture_primary || args.shield_primary))
+                .then(|| primary_override.clone()),
+        ))
+    } else {
+        None
+    };
 
     // --detach-primary / --capture-primary are lazy: the headless
     // mechanism is only engaged once a client actually connects. A
@@ -3268,15 +3292,13 @@ async fn async_main(mut args: Args, document: Option<config::Document>) -> Resul
         warn!("--auto-unlock has no effect under --skip-auth; ignoring");
     }
     if args.detach_primary {
-        let vd_id = virtual_display
+        let display = virtual_display
             .as_ref()
-            .expect("checked above when --detach-primary")
-            .lock()
-            .expect("virtual display mutex poisoned")
-            .display_id();
+            .expect("headless mode requires virtual display")
+            .clone();
         spawn_primary_overlay_watcher(
             "detach",
-            vd_id,
+            display,
             session_tracker.clone(),
             display_transitions.clone(),
             detached_primary.clone(),
@@ -3286,15 +3308,13 @@ async fn async_main(mut args: Args, document: Option<config::Document>) -> Resul
             lock_activity.clone(),
         );
     } else if args.capture_primary {
-        let vd_id = virtual_display
+        let display = virtual_display
             .as_ref()
-            .expect("checked above when --capture-primary")
-            .lock()
-            .expect("virtual display mutex poisoned")
-            .display_id();
+            .expect("headless mode requires virtual display")
+            .clone();
         spawn_primary_overlay_watcher(
             "capture",
-            vd_id,
+            display,
             session_tracker.clone(),
             display_transitions.clone(),
             captured_primary.clone(),
@@ -3304,15 +3324,13 @@ async fn async_main(mut args: Args, document: Option<config::Document>) -> Resul
             lock_activity.clone(),
         );
     } else if args.shield_primary {
-        let vd_id = virtual_display
+        let display = virtual_display
             .as_ref()
-            .expect("checked above when --shield-primary")
-            .lock()
-            .expect("virtual display mutex poisoned")
-            .display_id();
+            .expect("headless mode requires virtual display")
+            .clone();
         spawn_primary_overlay_watcher(
             "shield",
-            vd_id,
+            display,
             session_tracker.clone(),
             display_transitions.clone(),
             shielded_primary.clone(),
@@ -3321,31 +3339,6 @@ async fn async_main(mut args: Args, document: Option<config::Document>) -> Resul
             physical_main_id,
             lock_activity.clone(),
         );
-    } else if args.make_primary {
-        let vd_id = virtual_display
-            .as_ref()
-            .expect("checked above when --make-primary")
-            .lock()
-            .expect("virtual display mutex poisoned")
-            .display_id();
-        match virtual_display::PrimaryOverride::install(vd_id)
-            .context("promoting virtual display to primary")?
-        {
-            Some(ovr) => {
-                info!(
-                    "virtual display promoted to primary — menu bar and new \
-                     windows move there. Original layout restored on exit \
-                     (or at next logout)."
-                );
-                *primary_override.lock().expect("override mutex poisoned") = Some(ovr);
-            }
-            None => {
-                info!(
-                    "virtual display is already the system primary (macOS \
-                     auto-placed it at origin) — no override needed"
-                );
-            }
-        }
     }
 
     let cert_dir = match args.cert_dir.clone() {
@@ -3366,33 +3359,10 @@ async fn async_main(mut args: Args, document: Option<config::Document>) -> Resul
     //   - primary panel, no --width/--height override: query SCK for
     //     native size and use CGDisplay::main() for the point-space bounds.
     //   - primary panel with override: use the override + main geometry.
-    let (width, height, capture_display_id, screen_size_pts) = if let Some(vd) = &virtual_display {
-        let vd = vd.lock().expect("virtual display mutex poisoned");
-        // Both required earlier, so the unwraps can't fire.
-        let w = args
-            .width
-            .expect("checked above when --virtual-display set");
-        let h = args
-            .height
-            .expect("checked above when --virtual-display set");
-        // Re-query CGDisplayBounds rather than trusting the cached
-        // values from VirtualDisplay creation: if --make-primary
-        // moved the display to (0, 0), the cached size is fine but
-        // we want a fresh read for parity with the input handler.
-        #[cfg(target_os = "macos")]
-        let size = {
-            let b = core_graphics::display::CGDisplay::new(vd.display_id()).bounds();
-            (b.size.width, b.size.height)
-        };
-        #[cfg(not(target_os = "macos"))]
-        let size = vd.size_pts();
-        info!(
-            width = w,
-            height = h,
-            display_id = vd.display_id(),
-            "desktop size (virtual display)"
-        );
-        (w, h, Some(vd.display_id()), size)
+    let (width, height, capture_display_id, screen_size_pts) = if virtual_display.is_some() {
+        let (w, h) = (args.width.unwrap(), args.height.unwrap());
+        let scale = if vd_hidpi.capable() { 2.0 } else { 1.0 };
+        (w, h, None, (f64::from(w) / scale, f64::from(h) / scale))
     } else {
         let detected = primary_display_size().await?;
         let mut w = args

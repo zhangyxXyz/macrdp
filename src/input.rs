@@ -1188,7 +1188,10 @@ mod macos {
                     return b;
                 }
             }
-            let d = match self.target_display_id {
+            let d = match self
+                .target_display_id
+                .or_else(crate::display_session::active_display_id)
+            {
                 Some(id) => CGDisplay::new(id),
                 None => CGDisplay::main(),
             };
@@ -1706,7 +1709,10 @@ mod macos {
             // runs off-thread so input never stalls.
             let maintenance = super::modifiers::maintenance_chord(vk, ctrl, opt, cmd, shift);
             if maintenance == Some(super::modifiers::MaintenanceChord::Gather) {
-                if let Some(id) = self.target_display_id {
+                if let Some(id) = self
+                    .target_display_id
+                    .or_else(crate::display_session::active_display_id)
+                {
                     std::thread::spawn(move || {
                         let moved = gather_windows_onto_display(id);
                         tracing::info!(

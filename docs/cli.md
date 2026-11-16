@@ -703,3 +703,13 @@ Alt acts as Command and Ctrl remains Control. Physical maintenance chords
 Ctrl+Alt+G and Ctrl+Alt+Shift+R are unchanged. Apply requires a server restart.
 Client-intercepted shortcuts cannot be remapped by the server. See the mapping
 table and validation limits in [README](../README.md#modifier-positions-and-ctrl-shortcut-compatibility).
+
+### Fork virtual-display session lifetime
+
+`--virtual-display` (`VIRTUAL_DISPLAY=1`) stores its width/height/scale at startup,
+but creates the display only during authenticated capture. `--make-primary` also
+applies per active display and restores on release. A 2.5s reactivation grace and
+physical restoration precede last-capture cleanup; no other active display means
+retaining the virtual display. SCK registration after creation or confirmed
+unlock has a fixed 8s maximum, polled every 200ms with immediate success.
+Publishing/building does not activate this behavior in an older installed app.

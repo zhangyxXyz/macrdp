@@ -8,8 +8,8 @@ import os
 from pathlib import Path
 import re
 import subprocess
-import tempfile
 import zipfile
+from urllib.parse import quote
 
 MARKER = '<!-- macrdp-fork-release:v1 '
 TAG = re.compile(r'v\d+\.\d+\.\d+(?:-[A-Za-z0-9][A-Za-z0-9.-]*)?\Z')
@@ -26,10 +26,32 @@ def api(path, method='GET', data=None):
     return json.loads(gh('api', '--method', method, path, data=data))
 
 
+def marker_sha(release):
+    found = re.search(re.escape(MARKER) + r'sha=([a-f0-9]{40}) -->', release.get('body') or '')
+    return found.group(1) if found else None
+
+
 def owner_sha(release):
-    body = release.get('body') or ''
-    found = re.search(re.escape(MARKER) + r'sha=([a-f0-9]{40}) -->', body)
-    return found.group(1) if found and TAG.fullmatch(release['tag_name']) else None
+    return marker_sha(release) if TAG.fullmatch(release['tag_name']) else None
+
+
+def owned_draft(release, tag, sha):
+    # GitHub may rename a draft to untagged-* after an edit. Its stable ID,
+    # exact pipeline name, target commit and provenance must all still match.
+    return (release.get('draft') is True and marker_sha(release) == sha
+            and release.get('name') == 'macrdp ' + tag
+            and release.get('target_commitish') == sha
+            and (release['tag_name'] == tag or release['tag_name'].startswith('untagged-')))
+
+
+def upload_assets(repo, release, paths):
+    # Never resolve a draft through the tag-based gh release commands.
+    for path in paths:
+        for old in release['assets']:
+            if old['name'] == path.name:
+                gh('api', '--method', 'DELETE', f"repos/{repo}/releases/assets/{old['id']}")
+        url = f"https://uploads.github.com/repos/{repo}/releases/{release['id']}/assets?name={quote(path.name, safe='')}"
+        gh('api', '--method', 'POST', url, '-H', 'Content-Type: application/octet-stream', '--input', str(path))
 
 
 def verify_files(archive, sums, expected_sha, expected_name):
@@ -49,26 +71,31 @@ def verify_files(archive, sums, expected_sha, expected_name):
             raise ValueError('release bundle incomplete')
 
 
-def verify_release(repo, release):
-    sha = owner_sha(release)
-    if not sha:
+def verify_release(repo, release, expected_tag=None, expected_sha=None):
+    tag = expected_tag or release['tag_name']
+    sha = expected_sha or owner_sha(release)
+    if not TAG.fullmatch(tag) or not sha:
         raise ValueError('release is not owned by this pipeline')
-    name = f"macrdp-{release['tag_name']}-aarch64-apple-darwin-app.zip"
+    if release['draft']:
+        if not owned_draft(release, tag, sha):
+            raise ValueError('draft provenance mismatch')
+    elif release['tag_name'] != tag or owner_sha(release) != sha:
+        raise ValueError('published provenance mismatch')
+    name = f"macrdp-{tag}-aarch64-apple-darwin-app.zip"
     assets = release['assets']
     if sorted(a['name'] for a in assets) != sorted([name, 'SHA256SUMS']):
         raise ValueError('release asset set incomplete or unexpected')
-    with tempfile.TemporaryDirectory() as directory:
-        gh('release', 'download', release['tag_name'], '--repo', repo, '--dir', directory)
-        archive = Path(directory, name).read_bytes()
-        sums = Path(directory, 'SHA256SUMS').read_bytes()
-        for asset in assets:
-            content = archive if asset['name'] == name else sums
-            if len(content) != asset['size']:
-                raise ValueError('release asset size mismatch')
-            digest = asset.get('digest')
-            if digest and digest != 'sha256:' + hashlib.sha256(content).hexdigest():
-                raise ValueError('GitHub asset digest mismatch')
-        verify_files(archive, sums, sha, name)
+    contents = {}
+    for asset in assets:
+        content = gh('api', f"repos/{repo}/releases/assets/{asset['id']}",
+                     '-H', 'Accept: application/octet-stream')
+        if len(content) != asset['size']:
+            raise ValueError('release asset size mismatch')
+        digest = asset.get('digest')
+        if digest and digest != 'sha256:' + hashlib.sha256(content).hexdigest():
+            raise ValueError('GitHub asset digest mismatch')
+        contents[asset['name']] = content
+    verify_files(contents[name], contents['SHA256SUMS'], sha, name)
     return sha
 
 
@@ -88,22 +115,34 @@ def stage(repo, tag, sha, directory):
     name = f'macrdp-{tag}-aarch64-apple-darwin-app.zip'
     verify_files(Path(directory, name).read_bytes(), Path(directory, 'SHA256SUMS').read_bytes(), sha, name)
     existing = json.loads(gh('api', '--paginate', '--slurp', f'repos/{repo}/releases?per_page=100'))
-    release = next((r for page in existing for r in page if r['tag_name'] == tag), None)
+    records = [r for page in existing for r in page]
+    matches = [r for r in records if r['tag_name'] == tag or owned_draft(r, tag, sha)]
+    if len(matches) > 1:
+        raise ValueError('ambiguous release drafts; refusing to select one')
+    release = matches[0] if matches else None
     body = notes(tag, sha, repo)
     if release:
-        if not release['draft'] or owner_sha(release) != sha:
+        if not owned_draft(release, tag, sha):
             raise ValueError('refusing to overwrite a published or unowned release')
-        api(f"repos/{repo}/releases/{release['id']}", 'PATCH', {'body': body})
+        release = api(f"repos/{repo}/releases/{release['id']}", 'PATCH',
+            {'tag_name': tag, 'target_commitish': sha, 'name': 'macrdp ' + tag, 'body': body, 'draft': True})
     else:
         release = api(f'repos/{repo}/releases', 'POST', {'tag_name': tag, 'target_commitish': sha,
             'name': 'macrdp ' + tag, 'body': body, 'draft': True, 'prerelease': '-' in tag})
-    gh('release', 'upload', tag, '--repo', repo, '--clobber',
-       str(Path(directory, name)), str(Path(directory, 'SHA256SUMS')))
+    # Re-read and authenticate before deleting/replacing any asset.
     release = api(f"repos/{repo}/releases/{release['id']}")
-    verify_release(repo, release)
-    # Only publish after round-trip verification. Failed uploads remain draft.
-    api(f"repos/{repo}/releases/{release['id']}", 'PATCH',
-        {'draft': False, 'prerelease': '-' in tag, 'make_latest': 'false' if '-' in tag else 'true'})
+    if not owned_draft(release, tag, sha):
+        raise ValueError('draft changed before upload')
+    upload_assets(repo, release, [Path(directory, name), Path(directory, 'SHA256SUMS')])
+    release = api(f"repos/{repo}/releases/{release['id']}")
+    verify_release(repo, release, tag, sha)
+    # Only publish after round-trip verification. Always restore the real tag.
+    published = api(f"repos/{repo}/releases/{release['id']}", 'PATCH',
+        {'tag_name': tag, 'target_commitish': sha, 'name': 'macrdp ' + tag,
+         'draft': False, 'prerelease': '-' in tag, 'make_latest': 'false' if '-' in tag else 'true'})
+    if published['draft'] or published['tag_name'] != tag or owner_sha(published) != sha:
+        raise ValueError('publication metadata did not match the verified draft')
+
     print(f'Published and verified {tag}')
 
 

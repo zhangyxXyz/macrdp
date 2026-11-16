@@ -440,6 +440,10 @@ pub struct Cliprdr<R: Role> {
     /// CB_RESPONSE_FAIL if it can't produce the data (3.1.5.4.3);
     /// [`MAX_PENDING_FORMAT_DATA_REQUESTS`] bounds one that doesn't.
     pending_format_data_requests: VecDeque<PendingFormatDataRequest>,
+    // Responses have no format ID: serialize async backend requests and
+    // inline file descriptors/drop effects in their original wire order.
+    local_format_pending: bool,
+    local_format_queue: VecDeque<FormatDataRequest>,
 
     /// Stores the local file list when initiating a file copy operation.
     /// Set by initiate_file_copy(), used to respond to FormatDataRequest.
@@ -609,6 +613,8 @@ impl<R: Role> Cliprdr<R> {
             state: CliprdrState::Initialization,
             capabilities: Capabilities::new(ClipboardProtocolVersion::V2, flags),
             pending_format_data_requests: VecDeque::new(),
+            local_format_pending: false,
+            local_format_queue: VecDeque::new(),
             local_file_list: None,
             local_file_list_format_id: None,
             local_drop_effect_format_id: None,
@@ -850,12 +856,64 @@ impl<R: Role> Cliprdr<R> {
     /// [`CliprdrBackend::on_format_data_request`] is called by [`Cliprdr`].
     ///
     /// If data is not available anymore, an error response should be sent instead.
-    pub fn submit_format_data(&self, response: OwnedFormatDataResponse) -> PduResult<CliprdrSvcMessages<R>> {
+    pub fn submit_format_data(
+        &mut self,
+        response: OwnedFormatDataResponse,
+    ) -> PduResult<CliprdrSvcMessages<R>> {
         self.require_ready("submit_format_data")?;
+        self.local_format_pending = false;
+        let mut messages = vec![into_cliprdr_message(ClipboardPdu::FormatDataResponse(
+            response,
+        ))];
+        while !self.local_format_pending {
+            let Some(request) = self.local_format_queue.pop_front() else {
+                break;
+            };
+            messages.extend(self.respond_local_format(request)?);
+        }
+        Ok(messages.into())
+    }
 
-        let pdu = ClipboardPdu::FormatDataResponse(response);
+    fn respond_local_format(&mut self, request: FormatDataRequest) -> PduResult<Vec<SvcMessage>> {
+        // Short-circuit: if the remote is asking for our Preferred
+        // DropEffect, answer inline with DROPEFFECT_COPY (0x00000001,
+        // 4-byte little-endian). This is what we always mean by an
+        // outbound file copy (`initiate_file_copy` is named for
+        // exactly this), so answering inline keeps backends from
+        // having to know about the format.
+        if Some(request.format) == self.local_drop_effect_format_id {
+            const DROPEFFECT_COPY: u32 = 0x0000_0001;
+            let response =
+                OwnedFormatDataResponse::new_data(DROPEFFECT_COPY.to_le_bytes().to_vec());
+            let pdu = ClipboardPdu::FormatDataResponse(response);
+            return Ok(vec![into_cliprdr_message(pdu)]);
+        }
+        // Check if this is a request for our stored file list by comparing format IDs
+        if Some(request.format) == self.local_file_list_format_id {
+            if let Some(ref file_list) = self.local_file_list {
+                // Respond with the stored file list
+                debug!(
+                    format_id = ?request.format,
+                    file_count = file_list.files.len(),
+                    "Responding to FileGroupDescriptorW request with stored file list"
+                );
+                let response = OwnedFormatDataResponse::new_file_list(file_list)
+                    .map_err(|e| encode_err!(e))?;
+                let pdu = ClipboardPdu::FormatDataResponse(response);
+                return Ok(vec![into_cliprdr_message(pdu)]);
+            } else {
+                // Format ID matches but we don't have a file list - this shouldn't happen
+                warn!("Received FormatDataRequest for file list format but no file list stored");
+            }
+        }
 
-        Ok(vec![into_cliprdr_message(pdu)].into())
+        // Forward to backend for other format requests
+        self.local_format_pending = true;
+        self.backend.on_format_data_request(request);
+
+        // NOTE: Actual data should be sent later via `submit_format_data` method,
+        // therefore we do not send anything immediately.
+        Ok(Vec::new())
     }
 
     /// Submits the file contents response, returning a [`CliprdrSvcMessages`] to send on the channel.
@@ -1752,42 +1810,20 @@ impl<R: Role> SvcProcessor for Cliprdr<R> {
                 Ok(Vec::new())
             }
             ClipboardPdu::FormatDataRequest(request) => {
-                // Short-circuit: if the remote is asking for our Preferred
-                // DropEffect, answer inline with DROPEFFECT_COPY (0x00000001,
-                // 4-byte little-endian). This is what we always mean by an
-                // outbound file copy (`initiate_file_copy` is named for
-                // exactly this), so answering inline keeps backends from
-                // having to know about the format.
-                if Some(request.format) == self.local_drop_effect_format_id {
-                    const DROPEFFECT_COPY: u32 = 0x0000_0001;
-                    let response = OwnedFormatDataResponse::new_data(DROPEFFECT_COPY.to_le_bytes().to_vec());
-                    let pdu = ClipboardPdu::FormatDataResponse(response);
-                    return Ok(vec![into_cliprdr_message(pdu)]);
-                }
-                // Check if this is a request for our stored file list by comparing format IDs
-                if Some(request.format) == self.local_file_list_format_id {
-                    if let Some(ref file_list) = self.local_file_list {
-                        // Respond with the stored file list
-                        debug!(
-                            format_id = ?request.format,
-                            file_count = file_list.files.len(),
-                            "Responding to FileGroupDescriptorW request with stored file list"
-                        );
-                        let response = OwnedFormatDataResponse::new_file_list(file_list).map_err(|e| encode_err!(e))?;
-                        let pdu = ClipboardPdu::FormatDataResponse(response);
-                        return Ok(vec![into_cliprdr_message(pdu)]);
-                    } else {
-                        // Format ID matches but we don't have a file list - this shouldn't happen
-                        warn!("Received FormatDataRequest for file list format but no file list stored");
+                if self.local_format_pending {
+                    if self.local_format_queue.len() >= MAX_PENDING_FORMAT_DATA_REQUESTS {
+                        return Err(ironrdp_pdu::PduError::new(
+                            "FormatDataRequest",
+                            ironrdp_pdu::PduErrorKind::Other {
+                                description: "too many queued local format requests",
+                            },
+                        ));
                     }
+                    self.local_format_queue.push_back(request);
+                    Ok(Vec::new())
+                } else {
+                    self.respond_local_format(request)
                 }
-
-                // Forward to backend for other format requests
-                self.backend.on_format_data_request(request);
-
-                // NOTE: Actual data should be sent later via `submit_format_data` method,
-                // therefore we do not send anything immediately.
-                Ok(Vec::new())
             }
             ClipboardPdu::FormatDataResponse(response) => {
                 // Correlate this response with the oldest unanswered FormatDataRequest.

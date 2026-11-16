@@ -362,7 +362,7 @@ private struct DisplayTab: View {
         Form {
             Section("Virtual display") {
                 Toggle("Headless virtual display", isOn: model.boolBinding("VIRTUAL_DISPLAY"))
-                Text("Creates a separate Mac display for the remote session. Client requests and macOS display limits determine the actual result; see Status after connecting.")
+                Text("Creates a display only for authenticated remote sessions. After capture ends and physical displays are restored, it is removed. Client requests and macOS limits determine the actual result; see Status after connecting.")
                     .font(.caption).foregroundColor(.secondary)
                         .lineLimit(nil).fixedSize(horizontal: false, vertical: true)
                 if let overrides = model.displayOverrides {

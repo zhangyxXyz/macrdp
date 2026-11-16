@@ -39,6 +39,21 @@ The Display panel exposes these policies and separates requested settings from
 measured state. See [display settings](docs/display-settings.md),
 [controller guide](gui/README.md), and [CLI reference](docs/cli.md).
 
+## Virtual display lifetime
+
+The virtual display is created for authenticated capture, not at server startup.
+After the last capture ends, a 2.5-second reactivation grace and physical-screen
+restoration precede removal. Quick reconnects cancel stale cleanup. Fresh display
+IDs are used by capture, input, audio and the switcher HUD. Newly created displays
+and confirmed unlocks wait up to 8 seconds for SCK registration, returning as soon
+as the requested display appears; this is a fixed maximum, not an 8-second delay.
+
+If physical restoration fails or no other active display exists, keep the virtual
+display rather than removing the only usable screen. Configuration (including
+fixed 4K/200%) remains saved for the next connection. Real mstsc lock/reconnect,
+bidirectional paste and physical-screen restoration of this rebuild are pending
+manual testing; no installed app or local configuration is replaced by publishing.
+
 ## Modifier positions and Ctrl shortcut compatibility
 
 These are independent settings in **Input → Modifier key positions** and
@@ -122,8 +137,20 @@ Build verification does not grant TCC permissions or change the running app.
 
 ## Windows clipboard images and files
 
-PNG/DIB screenshot data takes priority over virtual file descriptors. The image
-codecs validate complete payloads and retain the existing PNG/DIB fallbacks.
+PNG/DIB screenshots take priority over their virtual image-file representation.
+Explorer file copies use the file stream even when a thumbnail is offered.
+While files are being prepared, an inert clipboard item replaces stale text;
+file names and previews never fall back to plain-text clippings. A newer local
+copy wins over delayed remote replies. The complete-file fallback plays its
+ready sound without generating Cmd+V: paste again when the files are ready.
+
+Mac→Windows clipboard reads/encoding run on bounded blocking workers, allowing
+RDP to service input and File Provider hydration while a read waits. Limits are
+4 workers, 32 queued/completed operations and 30 seconds per request including
+queue time; slow or stalled reads fail rather than blocking the connection.
+Uncancellable OS reads retain their worker slot until they finish. Format replies
+remain ordered; file requests retain their original locked path snapshot and
+late completions from disconnected sessions cannot enter a new connection.
 
 Bundled macOS 15+ builds now include a sandboxed **macrdp Files** helper and
 File Provider extension. Enable it in **System Settings → General → Login Items
@@ -238,6 +265,8 @@ This fork makes no additional soak-test or production-readiness claim.
 
 - `ci.yml`: Linux/macOS regression checks, configuration checks, and audit integration on `dev` changes and pull requests; also callable manually.
 - `release.yml`: only `v*` tag pushes package Apple Silicon apps after Rust/Swift/Python checks. The tagged commit must belong to `dev`. Both apps, source metadata and checksum go directly to a draft Release; round-trip verification precedes publication. There are no intermediate Actions Artifacts. Tags containing `-` are prereleases (for example `v0.10.6-dev`). Re-run a failed tag workflow to resume its owned draft; published releases are never overwritten.
+- `build-check.yml`: manual-only packaging verification without publishing or uploading artifacts. Ordinary dev pushes do not duplicate the release packaging job.
+- Draft assets upload/download by stable Release/asset IDs. An exact pipeline-owned `untagged-*` draft can resume; verified publication explicitly restores the version tag. A same-version replacement must first be deliberately prepared as an owned draft; it is not an automatic overwrite of a published release.
 - Release notes use the [short bilingual template](packaging/RELEASE_NOTES.md) and link to that version in [CHANGELOG.md](CHANGELOG.md). Add the changelog section before tagging; the full section is not duplicated in release notes.
 - `cleanup-releases.yml`: manual preview defaults on. The release pipeline also prunes after publishing: verify the newest owned release first, retain it, remove older pipeline-owned releases and their matching tags. Unknown releases and drafts are untouched; failed verification or concurrent edits abort cleanup. Inspired by CLIProxyAPI-Plugins. The former manual `dev-build.yml` artifact build has been removed.
 - `security.yml`: dependency checks, including `dev` dependency changes.

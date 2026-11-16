@@ -35,6 +35,18 @@
 Display 设置页提供这些策略，并区分请求配置与实测状态。详见
 [显示配置](docs/display-settings.md)、[控制器说明](gui/README.md)和 [CLI 文档](docs/cli.md)。
 
+## 虚拟显示器的生命周期
+
+虚拟显示器改为通过认证、准备捕获时创建，服务启动时不再创建闲置的扩展桌面。
+最后一路捕获结束后，先经过 2.5 秒重激活宽限并等待实体屏恢复，再移除虚拟屏；
+快速重连会使旧清理任务失效。捕获、输入、音频和切换器 HUD 使用当前显示器 ID。
+新建显示器及确认解锁后，最多等 8 秒让目标屏出现在 SCK 中；出现即继续，
+这是固定上限，并非每次等待 8 秒。
+
+实体屏恢复失败或没有其他活动显示器时保留虚拟屏，避免移除唯一可用画面。
+固定 4K／200% 等配置保留，供下次连接使用。此次重构建的真实 mstsc 锁屏重连、
+双向粘贴和实体屏恢复仍待手动测试；发布不会替换本机 app 或修改配置。
+
 ## 修饰键位置与 Ctrl 快捷键兼容
 
 两项设置独立存在于 **Input → Modifier key positions（修饰键位置）** 与
@@ -104,7 +116,16 @@ CLI 参数为 `--modifier-layout standard|swap-left-win-alt|swap-win-alt`，
 
 ## Windows 剪贴板图片与文件
 
-PNG／DIB 截图数据继续优先于虚拟文件描述符，保留完整图片校验和 PNG／DIB 回退路径。
+PNG／DIB 截图优先于其虚拟图片文件表示；Explorer 文件复制即使带缩略图也走文件流。
+文件准备期间先用不可粘贴的标记替换旧文本，文件名／预览不会降级为文本片段；
+延迟的远端回复不会覆盖后来在 Mac 上复制的内容。完整下载回退只播放就绪提示音，
+不再自动发送 Cmd+V；文件就绪后请再次粘贴。
+
+Mac→Windows 的剪贴板读取与图片编码移到有上限的后台阻塞线程，让 RDP 在等待读取时
+仍能处理输入和 File Provider 物化请求。上限为 4 个读取线程、32 个排队／待发送操作，
+每个请求含排队最多 30 秒；慢读／卡住时返回失败。无法取消的系统读取会继续占用线程名额，
+直到真正返回。无 ID 的格式回复保持原顺序，文件请求绑定原锁对应的路径，
+断开会话的迟到回复不能进入新连接。
 
 打包应用在 macOS 15+ 新增沙箱 **macrdp Files** helper 和 File Provider 扩展。
 在**系统设置 → 通用 → 登录项与扩展 → 文件提供程序**中启用它，再重启 macrdp。
@@ -197,6 +218,8 @@ BLANK_RECOVERY=0
 - `ci.yml`：`dev` 变更和 PR 执行 Linux/macOS 回归、配置检查与审计集成检查，也支持手动运行。
 - `release.yml`：只有推送 `v*` tag 才打包 Apple Silicon 应用，先通过 Rust／Swift／Python 检查，且 tag 提交必须属于 `dev`。两个 app、源提交信息与校验和直接上传草稿 Release，回读验证后发布，不使用中间 Actions Artifacts。包含 `-` 的 tag 为预发布（例如 `v0.10.6-dev`）。失败时重跑原 tag 工作流续传自有草稿；已发布版本拒绝覆盖。
 - Release notes 使用 [简短双语模板](packaging/RELEASE_NOTES.md)，链接到 [CHANGELOG.md](CHANGELOG.md) 对应版本，不复制整段更新记录；打 tag 前必须先补齐该节。
+- `build-check.yml`：仅手动执行打包验证，不发布、不上传归档；普通 dev 推送不再重复触发发布打包。
+- 草稿使用稳定的 Release／asset ID 上传和回读，能续传来源完全匹配的自有 `untagged-*` 草稿，验证后显式恢复版本 tag。同版本覆盖必须先明确准备自有草稿，不会自动覆盖已发布版本。
 - `cleanup-releases.yml`：手动默认只预览。发布成功后也会自动清理：先验证最新自有 Release，保留它，删除更旧的流水线自有 Release，同时删除这些旧自有 Release 对应的 Git tag。未知来源的 Release 和草稿不动；校验失败或发现并发编辑即中止。编排参考 CLIProxyAPI-Plugins，原先手动 `dev-build.yml` 归档构建已移除。
 - `security.yml`：依赖检查，包含 `dev` 上的依赖变更。
 - `delete-old-workflow-runs.yml`：沿用 [CLIProxyAPI-Plugins](https://github.com/zhangyxXyz/CLIProxyAPI-Plugins) 的策略。每个 workflow 保留最新 6 次记录和最近 30 天的全部记录，只清理更旧且已结束的记录。push 只预览，手动默认预览，每周定时清理。

@@ -518,26 +518,10 @@ pub fn resolve_dest(root: &Path, entry: &RemoteEntry) -> Option<PathBuf> {
     Some(p)
 }
 
-/// Audible "paste is ready" cue plus an opportunistic auto-Cmd-V if the
-/// user is still in Finder.
-///
-/// We tried `osascript ... display notification` first but macOS attributes
-/// the banner to the parent process (macrdp, unsigned, no notification
-/// grant) and silently suppresses it. `afplay` doesn't go through the
-/// notification permission system at all — it's just audio playback —
-/// so the chime always plays. The Glass sound is short and unobtrusive.
-///
-/// The auto-paste piggy-backs on the same trigger because the typical
-/// flow is "user copied in Windows, switched to Finder, hit Cmd-V, got
-/// beep, is still staring at Finder." If Finder is the frontmost app
-/// when our download finishes, fire `Cmd-V` via System Events so the
-/// paste completes without the user having to do anything. If they've
-/// switched focus to another app, the chime alone is the cue to switch
-/// back and paste manually — we deliberately don't activate or steal
-/// focus to avoid pasting into the wrong text field.
+/// Audible completion cue only. Never synthesize a later Cmd-V: another
+/// copy or focus change could turn it into pasting unrelated text/files.
 fn ready_signal() {
     play_glass();
-    auto_paste_if_finder_front();
 }
 
 fn play_glass() {
@@ -546,42 +530,6 @@ fn play_glass() {
         .spawn()
     {
         debug!("afplay spawn failed: {e}");
-    }
-}
-
-fn auto_paste_if_finder_front() {
-    // AppleScript: only fire Cmd-V if Finder is the currently frontmost
-    // process. System Events handles the keystroke; the user only needs
-    // to have granted Accessibility access to System Events once.
-    let script = r#"
-        tell application "System Events"
-            set frontApp to name of first application process whose frontmost is true
-            if frontApp is "Finder" then
-                keystroke "v" using command down
-            end if
-        end tell
-    "#;
-    let output = match std::process::Command::new("osascript")
-        .arg("-e")
-        .arg(script)
-        .output()
-    {
-        Ok(o) => o,
-        Err(e) => {
-            debug!("osascript spawn failed for auto-paste: {e}");
-            return;
-        }
-    };
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        debug!(
-            status = ?output.status,
-            stderr = %stderr.trim(),
-            "auto-paste osascript exited non-zero (typically: no Accessibility \
-             grant for System Events, or Finder not running)"
-        );
-    } else {
-        debug!("auto-paste check completed");
     }
 }
 
@@ -656,7 +604,9 @@ pub fn publish_file_urls(
         if !pb.writeObjects(&array) {
             return false;
         }
-        pb.changeCount() as i64
+        let cc = pb.changeCount() as i64;
+        self_change_count.store(cc, Ordering::Relaxed);
+        cc
     };
     // Tell the Mac-side poller "we just wrote these; ignore the next
     // changeCount tick."

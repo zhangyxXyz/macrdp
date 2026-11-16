@@ -94,6 +94,8 @@ impl Want {
 enum RemotePlan {
     /// The remote copied files: request the file list and nothing else.
     Files(ClipboardFormatId),
+    /// Windows local file handles/paths cannot be read as remote text.
+    UnavailableFiles,
     /// Fetch these, one at a time, then publish them as one pasteboard item.
     Fetch(Vec<Want>),
     Nothing,
@@ -119,6 +121,26 @@ fn payload_preview(data: &[u8]) -> String {
         .collect()
 }
 
+fn has_local_file_intent(formats: &[ClipboardFormat]) -> bool {
+    formats.iter().any(|format| {
+        format.id.value() == 15
+            || format.name.as_ref().is_some_and(|name| {
+                ["FileNameW", "FileName", "Shell IDList Array"]
+                    .iter()
+                    .any(|known| name.value().eq_ignore_ascii_case(known))
+            })
+    })
+}
+
+fn has_file_intent(formats: &[ClipboardFormat]) -> bool {
+    has_local_file_intent(formats)
+        || formats.iter().any(|f| {
+            f.name
+                .as_ref()
+                .is_some_and(|n| n.value().eq_ignore_ascii_case("FileGroupDescriptorW"))
+        })
+}
+
 fn plan_remote_fetch(formats: &[ClipboardFormat], rich: bool) -> RemotePlan {
     let named = |name: &str| {
         formats
@@ -136,9 +158,17 @@ fn plan_remote_fetch(formats: &[ClipboardFormat], rich: bool) -> RemotePlan {
         .into_iter()
         .find(|&id| has(id));
     let png = named("PNG");
+    // CF_HDROP (15), FileName[W] and Shell IDList describe local Windows
+    // files. Without a streamable descriptor, their filename text is NOT a
+    // text-copy fallback. Preserve real screenshot data when it exists.
+    if file_format.is_none() && has_file_intent(formats) && png.is_none() && dib.is_none() {
+        return RemotePlan::UnavailableFiles;
+    }
     // Screenshot tools can advertise both bitmap and virtual PNG-file forms.
     // Prefer actual image data; retain files as a fallback if all image decodes fail.
-    if let Some(id) = file_format.filter(|_| dib.is_none() && png.is_none()) {
+    if let Some(id) =
+        file_format.filter(|_| has_local_file_intent(formats) || (dib.is_none() && png.is_none()))
+    {
         return RemotePlan::Files(id);
     }
 
@@ -194,6 +224,8 @@ impl Collected {
 /// each answered in order; sequencing is macrdp's choice, not a spec rule.)
 #[derive(Debug, Default)]
 struct RemoteFetch {
+    /// Filename/HTML previews of file copies must never become text clippings.
+    file_intent: bool,
     current: Option<Want>,
     /// When the request for `current` went out. A reply overdue by more than
     /// `STALE_REPLY_GRACE` is presumed lost, so a new copy doesn't wait on it.
@@ -740,8 +772,8 @@ impl CliprdrBackendFactory for MacCliprdr {
             image_ticket: None,
             #[cfg(target_os = "macos")]
             file_session: crate::file_provider::random_id(),
-            #[cfg(target_os = "macos")]
             session_alive: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            local_file_locks: Default::default(),
             current_remote_lock: None,
             advertise_state: self.advertise_state.clone(),
             #[cfg(target_os = "macos")]
@@ -839,8 +871,8 @@ struct MacCliprdrBackend {
     initial_remote_copy_pending: bool,
     #[cfg(target_os = "macos")]
     file_session: String,
-    #[cfg(target_os = "macos")]
     session_alive: Arc<std::sync::atomic::AtomicBool>,
+    local_file_locks: std::collections::HashMap<u32, Vec<std::path::PathBuf>>,
     current_remote_lock: Option<u32>,
 }
 
@@ -865,6 +897,8 @@ struct MacCliprdrBackend {
 /// and we don't want to stall the disconnect path.
 impl Drop for MacCliprdrBackend {
     fn drop(&mut self) {
+        self.session_alive
+            .store(false, std::sync::atomic::Ordering::Release);
         // Re-park the pasteboard poller if this was the last connected
         // clipboard channel (balances build_cliprdr_backend's increment).
         self.active_backends
@@ -961,6 +995,34 @@ impl MacCliprdrBackend {
         }
     }
 
+    /// Once the client announces files, old text is no longer a valid paste.
+    /// Reserve an inert, local-only item until complete/provider URLs are ready.
+    /// A newer local copy still wins: never clear it or retarget its ticket.
+    #[cfg(target_os = "macos")]
+    fn reserve_file_clipboard(&mut self) -> bool {
+        use objc2_foundation::NSString;
+        let _guard = pasteboard_guard();
+        let Some(ticket) = self.image_ticket.as_ref() else {
+            return false;
+        };
+        unsafe {
+            let pb = pasteboard();
+            if !ticket.may_publish(pb.changeCount() as i64) {
+                return false;
+            }
+            begin_local_write(&pb);
+            pb.setString_forType(
+                &NSString::from_str("files"),
+                &NSString::from_str("com.clintcan.macrdp.pending-files"),
+            );
+            let cc = pb.changeCount() as i64;
+            self.self_change_count
+                .store(cc, std::sync::atomic::Ordering::Relaxed);
+            self.image_ticket = Some(ticket.after_own_write(cc));
+        }
+        true
+    }
+
     /// Write one remote copy to NSPasteboard as a single multi-type item and
     /// mark that write as our own, so the pasteboard poller doesn't advertise
     /// it straight back to the remote. Without that mark the echo makes the
@@ -969,7 +1031,12 @@ impl MacCliprdrBackend {
     /// The mark goes in `remote_write_cc`, NOT `self_change_count` — see
     /// MacCliprdr::remote_write_cc for why that distinction is load-bearing.
     fn publish_fetched(&mut self) {
-        let got = std::mem::take(&mut self.fetch.got);
+        let mut got = std::mem::take(&mut self.fetch.got);
+        if self.fetch.file_intent {
+            got.text = None;
+            got.html = None;
+            got.rtf = None;
+        }
         if got.is_empty() {
             return;
         }
@@ -990,6 +1057,10 @@ impl MacCliprdrBackend {
             got.rtf.as_deref(),
             got.png.as_deref(),
             mark,
+            #[cfg(target_os = "macos")]
+            self.image_ticket.as_ref(),
+            #[cfg(not(target_os = "macos"))]
+            None,
         );
     }
 
@@ -997,14 +1068,9 @@ impl MacCliprdrBackend {
     /// during the most recent file-copy advertise. Returns `None` on any
     /// failure so the caller can synthesize a CB_RESPONSE_FAIL.
     fn serve_file_contents(
-        &self,
+        path: std::path::PathBuf,
         request: FileContentsRequest,
     ) -> Option<FileContentsResponse<'static>> {
-        let idx = usize::try_from(request.index).ok()?;
-        let path = {
-            let guard = self.file_paths.lock().unwrap();
-            guard.get(idx).cloned()?
-        };
         let meta = std::fs::metadata(&path)
             .map_err(|e| warn!(?path, "metadata failed: {e}"))
             .ok()?;
@@ -1366,10 +1432,18 @@ impl CliprdrBackend for MacCliprdrBackend {
             );
         }
         self.fetch = RemoteFetch {
+            file_intent: has_file_intent(available_formats),
             awaiting_stale,
             ..RemoteFetch::default()
         };
+        #[cfg(target_os = "macos")]
+        if has_file_intent(available_formats) && !self.reserve_file_clipboard() {
+            return;
+        }
         match plan_remote_fetch(available_formats, self.rich_clipboard) {
+            RemotePlan::UnavailableFiles => {
+                warn!("remote clipboard announces Windows files but no supported file stream; refusing filename/text fallback");
+            }
             RemotePlan::Files(id) => {
                 debug!(format_id = ?id, "remote advertised files; requesting file list");
                 self.fetch.queue.push_back(Want::Other(id));
@@ -1464,62 +1538,68 @@ impl CliprdrBackend for MacCliprdrBackend {
         // `SendInitiateFileCopy` path) — it answers the FormatData
         // request from its stored `local_file_list` without ever reaching
         // us. So we only deal with CF_UNICODETEXT and CF_DIB here.
-        if pb::is_remote_clipboard() {
-            // Reading the data would make macOS fetch it from the other
-            // Apple device over Bluetooth/AWDL (with the "Pasting from …"
-            // progress dialog on the Mac's screen) just to relay it to the
-            // RDP client. See the Universal Clipboard quirk note.
-            info!(
-                format = ?request.format,
-                "refusing format data request: the Mac pasteboard holds a Universal \
-                 Clipboard promise from another Apple device, not local data"
-            );
-            self.push(ClipboardMessage::SendFormatData(
-                OwnedFormatDataResponse::new_error(),
-            ));
-            return;
-        }
-        let response = match request.format {
-            ClipboardFormatId::CF_UNICODETEXT => match pb::read_string() {
-                Some(s) => {
-                    let mut units: Vec<u16> = s.encode_utf16().collect();
-                    units.push(0);
-                    let mut bytes = Vec::with_capacity(units.len() * 2);
-                    for u in units {
-                        bytes.extend_from_slice(&u.to_le_bytes());
-                    }
-                    OwnedFormatDataResponse::new_data(bytes)
+        let sender = self.sender.clone();
+        let alive = self.session_alive.clone();
+        crate::clipboard_io::schedule(
+            sender,
+            alive,
+            ClipboardMessage::SendFormatData(OwnedFormatDataResponse::new_error()),
+            move || {
+                if pb::is_remote_clipboard() {
+                    // Reading the data would make macOS fetch it from the other
+                    // Apple device over Bluetooth/AWDL (with the "Pasting from …"
+                    // progress dialog on the Mac's screen) just to relay it to the
+                    // RDP client. See the Universal Clipboard quirk note.
+                    info!(
+                        format = ?request.format,
+                        "refusing format data request: the Mac pasteboard holds a Universal \
+                         Clipboard promise from another Apple device, not local data"
+                    );
+                    return ClipboardMessage::SendFormatData(OwnedFormatDataResponse::new_error());
                 }
-                None => OwnedFormatDataResponse::new_error(),
-            },
-            ClipboardFormatId::CF_DIB => match pb::read_image_bytes() {
-                Some((_enc, bytes)) => match png_or_tiff_to_dib(&bytes) {
-                    Ok(dib) => OwnedFormatDataResponse::new_data(dib),
-                    Err(e) => {
-                        warn!("DIB encode failed: {e}");
+                let response = match request.format {
+                    ClipboardFormatId::CF_UNICODETEXT => match pb::read_string() {
+                        Some(s) => {
+                            let mut units: Vec<u16> = s.encode_utf16().collect();
+                            units.push(0);
+                            let mut bytes = Vec::with_capacity(units.len() * 2);
+                            for u in units {
+                                bytes.extend_from_slice(&u.to_le_bytes());
+                            }
+                            OwnedFormatDataResponse::new_data(bytes)
+                        }
+                        None => OwnedFormatDataResponse::new_error(),
+                    },
+                    ClipboardFormatId::CF_DIB => match pb::read_image_bytes() {
+                        Some((_enc, bytes)) => match png_or_tiff_to_dib(&bytes) {
+                            Ok(dib) => OwnedFormatDataResponse::new_data(dib),
+                            Err(e) => {
+                                warn!("DIB encode failed: {e}");
+                                OwnedFormatDataResponse::new_error()
+                            }
+                        },
+                        None => OwnedFormatDataResponse::new_error(),
+                    },
+                    f if f.value() == HTML_FORMAT_ID => match pb::read_html() {
+                        Some(html) => OwnedFormatDataResponse::new_data(
+                            crate::clipboard_rich::encode_cf_html(&html),
+                        ),
+                        None => OwnedFormatDataResponse::new_error(),
+                    },
+                    f if f.value() == RTF_FORMAT_ID => match pb::read_rtf() {
+                        Some(rtf) => OwnedFormatDataResponse::new_data(
+                            crate::clipboard_rich::encode_rtf(&rtf),
+                        ),
+                        None => OwnedFormatDataResponse::new_error(),
+                    },
+                    other => {
+                        debug!(?other, "unsupported format requested by remote");
                         OwnedFormatDataResponse::new_error()
                     }
-                },
-                None => OwnedFormatDataResponse::new_error(),
+                };
+                ClipboardMessage::SendFormatData(response)
             },
-            f if f.value() == HTML_FORMAT_ID => match pb::read_html() {
-                Some(html) => {
-                    OwnedFormatDataResponse::new_data(crate::clipboard_rich::encode_cf_html(&html))
-                }
-                None => OwnedFormatDataResponse::new_error(),
-            },
-            f if f.value() == RTF_FORMAT_ID => match pb::read_rtf() {
-                Some(rtf) => {
-                    OwnedFormatDataResponse::new_data(crate::clipboard_rich::encode_rtf(&rtf))
-                }
-                None => OwnedFormatDataResponse::new_error(),
-            },
-            other => {
-                debug!(?other, "unsupported format requested by remote");
-                OwnedFormatDataResponse::new_error()
-            }
-        };
-        self.push(ClipboardMessage::SendFormatData(response));
+        );
     }
 
     fn on_format_data_response(&mut self, response: FormatDataResponse<'_>) {
@@ -1527,6 +1607,10 @@ impl CliprdrBackend for MacCliprdrBackend {
             return;
         }
         let want = self.fetch.current.take();
+        if want.is_none() {
+            debug!("ignoring unsolicited clipboard response");
+            return;
+        }
         if let Some(Want::Other(id)) = want {
             warn!(format_id = ?id, "unexpected format in data response");
             return;
@@ -1557,9 +1641,8 @@ impl CliprdrBackend for MacCliprdrBackend {
             return;
         }
         match want {
-            // Default to text if we don't know what we asked for — matches
-            // the original text-only behaviour.
-            Some(Want::Text(_)) | None => {
+            // Only a correlated text reply may be decoded as UTF-16.
+            Some(Want::Text(_)) => {
                 if data.len() % 2 != 0 {
                     warn!(len = data.len(), "odd-length UTF-16 payload");
                 } else {
@@ -1605,17 +1688,38 @@ impl CliprdrBackend for MacCliprdrBackend {
                 ),
             },
             Some(Want::Other(_)) => unreachable!("handled above"),
+            None => {}
         }
         self.request_next();
     }
 
     fn on_file_contents_request(&mut self, request: FileContentsRequest) {
-        let stream_id = request.stream_id;
-        let response = self
-            .serve_file_contents(request)
-            .unwrap_or_else(|| FileContentsResponse::new_error(stream_id));
-        self.push(ClipboardMessage::SendFileContentsResponse(response));
+        let stream = request.stream_id;
+        let path = usize::try_from(request.index)
+            .ok()
+            .and_then(|index| match request.data_id {
+                Some(id) => self
+                    .local_file_locks
+                    .get(&id)
+                    .and_then(|paths| paths.get(index))
+                    .cloned(),
+                None => self.file_paths.lock().unwrap().get(index).cloned(),
+            });
+        let fallback =
+            ClipboardMessage::SendFileContentsResponse(FileContentsResponse::new_error(stream));
+        crate::clipboard_io::schedule(
+            self.sender.clone(),
+            self.session_alive.clone(),
+            fallback,
+            move || {
+                let response = path
+                    .and_then(|path| Self::serve_file_contents(path, request))
+                    .unwrap_or_else(|| FileContentsResponse::new_error(stream));
+                ClipboardMessage::SendFileContentsResponse(response)
+            },
+        );
     }
+
     fn on_file_contents_response(&mut self, response: FileContentsResponse<'_>) {
         // Owned copy so we can hand it to the awaiting task (which lives
         // past the lifetime of this borrow).
@@ -1627,8 +1731,22 @@ impl CliprdrBackend for MacCliprdrBackend {
         #[cfg(not(target_os = "macos"))]
         let _ = response;
     }
-    fn on_lock(&mut self, _data_id: LockDataId) {}
-    fn on_unlock(&mut self, _data_id: LockDataId) {}
+    fn on_lock(&mut self, data_id: LockDataId) {
+        if self.local_file_locks.contains_key(&data_id.0) {
+            return;
+        }
+        let paths = self.file_paths.lock().unwrap();
+        let retained = self.local_file_locks.values().map(Vec::len).sum::<usize>();
+        if self.local_file_locks.len() < 128 && retained.saturating_add(paths.len()) <= 20_000 {
+            self.local_file_locks.insert(data_id.0, paths.clone());
+        } else {
+            warn!("outgoing file lock snapshot limit reached");
+        }
+    }
+
+    fn on_unlock(&mut self, data_id: LockDataId) {
+        self.local_file_locks.remove(&data_id.0);
+    }
 
     /// Fires once per Windows clipboard transition, with the lock IDs
     /// that just expired. This is our "Windows clipboard changed"
@@ -1698,6 +1816,32 @@ pub(crate) fn pasteboard() -> objc2::rc::Retained<objc2_app_kit::NSPasteboard> {
     unsafe { objc2_app_kit::NSPasteboard::generalPasteboard() }
 }
 
+#[cfg(all(target_os = "macos", test))]
+thread_local! { static TEST_BOARD_OVERRIDE: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) }; }
+
+/// Blocking readers inherit the caller's private test board, never generalPasteboard.
+#[cfg(all(target_os = "macos", test))]
+pub(crate) fn inherit_test_pasteboard<F, R>(operation: F) -> impl FnOnce() -> R + Send
+where
+    F: FnOnce() -> R + Send,
+    R: Send,
+{
+    let name = {
+        let _guard = pasteboard_guard();
+        unsafe { pasteboard().name().to_string() }
+    };
+    move || {
+        struct Reset(Option<String>);
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                TEST_BOARD_OVERRIDE.with(|cell| *cell.borrow_mut() = self.0.take());
+            }
+        }
+        let _reset = Reset(TEST_BOARD_OVERRIDE.with(|cell| cell.borrow_mut().replace(name)));
+        operation()
+    }
+}
+
 /// Under test, each test thread gets its own uniquely named pasteboard instead.
 /// The general one is shared by every process on the Mac, so tests that wrote
 /// it and then asserted on it failed whenever anything else copied at the same
@@ -1708,6 +1852,13 @@ pub(crate) fn pasteboard() -> objc2::rc::Retained<objc2_app_kit::NSPasteboard> {
 /// released when the thread exits so runs don't leave named pasteboards behind.
 #[cfg(all(target_os = "macos", test))]
 pub(crate) fn pasteboard() -> objc2::rc::Retained<objc2_app_kit::NSPasteboard> {
+    if let Some(name) = TEST_BOARD_OVERRIDE.with(|cell| cell.borrow().clone()) {
+        return unsafe {
+            objc2_app_kit::NSPasteboard::pasteboardWithName(&objc2_foundation::NSString::from_str(
+                &name,
+            ))
+        };
+    }
     struct Private(objc2::rc::Retained<objc2_app_kit::NSPasteboard>);
     impl Drop for Private {
         fn drop(&mut self) {
@@ -1861,62 +2012,62 @@ mod pb {
     /// to prevent cycles. Unreadable paths or directories we can't open are
     /// logged but don't abort the rest of the walk.
     pub fn read_files() -> Vec<FileEntry> {
-        let _pb_guard = super::pasteboard_guard();
-        autoreleasepool(|_| unsafe {
-            let pb = super::pasteboard();
-            let Some(items) = pb.pasteboardItems() else {
-                return Vec::new();
+        // AppKit objects stay under PB_LOCK, but filesystem work must not:
+        // a File Provider or network directory may call back into the server.
+        let roots = {
+            let _pb_guard = super::pasteboard_guard();
+            autoreleasepool(|_| unsafe {
+                let pb = super::pasteboard();
+                let Some(items) = pb.pasteboardItems() else {
+                    return Vec::new();
+                };
+                (0..items.count())
+                    .filter_map(|index| {
+                        let item = items.objectAtIndex(index);
+                        let value = item.stringForType(NSPasteboardTypeFileURL)?;
+                        resolve_file_url(&value)
+                    })
+                    .collect::<Vec<_>>()
+            })
+        };
+        let mut out = Vec::new();
+        for path in roots {
+            let Some(name) = path.file_name().and_then(|n| n.to_str()).map(str::to_owned) else {
+                continue;
             };
-            let mut out: Vec<FileEntry> = Vec::new();
-            'items: for i in 0..items.count() {
-                let item = items.objectAtIndex(i);
-                let Some(url_str) = item.stringForType(NSPasteboardTypeFileURL) else {
-                    continue;
-                };
-                let Some(path) = resolve_file_url(&url_str) else {
-                    continue;
-                };
-                let Some(name) = path.file_name().and_then(|n| n.to_str()).map(str::to_owned)
-                else {
-                    continue;
-                };
-                // symlink_metadata so we don't transparently follow a
-                // top-level symlink into someone else's filesystem subtree.
-                let meta = match std::fs::symlink_metadata(&path) {
-                    Ok(m) => m,
-                    Err(e) => {
-                        tracing::warn!(?path, "metadata failed for pasteboard item: {e}");
-                        continue;
-                    }
-                };
-                if meta.file_type().is_symlink() {
-                    tracing::debug!(?path, "skipping symlink on pasteboard");
+            // symlink_metadata so we don't transparently follow a
+            // top-level symlink into someone else's filesystem subtree.
+            let meta = match std::fs::symlink_metadata(&path) {
+                Ok(m) => m,
+                Err(e) => {
+                    tracing::warn!(?path, "metadata failed for pasteboard item: {e}");
                     continue;
                 }
-                let is_dir = meta.is_dir();
-                let size = if is_dir { None } else { Some(meta.len()) };
-                out.push(FileEntry {
-                    name: name.clone(),
-                    size,
-                    is_dir,
-                    path: path.clone(),
-                    relative_path: None,
-                });
-                if out.len() >= MAX_FILES_PER_COPY {
-                    break 'items;
-                }
-                if is_dir && !walk_inner(&mut out, &path, name) {
-                    break 'items;
-                }
+            };
+            if meta.file_type().is_symlink() {
+                tracing::debug!(?path, "skipping symlink on pasteboard");
+                continue;
             }
+            let is_dir = meta.is_dir();
+            let size = if is_dir { None } else { Some(meta.len()) };
+            out.push(FileEntry {
+                name: name.clone(),
+                size,
+                is_dir,
+                path: path.clone(),
+                relative_path: None,
+            });
             if out.len() >= MAX_FILES_PER_COPY {
-                tracing::warn!(
-                    cap = MAX_FILES_PER_COPY,
-                    "file list truncated at cap; deeper entries omitted from this paste"
-                );
+                break;
             }
-            out
-        })
+            if is_dir && !walk_inner(&mut out, &path, name) {
+                break;
+            }
+        }
+        if out.len() >= MAX_FILES_PER_COPY {
+            tracing::warn!(cap = MAX_FILES_PER_COPY, "file list truncated at cap");
+        }
+        out
     }
 
     /// Recursively append entries under `dir` to `out`. `relative_prefix`
@@ -2088,10 +2239,14 @@ mod pb {
         rtf: Option<&[u8]>,
         png: Option<&[u8]>,
         mark: &std::sync::atomic::AtomicI64,
+        ticket: Option<&crate::clipboard_image::CopyTicket>,
     ) {
         let _pb_guard = super::pasteboard_guard();
         unsafe {
             let pb = super::pasteboard();
+            if ticket.is_some_and(|ticket| !ticket.may_publish(pb.changeCount() as i64)) {
+                return;
+            }
             super::begin_local_write(&pb);
             // Richest first: the order is the owner's stated preference.
             if let Some(rtf) = rtf {
@@ -2184,6 +2339,7 @@ mod pb {
         _: Option<&[u8]>,
         _: Option<&[u8]>,
         _: &std::sync::atomic::AtomicI64,
+        _: Option<&crate::clipboard_image::CopyTicket>,
     ) {
     }
     pub fn read_files() -> Vec<FileEntry> {
@@ -2337,8 +2493,8 @@ mod tests {
             image_ticket: None,
             #[cfg(target_os = "macos")]
             file_session: crate::file_provider::random_id(),
-            #[cfg(target_os = "macos")]
             session_alive: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            local_file_locks: Default::default(),
             current_remote_lock: None,
             advertise_state: Arc::new(AdvertiseState::default()),
             lazy_paste: true,
@@ -2522,8 +2678,8 @@ mod tests {
     }
 
     #[cfg(target_os = "macos")]
-    #[test]
-    fn a_data_request_for_a_universal_clipboard_promise_is_refused() {
+    #[tokio::test]
+    async fn a_data_request_for_a_universal_clipboard_promise_is_refused() {
         let (mut backend, mut rx) = test_backend();
         pb::write_remote_promise("copied on another Apple device");
 
@@ -2531,8 +2687,11 @@ mod tests {
             format: ClipboardFormatId::CF_UNICODETEXT,
         });
 
-        match rx.try_recv().expect("the request must still be answered") {
-            ServerEvent::Clipboard(ClipboardMessage::SendFormatData(response)) => {
+        match rx.recv().await.expect("the request must still be answered") {
+            ServerEvent::SessionClipboard {
+                message: ClipboardMessage::SendFormatData(response),
+                ..
+            } => {
                 assert!(response.is_error(), "a promise must not be resolved");
             }
             other => panic!("unexpected event: {other:?}"),
@@ -3256,5 +3415,159 @@ mod tests {
                 .load(std::sync::atomic::Ordering::Acquire),
             before + 1
         );
+    }
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn pending_remote_files_remove_old_text_but_preserve_new_local_copies() {
+        let (mut backend, mut rx) = test_backend();
+        pb::write_string("old text must never be pasted as the incoming file");
+        backend.on_remote_copy(&[named(0xc111, "FileGroupDescriptorW")]);
+        assert!(
+            matches!(rx.try_recv(), Ok(ServerEvent::Clipboard(ClipboardMessage::SendInitiatePaste(id))) if id == ClipboardFormatId::new(0xc111))
+        );
+        assert!(pb::read_string().is_none());
+        assert!(backend
+            .image_ticket
+            .as_ref()
+            .unwrap()
+            .may_publish(pb::change_count()));
+        pb::write_string("new local copy wins");
+        assert!(!crate::file_promise::publish_file_urls(
+            &[std::path::PathBuf::from("/tmp/synthetic-file")],
+            &backend.self_change_count,
+            backend.image_ticket.as_ref().unwrap()
+        ));
+        assert_eq!(pb::read_string().as_deref(), Some("new local copy wins"));
+    }
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn unsolicited_reply_is_not_reinterpreted_as_text() {
+        let (mut backend, _rx) = test_backend();
+        pb::write_string("keep local text");
+        let data = "unsolicited"
+            .encode_utf16()
+            .flat_map(u16::to_le_bytes)
+            .collect::<Vec<_>>();
+        backend.on_format_data_response(OwnedFormatDataResponse::new_data(data));
+        assert_eq!(pb::read_string().as_deref(), Some("keep local text"));
+    }
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn outgoing_file_lock_keeps_original_path_after_another_local_copy() {
+        let (mut backend, mut rx) = test_backend();
+        let directory = std::env::temp_dir().join(format!(
+            "macrdp-outgoing-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&directory).unwrap();
+        let first = directory.join("first");
+        let second = directory.join("second");
+        std::fs::write(&first, b"first").unwrap();
+        std::fs::write(&second, b"other").unwrap();
+        *backend.file_paths.lock().unwrap() = vec![first];
+        backend.on_lock(LockDataId(7));
+        *backend.file_paths.lock().unwrap() = vec![second];
+        for (id, expected) in [
+            (Some(7), Some(b"first".as_slice())),
+            (None, Some(b"other".as_slice())),
+            (Some(99), None),
+        ] {
+            backend.on_file_contents_request(FileContentsRequest {
+                stream_id: 42,
+                index: 0,
+                flags: FileContentsFlags::RANGE,
+                position: 0,
+                requested_size: 5,
+                data_id: id,
+            });
+            let event = rx.recv().await.unwrap();
+            let ServerEvent::SessionClipboard {
+                message: ClipboardMessage::SendFileContentsResponse(response),
+                ..
+            } = event
+            else {
+                panic!("wrong event")
+            };
+            if let Some(expected) = expected {
+                assert_eq!(response.data(), expected);
+            } else {
+                assert!(response.is_error());
+            }
+        }
+        backend.on_unlock(LockDataId(7));
+        assert!(!backend.local_file_locks.contains_key(&7));
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+    #[test]
+    fn windows_file_handles_without_streams_are_never_plain_text() {
+        let formats = vec![
+            ClipboardFormat::new(ClipboardFormatId::new(15)),
+            ClipboardFormat::new(ClipboardFormatId::CF_UNICODETEXT),
+        ];
+        assert_eq!(
+            plan_remote_fetch(&formats, true),
+            RemotePlan::UnavailableFiles
+        );
+        let named_file = vec![
+            named(0xc222, "FileNameW"),
+            ClipboardFormat::new(ClipboardFormatId::CF_UNICODETEXT),
+        ];
+        assert_eq!(
+            plan_remote_fetch(&named_file, true),
+            RemotePlan::UnavailableFiles
+        );
+        let mut screenshot = formats;
+        screenshot.push(named(0xc223, "PNG"));
+        assert!(matches!(
+            plan_remote_fetch(&screenshot, true),
+            RemotePlan::Fetch(_)
+        ));
+    }
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn delayed_remote_text_never_overwrites_a_new_local_copy() {
+        let (mut backend, _rx) = test_backend();
+        pb::write_string("original");
+        backend.on_remote_copy(&[ClipboardFormat::new(ClipboardFormatId::CF_UNICODETEXT)]);
+        pb::write_string("new local copy");
+        backend.on_format_data_response(OwnedFormatDataResponse::new_data(
+            "old remote text"
+                .encode_utf16()
+                .flat_map(u16::to_le_bytes)
+                .collect::<Vec<_>>(),
+        ));
+        assert_eq!(pb::read_string().as_deref(), Some("new local copy"));
+    }
+    #[test]
+    fn explorer_files_win_over_thumbnail_images() {
+        let formats = vec![
+            ClipboardFormat::new(ClipboardFormatId::new(15)),
+            named(0xc222, "FileGroupDescriptorW"),
+            named(0xc223, "PNG"),
+            ClipboardFormat::new(ClipboardFormatId::CF_UNICODETEXT),
+        ];
+        assert_eq!(
+            plan_remote_fetch(&formats, true),
+            RemotePlan::Files(ClipboardFormatId::new(0xc222))
+        );
+    }
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn failed_file_preview_never_publishes_filename_as_text() {
+        let (mut backend, _rx) = test_backend();
+        pb::write_string("old clipboard");
+        backend.on_remote_copy(&[
+            named(0xc222, "FileGroupDescriptorW"),
+            named(0xc223, "PNG"),
+            ClipboardFormat::new(ClipboardFormatId::CF_UNICODETEXT),
+        ]);
+        backend.fetch.got.text = Some("screenshot.png".into());
+        backend.fetch.got.html = Some("<p>screenshot.png</p>".into());
+        backend.publish_fetched();
+        assert!(pb::read_string().is_none());
     }
 }

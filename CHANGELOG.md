@@ -7,10 +7,15 @@ Only implemented behavior and completed checks are recorded here. Client-side ma
 
 ### English
 
+- Keep Windows file-copy intent through preparation: clear stale text, prioritize Explorer file streams over previews, refuse filename-as-text fallback and stale replies, and remove automatic Cmd+V after downloads. Preserve screenshot PNG/DIB and system dataless paths.
+- Move Mac→Windows clipboard I/O off the RDP loop with bounded workers/queues and a 30s deadline. Serialize format replies (including inline file/drop-effect replies), snapshot original locked paths, and discard retired-session completions. OS reads may outlive timeout but cannot create unbounded workers.
+- Create virtual displays only for authenticated capture; release after a 2.5s reactivation grace and physical restoration. Protect reconnects by generation and refresh input/audio/HUD IDs. Keep the only active display if physical restoration fails; fixed 4K/200% and keyboard configuration remain unchanged.
+- Repair draft uploads through stable Release/asset IDs, verify exact ownership/source, and restore the real tag on publication. Make build-only packaging manual to avoid duplicate release packaging; no Actions artifacts. This same-version rebuild is published for later manual testing, without installing locally.
+
 - Merge upstream cef6073 (#204), retaining opt-in NV12 capture, bitmap fallback, immutable capture-buffer retention and the fork lock/clipboard/display policies. Add strict CAPTURE_NV12 validation and requested/effective inspection; keep the feature off in existing configs. Upstream performance reports are not local results; merged Windows rendering is not yet manually tested.
 - Run opt-in auto-unlock after credential/ARC validation, before display synchronization and capture; wait at most 8s for the requested SCK display after confirmed unlock. Preserve skip-auth gating, serialized real submissions and the shared two-submission budget; report unsafe/budget failures explicitly.
 - Request a true immediate lock via runtime-resolved login.framework and independently confirm the lock flag within 2s. No screen-saver fallback or password-delay policy changes. Preserve display restoration, disconnect grace, safety delay and bounded reconnect hold.
-- Add regression coverage and a build-only Actions workflow that verifies packaged apps without publishing releases or uploading artifacts. Live Windows lock/reconnect validation of this rebuild is pending.
+- Add regression coverage and a manual build-only Actions workflow that verifies packaged apps without publishing releases or uploading artifacts. Live Windows lock/reconnect validation of this rebuild is pending.
 - Rebuild this development release at the user's request without changing version `0.10.6`. Include upstream [#228](https://github.com/clintcan/macrdp/pull/228): Windows 10 mstsc black-screen compatibility for RemoteFX surface commands and H.264 SPS bitstream restrictions, its vendored encoder tests and CI step. Preserve the fork's clipboard maintenance/leases and use the local CLIPRDR patch in standalone server checks. Win10 client rendering still requires a post-update manual check; upstream's separate frozen-start issue #230 is not included.
 - Add a bundled sandboxed File Provider host/extension for macOS 15+, using system dataless file URLs for flat file copies of any type. Preserve screenshot PNG/DIB handling. Unavailable providers, folders and eager mode download complete files before publication; remove the sparse NSFilePresenter path.
 - Stream file contents to private staging, persist immutable metadata and incremental enumeration anchors, pin every SIZE/RANGE to its original clipboard lock, retain concurrent readers across local copies, and isolate cleanup by connection. Reject unknown locks instead of falling back to current clipboard data; drive timeout maintenance in the serving connection.
@@ -19,6 +24,11 @@ Only implemented behavior and completed checks are recorded here. Client-side ma
 - Verify the Rust regression suite, nine production adapter checks, and six real system checks with synthetic sources, including same-domain/same-name reconnect. The user reported successful testing of the previously installed `92f4c8c` build before this Win10 merge; this is not a manual check of the rebuilt binary. Release verification requires both embedded File Provider executables. Notes use a short bilingual template linking to this changelog; old owned releases and their tags are pruned only after retained-release verification.
 
 ### 简体中文
+
+- 保留 Windows 文件复制意图：准备期间清除旧文本，Explorer 文件流优先于预览，拒绝文件名降级成文本及过期回复，取消下载后的自动 Cmd+V；保留截图 PNG／DIB 和系统 dataless 路径。
+- Mac→Windows 剪贴板读取移出 RDP 循环，限制后台线程／队列，30 秒请求超时；格式回复（含内联文件列表／drop effect）保持顺序，绑定原锁路径，丢弃旧会话迟到完成。系统阻塞读取可能晚于超时结束，但不会无限增加线程。
+- 虚拟屏仅在认证后捕获时创建，2.5 秒重激活宽限及实体屏恢复后释放；按代次保护重连，刷新输入／音频／HUD 的屏幕 ID。实体屏恢复失败时保留唯一活动屏幕；固定 4K／200% 和键盘配置含义不变。
+- 修复草稿上传：使用稳定 Release／asset ID，严格核对来源和提交，发布时恢复真实 tag。仅手动运行独立打包验证，避免重复发布构建，不使用 Actions 归档。本次同版本发布供后续手动回归，不在本机安装。
 
 - 合入上游 cef6073（#204），保留主动开启的 NV12 捕获、位图回退和捕获缓冲区保留，同时保留本 fork 锁屏／剪贴板／显示策略。补齐 CAPTURE_NV12 严格校验和请求／有效状态检查；现有配置保持默认关闭。上游性能数据不是本机实测，合并后 Windows 显示待手动验证。
 - 主动开启的自动解锁改在凭证／ARC 校验后、显示调整与捕获前执行；确认解锁后最多等待 8 秒 SCK 显示器就绪。保留 skip-auth 限制、串行真实提交和共享两次密码预算，明确报告不安全／预算耗尽错误。

@@ -33,6 +33,13 @@ impl CopyTicket {
             expected_cc,
         }
     }
+    pub fn after_own_write(&self, expected_cc: i64) -> Self {
+        Self {
+            epoch: self.epoch.clone(),
+            generation: self.generation,
+            expected_cc,
+        }
+    }
     pub fn is_current(&self) -> bool {
         self.epoch.load(Ordering::Acquire) == self.generation
     }

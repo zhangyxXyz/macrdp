@@ -83,3 +83,17 @@ Mac／RDP 登录密码，不依赖 App Group、录屏或设备控制 entitlement
 
 Thanks to [macrdp](https://github.com/clintcan/macrdp) and
 [IronRDP](https://github.com/Devolutions/IronRDP) contributors.
+
+## Outgoing reads and paste safety / 回传与粘贴安全
+
+Mac→Windows reads run outside the RDP loop, so reading an unmaterialized provider
+file can request its original Windows bytes without a network-loop deadlock.
+Four workers, 32 operations and a 30s queue/read timeout bound resource use.
+Timeout does not cancel an OS read; its worker stays occupied until return.
+Late responses cannot cross connections. Incoming file preparation clears stale
+text; eager readiness only plays a sound, never sends Cmd+V.
+
+Mac 回传 Windows 的读取放到 RDP 循环之外，未物化文件可以请求原 Windows 数据，
+避免同一网络循环互等。限制 4 线程／32 操作／含排队 30 秒；系统读取不能强制取消，
+超时后名额仍保留到读取返回。迟到回复不跨会话。文件准备期间清除旧文本，
+完整下载就绪只播放提示音，不再自动发送 Cmd+V。此次修改仍待真实 mstsc 回归。

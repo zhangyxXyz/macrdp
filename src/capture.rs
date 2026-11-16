@@ -493,9 +493,9 @@ pub struct CaptureDisplay {
     /// size. See `request_initial_size`'s doc comment for why this exists.
     pub suppress_next_adopt: Arc<AtomicBool>,
     /// The `--virtual-display` this session serves, when there is one.
-    /// Shared with `main.rs`, which created it. `updates()` re-modes it to
+    /// Shared with `main.rs`; `updates()` acquires its session lease and re-modes it to
     /// match the negotiated size and independent scale policy before capture.
-    pub virtual_display: Option<Arc<std::sync::Mutex<crate::virtual_display::VirtualDisplay>>>,
+    pub virtual_display: Option<crate::display_session::SharedDisplay>,
     /// When the virtual display runs HiDPI (`--virtual-display-hidpi`). With
     /// `Auto`, decided per connection from the client's desktop scale factor
     /// in `sync_virtual_display`.
@@ -872,17 +872,38 @@ impl RdpServerDisplay for CaptureDisplay {
         // Include preparation failures in the same truthful telemetry as SCK
         // failures. No capture, input-size commit or display sync before this gate.
         let result = async {
-            if let Some(preparation) = &self.preparation {
-                let unlocked = preparation.run().await?;
-                if unlocked {
-                    crate::session_lock::wait_for_display(self.display_id).await?;
-                }
-            }
+            let unlocked = if let Some(preparation) = &self.preparation {
+                preparation.run().await?
+            } else {
+                false
+            };
+            let lease = if let Some(vd) = &self.virtual_display {
+                let lease = crate::display_session::ManagedDisplay::acquire(vd).await?;
+                let vd = vd.lock().unwrap();
+                self.display_id = vd.id_if_active();
+                self.screen_size_pts = vd.size_pts();
+                Some(lease)
+            } else {
+                None
+            };
             // The sync block keeps the display mutex out of every await point.
             let (width, height) = self.sync_virtual_display();
             self.desktop_size.commit_input_size(width, height);
             crate::input::invalidate_display_bounds();
-            self.build_updates(width, height).await
+            if unlocked || lease.is_some() {
+                crate::session_lock::wait_for_display(self.display_id).await?;
+            }
+            if lease.is_some() {
+                if let Some(id) = self.display_id {
+                    crate::display_session::mark_ready(id);
+                }
+            }
+            let inner = self.build_updates(width, height).await?;
+            Ok(match lease {
+                Some(lease) => Box::new(crate::display_session::Updates::new(inner, lease))
+                    as Box<dyn RdpServerDisplayUpdates>,
+                None => inner,
+            })
         }
         .await;
         if let Some(stats) = crate::stats::global() {
@@ -1184,7 +1205,7 @@ impl CaptureDisplay {
         &mut self,
         width: u16,
         height: u16,
-    ) -> Result<Box<dyn RdpServerDisplayUpdates>> {
+    ) -> Result<Box<dyn RdpServerDisplayUpdates + Send>> {
         #[cfg(target_os = "macos")]
         let inner: Box<dyn RdpServerDisplayUpdates + Send> = Box::new(
             macos::ScreenCaptureUpdates::start(

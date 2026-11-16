@@ -23,3 +23,9 @@ lease retention, independent consumers, and hard lifetime bounds.
 中文：只改动原锁归属、显式租约、未知锁拒绝及超时边界；不自建 RDP 协议解析器。
 回归在根项目运行，正常构建不启用 `__test` 可见性接口。升级 IronRDP pin 时需重新核对
 这些差异及服务端的 `ClipboardLease` 事件与维护 timer。
+
+- Serialize incoming FormatDataRequest callbacks and inline file/drop-effect
+  responses until the asynchronous backend completes. Responses carry no ID;
+  queue up to MAX_PENDING_FORMAT_DATA_REQUESTS and reject overflow. RANGE/SIZE
+  remain concurrent because those responses carry stream IDs.
+  中文：异步读取期间按请求顺序发送无 ID 的格式回复，文件分块仍可并发。

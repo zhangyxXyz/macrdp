@@ -243,6 +243,8 @@ impl RdpsndServerHandler for MacRdpsndBackend {
         let display_suppressed = self.display_suppressed.clone();
         let mute_on_minimize = self.mute_on_minimize;
         let aac_bitrate = self.aac_bitrate;
+        // A virtual display may exist before SCK can enumerate it. Resolve
+        // READY in capture_loop instead of capturing its provisional ID here.
         let target_display_id = self.target_display_id;
         // Dedicated OS thread at USER_INTERACTIVE QoS for the entire
         // capture / resample / channel-send pipeline. Tokio workers ride
@@ -337,6 +339,13 @@ async fn capture_loop(
     use screencapturekit::async_api::{AsyncSCShareableContent, AsyncSCStream};
     use screencapturekit::prelude::{SCContentFilter, SCStreamConfiguration, SCStreamOutputType};
 
+    let target_display_id = crate::display_session::audio_display(target_display_id, || {
+        generation.load(Ordering::Acquire) == my_gen
+    })
+    .await?;
+    if generation.load(Ordering::Acquire) != my_gen {
+        return Ok(());
+    }
     let content = AsyncSCShareableContent::get()
         .await
         .map_err(|e| anyhow!("SCShareableContent for audio: {e:?}"))?;

@@ -1,9 +1,8 @@
 name: build-check
 
-# Build-only validation. Releases remain v-tag-only; no artifacts or drafts.
+# Optional manual package check. dev pushes run CI; a version tag builds
+# the distributable exactly once in release.yml. No artifact/draft uploads here.
 on:
-  push:
-    branches: [dev]
   workflow_dispatch:
 
 permissions:

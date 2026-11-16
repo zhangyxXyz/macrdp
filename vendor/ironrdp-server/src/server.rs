@@ -1039,6 +1039,18 @@ impl AutoReconnectCookieHandle {
     }
 }
 
+// A completion from a retired backend must not reach its replacement even
+// when it arrived after the old global queue was drained.
+fn live_clipboard_event(event: ServerEvent) -> Option<ServerEvent> {
+    match event {
+        ServerEvent::SessionClipboard { active, message, .. } if active.load(std::sync::atomic::Ordering::Acquire) => {
+            Some(ServerEvent::Clipboard(message))
+        }
+        ServerEvent::SessionClipboard { .. } => None,
+        event => Some(event),
+    }
+}
+
 /// Cloneable handle for gracefully disconnecting the active client with a
 /// `ServerSetErrorInfo` PDU (MS-RDPBCGR 2.2.5.1) while [`RdpServer::run`]
 /// owns the server.
@@ -1089,7 +1101,17 @@ pub enum ServerEvent {
     /// the given reason. See [`ErrorInfoDisconnectHandle::disconnect`].
     Disconnect(ErrorInfo),
     Clipboard(ClipboardMessage),
-    ClipboardLease { id: u32, retain: bool },
+    /// (macrdp) Async clipboard I/O completion, scoped to its serving backend.
+    SessionClipboard {
+        active: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        message: ClipboardMessage,
+        /// Keep the producer budget until the event is dispatched or dropped.
+        permit: Option<tokio::sync::OwnedSemaphorePermit>,
+    },
+    ClipboardLease {
+        id: u32,
+        retain: bool,
+    },
     Rdpsnd(RdpsndServerMessage),
     Rdpdr(RdpdrServerMessage),
     Rdpeai(RdpeaiServerMessage),
@@ -1128,6 +1150,7 @@ impl fmt::Debug for ServerEvent {
             Self::EvictedByOtherConnection => f.write_str("EvictedByOtherConnection"),
             Self::Disconnect(error) => f.debug_tuple("Disconnect").field(error).finish(),
             Self::ClipboardLease { .. } => f.write_str("ClipboardLease(..)"),
+            Self::SessionClipboard { .. } => f.write_str("SessionClipboard(..)"),
             Self::Clipboard(..) => f.write_str("Clipboard(..)"),
             Self::Rdpsnd(..) => f.write_str("Rdpsnd(..)"),
             Self::Rdpdr(..) => f.write_str("Rdpdr(..)"),
@@ -3278,6 +3301,9 @@ impl RdpServer {
         #[cfg(feature = "egfx")]
         prioritize_batch(events);
         for event in events.drain(..) {
+            let Some(event) = live_clipboard_event(event) else {
+                continue;
+            };
             trace!(?event, "Dispatching");
             match event {
                 ServerEvent::Quit(reason) => {
@@ -3553,9 +3579,14 @@ impl RdpServer {
                 }
                 ServerEvent::ClipboardLease { id, retain } => {
                     if let Some(clipboard) = self.get_svc_processor::<CliprdrServer>() {
-                        if retain { clipboard.retain_remote_lock(id); } else { clipboard.release_remote_lock(id); }
+                        if retain {
+                            clipboard.retain_remote_lock(id);
+                        } else {
+                            clipboard.release_remote_lock(id);
+                        }
                     }
                 }
+                ServerEvent::SessionClipboard { .. } => continue, // normalized above
                 ServerEvent::Clipboard(c) => {
                     let Some(cliprdr) = self.get_svc_processor::<CliprdrServer>() else {
                         warn!("No clipboard channel, dropping event");
@@ -4446,22 +4477,36 @@ impl RdpServer {
             loop {
                 timer.tick().await;
                 let mut server = clipboard_state.lock().await;
-                let Some(channel) = server.get_channel_id_by_type::<CliprdrServer>() else { continue; };
-                let Some(clipboard) = server.get_svc_processor::<CliprdrServer>() else { continue; };
+                let Some(channel) = server.get_channel_id_by_type::<CliprdrServer>() else {
+                    continue;
+                };
+                let Some(clipboard) = server.get_svc_processor::<CliprdrServer>() else {
+                    continue;
+                };
                 let messages = match clipboard.drive_timeouts() {
                     Ok(messages) => messages,
-                    Err(error) => { warn!(?error, "clipboard timeout sweep failed"); continue; }
+                    Err(error) => {
+                        warn!(?error, "clipboard timeout sweep failed");
+                        continue;
+                    }
                 };
                 let bytes = match server_encode_svc_messages(messages.into(), channel, user_channel_id) {
                     Ok(bytes) => bytes,
-                    Err(error) => { warn!(?error, "clipboard timeout encoding failed"); continue; }
+                    Err(error) => {
+                        warn!(?error, "clipboard timeout encoding failed");
+                        continue;
+                    }
                 };
                 drop(server);
                 if !bytes.is_empty() {
-                    clipboard_timeout_writer.write_all(&bytes).await.map_err(|e| ServerError::io("clipboard timeout write", e))?;
+                    clipboard_timeout_writer
+                        .write_all(&bytes)
+                        .await
+                        .map_err(|e| ServerError::io("clipboard timeout write", e))?;
                 }
             }
-            #[allow(unreachable_code)] Ok::<RunState, ServerError>(RunState::Continue)
+            #[allow(unreachable_code)]
+            Ok::<RunState, ServerError>(RunState::Continue)
         };
         let send_heartbeats = async move {
             let (Some(config), Some(message_channel_id)) = (heartbeat, message_channel_id) else {
@@ -6829,5 +6874,27 @@ mod remotefx_codec_choice_tests {
         assert_eq!(picked(&image_only, true, true), Some((5, RemoteFxCodec::ImageRemoteFx)));
         assert_eq!(picked(&[listed_codec(1, None)], true, true), None);
         assert_eq!(picked(&[], true, true), None);
+    }
+}
+
+#[cfg(test)]
+mod clipboard_completion_tests {
+    use super::*;
+    #[test]
+    fn completion_enqueued_before_retirement_is_dropped_at_dispatch() {
+        let active = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let event = ServerEvent::SessionClipboard {
+            active: active.clone(),
+            permit: None,
+            message: ClipboardMessage::SendInitiatePaste(ironrdp_cliprdr::pdu::ClipboardFormatId::CF_UNICODETEXT),
+        };
+        active.store(false, std::sync::atomic::Ordering::Release);
+        assert!(live_clipboard_event(event).is_none());
+        let event = ServerEvent::SessionClipboard {
+            active: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            permit: None,
+            message: ClipboardMessage::SendInitiatePaste(ironrdp_cliprdr::pdu::ClipboardFormatId::CF_UNICODETEXT),
+        };
+        assert!(matches!(live_clipboard_event(event), Some(ServerEvent::Clipboard(_))));
     }
 }

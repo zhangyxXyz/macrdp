@@ -44,7 +44,9 @@ mod tests {
         fn on_request_format_list(&mut self) {}
         fn on_process_negotiated_capabilities(&mut self, _: ClipboardGeneralCapabilityFlags) {}
         fn on_remote_copy(&mut self, _: &[ClipboardFormat]) {}
-        fn on_format_data_request(&mut self, _: FormatDataRequest) {}
+        fn on_format_data_request(&mut self, _: FormatDataRequest) {
+            self.requests.fetch_add(1, Ordering::Relaxed);
+        }
         fn on_format_data_response(&mut self, _: FormatDataResponse<'_>) {}
         fn on_file_contents_request(&mut self, _: FileContentsRequest) {
             self.requests.fetch_add(1, Ordering::Relaxed);
@@ -327,5 +329,43 @@ mod tests {
         client.release_remote_lock(lock);
         client.drive_timeouts().unwrap();
         assert!(!client.__test_outgoing_locks().contains_key(&lock));
+    }
+    #[test]
+    fn asynchronous_format_reads_and_inline_drop_effect_keep_wire_order() {
+        let backend = Backend::default();
+        let requests = backend.requests.clone();
+        let mut client = CliprdrClient::new(Box::new(backend));
+        *client.__test_state_mut() = CliprdrState::Ready;
+        *client.__test_capabilities_mut() =
+            Capabilities::new(ClipboardProtocolVersion::V2, flags());
+        client
+            .initiate_file_copy(vec![FileDescriptor::new("test")])
+            .unwrap();
+        let request = |id| {
+            encoded(ClipboardPdu::FormatDataRequest(FormatDataRequest {
+                format: ClipboardFormatId::new(id),
+            }))
+        };
+        assert!(client.process(&request(13)).unwrap().is_empty());
+        assert!(client.process(&request(0xc0fd)).unwrap().is_empty());
+        assert!(client.process(&request(8)).unwrap().is_empty());
+        assert_eq!(requests.load(Ordering::Relaxed), 1);
+        let replies: Vec<SvcMessage> = client
+            .submit_format_data(OwnedFormatDataResponse::new_error())
+            .unwrap()
+            .into();
+        assert_eq!(replies.len(), 2);
+        let first = replies[0].encode_unframed_pdu().unwrap();
+        let second = replies[1].encode_unframed_pdu().unwrap();
+        assert!(
+            matches!(ironrdp_core::decode::<ClipboardPdu<'_>>(&first).unwrap(), ClipboardPdu::FormatDataResponse(r) if r.is_error())
+        );
+        assert!(
+            matches!(ironrdp_core::decode::<ClipboardPdu<'_>>(&second).unwrap(), ClipboardPdu::FormatDataResponse(r) if r.data() == 1u32.to_le_bytes())
+        );
+        assert_eq!(requests.load(Ordering::Relaxed), 2);
+        client
+            .submit_format_data(OwnedFormatDataResponse::new_error())
+            .unwrap();
     }
 }
