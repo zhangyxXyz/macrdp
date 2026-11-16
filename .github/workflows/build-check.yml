@@ -16,6 +16,7 @@ env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: '0'
   CARGO_NET_RETRY: '10'
+  RUST_BACKTRACE: '1'
 
 jobs:
   checks:
@@ -30,8 +31,6 @@ jobs:
     runs-on: ${{ vars.MACOS_RUNNER || 'macos-26' }}
     timeout-minutes: 60
     steps:
-      - name: Require Apple Silicon runner
-        run: test "$(uname -m)" = arm64
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
         with:
           ref: ${{ github.sha }}
@@ -39,22 +38,19 @@ jobs:
       - uses: actions-rust-lang/setup-rust-toolchain@46268bd060767258de96ed93c1251119784f2ab6
         with:
           toolchain: '1.95.0'
+          target: aarch64-apple-darwin
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4
         with:
-          key: fork-packaging-check
-      - name: Build release binary
-        run: cargo build --release --locked
-      - name: Package outside Applications and verify signatures
+          shared-key: packaged-apps
+          key: native-and-arm64
+      - name: Build ARM64 apps and verify components
         env:
           CODESIGN_IDENTITY: '-'
+          MACRDP_TARGET: aarch64-apple-darwin
         run: |
-          cargo build --release --locked --manifest-path ifd-handler/Cargo.toml
-          swift build --package-path gui -c release --product macrdphud
-          swift build --package-path gui -c release --product macrdpshield
-          SKIP_BUILD=1 APP_DIR="$RUNNER_TEMP/appout" packaging/make-app.sh
+          APP_DIR="$RUNNER_TEMP/appout" packaging/make-app.sh
           APP_DIR="$RUNNER_TEMP/appout" gui/make-tray-app.sh
-          codesign --verify --deep --strict target/macrdp.app
-          codesign --verify --deep --strict target/macrdpController.app
+          python3 scripts/check-app-bundles.py --app-root target --source-sha "$GITHUB_SHA"
       - name: Record verified source
         run: |
           echo "Verified build from $(git rev-parse HEAD). No release, artifact upload or local installation." >> "$GITHUB_STEP_SUMMARY"

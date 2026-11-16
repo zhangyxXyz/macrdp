@@ -271,11 +271,11 @@ BLANK_RECOVERY=0
 ## Actions 与维护
 
 - `ci.yml`：可复用回归入口，集中 Linux/macOS 测试、严格 Clippy、配置、原生适配、发布脚本和审计集成检查。macOS 检查共用一个 runner，Linux 同时运行；分支变更／PR 和手动运行也使用此入口。
-- `release.yml`：仅推送 `v*` tag 触发“检查 → 编译打包 → 草稿上传／下载校验 → 发布 → 清理”，tag 提交必须属于 `dev`。两个 app、来源信息和校验和直接进入草稿，不使用 Actions Artifacts。包含 `-` 的 tag 为预发布（例如 `v0.10.6-dev`）。
+- `release.yml`：仅推送 `v*` tag 触发“编译打包 → 草稿上传／下载校验 → 发布 → 清理”。CI 独立运行，不再阻塞发布；打 tag 前应完成必要审查和回归，tag 提交必须属于 `dev`。两个 app、来源信息和校验和直接进入草稿，不使用 Actions Artifacts。包含 `-` 的 tag 为预发布（例如 `v0.10.6-dev`）。
 - Release notes 使用 [简短双语模板](packaging/RELEASE_NOTES.md)，链接到 [CHANGELOG.md](CHANGELOG.md) 对应版本，不复制整段更新记录；打 tag 前必须先补齐该节。
 - `build-check.yml`：仅手动执行“检查 → 编译打包验证”，不发布、不上传归档；普通 dev 推送不执行打包任务。
 - 同标签重构建使用独立的 `staging-<tag>-<source>` 草稿及稳定 Release／asset ID。新包回读验证并确认归属后才替换旧自有 Release，保留该版本 tag。GitHub 不支持原子交换 Release，最终发布失败时保留已验证草稿供重试；远端 tag／源提交核对会拒绝过期运行。失败后可重跑原工作流续传自有草稿。
-- 原生任务默认使用 Apple Silicon `macos-26`；仓库变量 `MACOS_RUNNER` 可切换到其他 ARM64 runner，构建前检查架构。GitHub 的 runner 容量仍可能造成排队。工作流名称统一小写。
+- 原生任务默认使用 Apple Silicon `macos-26`；`MACOS_RUNNER` 可切换到其他 macOS runner，`macos-26-intel` 可应对 ARM 池容量不足。Intel 执行主机回归及 ARM64 Clippy／编译检查；所有打包组件明确指定 ARM64，并核对架构、源提交和嵌套签名。Intel 不能执行 ARM64 成品，`BUILD_INFO.json` 会记录主机架构，以及静态能力信息来自同源主机程序；真正 ARM64 运行单独验证。工作流名称统一小写。
 - `cleanup-releases.yml`：手动默认只预览。发布成功后也会自动清理：先验证最新自有 Release，保留它，删除更旧的流水线自有 Release，同时删除这些旧自有 Release 对应的 Git tag。未知来源的 Release 和草稿不动；校验失败或发现并发编辑即中止。编排参考 CLIProxyAPI-Plugins，原先手动 `dev-build.yml` 归档构建已移除。
 - `security.yml`：依赖检查，包含 `dev` 上的依赖变更。
 - `delete-old-workflow-runs.yml`：沿用 [CLIProxyAPI-Plugins](https://github.com/zhangyxXyz/CLIProxyAPI-Plugins) 的策略。每个 workflow 保留最新 6 次记录和最近 30 天的全部记录，只清理更旧且已结束的记录。push 只预览，手动默认预览，每周定时清理。

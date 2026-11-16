@@ -11,11 +11,28 @@
 #   APP_DIR=/Applications                 # where to install (default /Applications)
 #   CODESIGN_IDENTITY="-"                 # "-" = ad-hoc; or a Developer ID name
 #   SKIP_BUILD=1                          # reuse an existing release binary
+#   MACRDP_TARGET=aarch64-apple-darwin     # optional ARM64 cross-build (unset: native)
+#   SWIFT_SDK=/path/to/MacOSX.sdk          # optional per-build Swift SDK override
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 PKG_DIR="$REPO_ROOT/packaging"
 APP_DIR="${APP_DIR:-/Applications}"
+# Keep every packaged executable on the same explicit target. The default
+# remains native; cross-build output must never fall back to target/release.
+CARGO_ARGS=(--release --locked)
+TARGET_SUBDIR=""
+SWIFT_ARGS=(--package-path "$REPO_ROOT/gui" --scratch-path "$REPO_ROOT/gui/.build" -c release)
+case "${MACRDP_TARGET:-}" in
+    "") ;;
+    aarch64-apple-darwin)
+        CARGO_ARGS+=(--target "$MACRDP_TARGET")
+        TARGET_SUBDIR="$MACRDP_TARGET/"
+        SWIFT_ARGS+=(--triple arm64-apple-macosx)
+        ;;
+    *) echo "unsupported MACRDP_TARGET: $MACRDP_TARGET" >&2; exit 1 ;;
+esac
+if [ -n "${SWIFT_SDK:-}" ]; then SWIFT_ARGS+=(--sdk "$SWIFT_SDK"); fi
 # Signing identity. Ad-hoc ("-") keys TCC to the binary's cdhash, so the
 # Screen Recording / Accessibility grants die on EVERY rebuild — the "grants
 # survive rebuilds" promise needs a stable certificate identity. When no
@@ -41,12 +58,12 @@ VERSION="$(grep -m1 '^version' "$REPO_ROOT/Cargo.toml" | cut -d'"' -f2)"
 
 echo "==> macrdp.app v$VERSION  (id: $BUNDLE_ID, identity: $IDENTITY, install: $APP_DIR)"
 
-# 1. Build the release binary (native target).
+# 1. Build the release binary (native unless MACRDP_TARGET is set).
 if [ "${SKIP_BUILD:-0}" != "1" ]; then
-    echo "==> cargo build --release"
-    ( cd "$REPO_ROOT" && cargo build --release )
+    echo "==> cargo build ${CARGO_ARGS[*]}"
+    ( cd "$REPO_ROOT" && cargo build "${CARGO_ARGS[@]}" )
 fi
-BIN="$REPO_ROOT/target/release/macrdp"
+BIN="$REPO_ROOT/target/${TARGET_SUBDIR}release/macrdp"
 [ -x "$BIN" ] || { echo "missing release binary at $BIN (unset SKIP_BUILD?)" >&2; exit 1; }
 
 # 2. Assemble the bundle in a staging dir under target/ (already gitignored;
@@ -58,6 +75,14 @@ mkdir -p "$STAGE/Contents/MacOS" "$STAGE/Contents/Resources"
 
 sed -e "s/__VERSION__/$VERSION/g" -e "s#__BUNDLE_ID__#$BUNDLE_ID#g" \
     "$PKG_DIR/Info.plist" > "$STAGE/Contents/Info.plist"
+SOURCE_COMMIT="$(git -C "$REPO_ROOT" rev-parse HEAD)"
+python3 - "$STAGE/Contents/Info.plist" "$SOURCE_COMMIT" <<'PY'
+import pathlib, plistlib, sys
+path = pathlib.Path(sys.argv[1])
+info = plistlib.loads(path.read_bytes())
+info['MacrdpSourceCommit'] = sys.argv[2]
+path.write_bytes(plistlib.dumps(info))
+PY
 cp "$BIN" "$STAGE/Contents/MacOS/macrdp"
 chmod +x "$STAGE/Contents/MacOS/macrdp"
 # No wrapper script: the LaunchAgent runs this signed binary directly with
@@ -109,9 +134,9 @@ fi
 #     ifd-handler crate (not part of the macrdp cargo package).
 if [ "${SKIP_BUILD:-0}" != "1" ]; then
     echo "==> cargo build --release (ifd-handler cdylib)"
-    ( cd "$REPO_ROOT" && cargo build --release --manifest-path ifd-handler/Cargo.toml )
+    ( cd "$REPO_ROOT" && cargo build "${CARGO_ARGS[@]}" --manifest-path ifd-handler/Cargo.toml )
 fi
-IFD_DYLIB="$REPO_ROOT/ifd-handler/target/release/libifd_macrdp.dylib"
+IFD_DYLIB="$REPO_ROOT/ifd-handler/target/${TARGET_SUBDIR}release/libifd_macrdp.dylib"
 if [ -f "$IFD_DYLIB" ]; then
     IFD_BUNDLE="$STAGE/Contents/Resources/ifd-macrdp.bundle"
     mkdir -p "$IFD_BUNDLE/Contents/MacOS"
@@ -153,9 +178,9 @@ echo "==> embedded macrdp-mic.driver (macrdp Microphone) + installer"
 #     sealed so the deep signature stays valid + it passes notarization.
 if [ "${SKIP_BUILD:-0}" != "1" ]; then
     echo "==> swift build -c release (macrdphud)"
-    ( cd "$REPO_ROOT/gui" && swift build -c release --product macrdphud )
+    swift build "${SWIFT_ARGS[@]}" --product macrdphud
 fi
-HUD_BIN="$REPO_ROOT/gui/.build/release/macrdphud"
+HUD_BIN="$(swift build "${SWIFT_ARGS[@]}" --product macrdphud --show-bin-path)/macrdphud"
 if [ -f "$HUD_BIN" ]; then
     cp "$HUD_BIN" "$STAGE/Contents/Resources/macrdphud"
     chmod +x "$STAGE/Contents/Resources/macrdphud"
@@ -171,9 +196,9 @@ fi
 #     signed before the outer bundle seal.
 if [ "${SKIP_BUILD:-0}" != "1" ]; then
     echo "==> swift build -c release (macrdpshield)"
-    ( cd "$REPO_ROOT/gui" && swift build -c release --product macrdpshield )
+    swift build "${SWIFT_ARGS[@]}" --product macrdpshield
 fi
-SHIELD_BIN="$REPO_ROOT/gui/.build/release/macrdpshield"
+SHIELD_BIN="$(swift build "${SWIFT_ARGS[@]}" --product macrdpshield --show-bin-path)/macrdpshield"
 if [ -f "$SHIELD_BIN" ]; then
     cp "$SHIELD_BIN" "$STAGE/Contents/Resources/macrdpshield"
     chmod +x "$STAGE/Contents/Resources/macrdpshield"

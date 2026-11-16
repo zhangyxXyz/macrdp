@@ -1,13 +1,20 @@
 #!/usr/bin/env python3
 """Production adapter regression checks; no domain registration or installation."""
-import argparse,base64,hashlib,hmac,json,mmap,os,secrets,subprocess,threading,time
+import argparse,base64,hashlib,hmac,json,mmap,os,platform,secrets,subprocess,threading,time
 from http.server import BaseHTTPRequestHandler,ThreadingHTTPServer
 from pathlib import Path
 ROOT=Path(__file__).resolve().parents[1]
+def host_target():
+    # This executable is run by the checks, so match the native runner. The
+    # production host/extension remain ARM64 in packaging/make-file-provider.py.
+    architecture=platform.machine()
+    if architecture not in ('arm64','x86_64'):
+        raise ValueError(f'unsupported macOS test host architecture: {architecture}')
+    return architecture+'-apple-macos15.0'
 def main(root,sdk):
     root.mkdir(parents=True,exist_ok=True)
     probe=root/'checks'
-    subprocess.run(['swiftc','-sdk',sdk,'-target','arm64-apple-macos15.0','-swift-version','5','-parse-as-library',str(ROOT/'native/file-provider/Core.swift'),str(ROOT/'native/file-provider/LocalCopies.swift'),str(ROOT/'native/file-provider/Checks.swift'),'-o',str(probe)],check=True)
+    subprocess.run(['swiftc','-sdk',sdk,'-target',host_target(),'-swift-version','5','-parse-as-library',str(ROOT/'native/file-provider/Core.swift'),str(ROOT/'native/file-provider/LocalCopies.swift'),str(ROOT/'native/file-provider/Checks.swift'),'-o',str(probe)],check=True)
     token=secrets.token_hex(32);data=bytes(range(256))*65537+b'not-zero-tail';ranges=0;mode='normal'
     snapshot=dict(session='session-A',copy='copy-A',lock=7,index=0,name='same.bin',size=len(data))
     class Handler(BaseHTTPRequestHandler):

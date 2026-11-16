@@ -6,6 +6,7 @@
 #   APP_DIR=/Applications              # install location (default /Applications)
 #   CODESIGN_IDENTITY="-"             # "-" = ad-hoc; or a Developer ID name
 #   SWIFT_SDK=/path/to/MacOSX.sdk     # optional per-build SDK override
+#   MACRDP_TARGET=aarch64-apple-darwin # optional ARM64 cross-build (unset: native)
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -21,14 +22,20 @@ CONTROLLER_ID="$BUNDLE_PREFIX.macrdp.controller"
 
 VERSION="$(grep -m1 '^version' "$REPO_ROOT/Cargo.toml" | cut -d'"' -f2)"
 [ -n "$VERSION" ] || { echo "could not read version from Cargo.toml" >&2; exit 1; }
+SOURCE_COMMIT="$(git -C "$REPO_ROOT" rev-parse HEAD)"
 
 echo "==> macrdpController v$VERSION  (id: $CONTROLLER_ID, identity: $IDENTITY, install: $APP_DIR)"
 
 echo "==> swift build -c release"
 SWIFT_ARGS=(--package-path "$GUI_DIR" --scratch-path "$GUI_DIR/.build" -c release --product macrdptray)
+case "${MACRDP_TARGET:-}" in
+    "") ;;
+    aarch64-apple-darwin) SWIFT_ARGS+=(--triple arm64-apple-macosx) ;;
+    *) echo "unsupported MACRDP_TARGET: $MACRDP_TARGET" >&2; exit 1 ;;
+esac
 if [ -n "${SWIFT_SDK:-}" ]; then SWIFT_ARGS+=(--sdk "$SWIFT_SDK"); fi
 swift build "${SWIFT_ARGS[@]}"
-BIN="$GUI_DIR/.build/release/macrdptray"
+BIN="$(swift build "${SWIFT_ARGS[@]}" --show-bin-path)/macrdptray"
 [ -x "$BIN" ] || { echo "build produced no binary at $BIN" >&2; exit 1; }
 
 STAGE="$REPO_ROOT/target/$APP_NAME"   # target/ is gitignored
@@ -47,6 +54,7 @@ cat > "$STAGE/Contents/Info.plist" <<PLIST
     <key>CFBundleExecutable</key><string>macrdptray</string>
     <key>CFBundlePackageType</key><string>APPL</string>
     <key>CFBundleVersion</key><string>$VERSION</string>
+    <key>MacrdpSourceCommit</key><string>$SOURCE_COMMIT</string>
     <key>CFBundleShortVersionString</key><string>$VERSION</string>
     <key>LSMinimumSystemVersion</key><string>13.0</string>
     <key>LSUIElement</key><true/>

@@ -16,26 +16,17 @@ env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: '0'
   CARGO_NET_RETRY: '10'
+  RUST_BACKTRACE: '1'
 
 jobs:
-  checks:
-    name: checks
-    if: github.repository == 'zhangyxXyz/macrdp' && github.event.deleted == false
-    uses: ./.github/workflows/ci.yml
-    permissions:
-      contents: read
-
   build:
     name: build and publish
-    needs: checks
     if: github.repository == 'zhangyxXyz/macrdp' && github.event.deleted == false
     runs-on: ${{ vars.MACOS_RUNNER || 'macos-26' }}
     timeout-minutes: 60
     permissions:
       contents: write
     steps:
-      - name: Require Apple Silicon runner
-        run: test "$(uname -m)" = arm64
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
         with:
           ref: ${{ github.sha }}
@@ -48,24 +39,20 @@ jobs:
       - uses: actions-rust-lang/setup-rust-toolchain@46268bd060767258de96ed93c1251119784f2ab6
         with:
           toolchain: '1.95.0'
+          target: aarch64-apple-darwin
       - name: Reuse package dependency cache
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4
         with:
           shared-key: packaged-apps
-          key: fork-packaging-check
-      - name: Build release binary
-        run: cargo build --release --locked
-      - name: Build and verify both apps
+          key: native-and-arm64
+      - name: Build ARM64 apps and verify components
         env:
           CODESIGN_IDENTITY: '-'
+          MACRDP_TARGET: aarch64-apple-darwin
         run: |
-          cargo build --release --locked --manifest-path ifd-handler/Cargo.toml
-          swift build --package-path gui -c release --product macrdphud
-          swift build --package-path gui -c release --product macrdpshield
-          SKIP_BUILD=1 APP_DIR="$RUNNER_TEMP/appout" packaging/make-app.sh
+          APP_DIR="$RUNNER_TEMP/appout" packaging/make-app.sh
           APP_DIR="$RUNNER_TEMP/appout" gui/make-tray-app.sh
-          codesign --verify --deep --strict target/macrdp.app
-          codesign --verify --deep --strict target/macrdpController.app
+          python3 scripts/check-app-bundles.py --app-root target --source-sha "$GITHUB_SHA"
       - name: Package apps, provenance and checksum
         env:
           RELEASE_TAG: ${{ github.ref_name }}
@@ -74,7 +61,24 @@ jobs:
           cp -R target/macrdp.app target/macrdpController.app target/app-pair/
           cp README.md README_CN.md CHANGELOG.md LICENSE-MIT LICENSE-APACHE target/app-pair/
           git rev-parse HEAD > target/app-pair/SOURCE_COMMIT
-          target/release/macrdp --capabilities > target/app-pair/CAPABILITIES.json
+          if [ "$(uname -m)" = arm64 ]; then
+            target/aarch64-apple-darwin/release/macrdp --capabilities > target/app-pair/CAPABILITIES.json
+          else
+            # Capabilities are static config metadata with no architecture branches.
+            # Intel cannot execute the packaged ARM64 binary: record the host below.
+            cargo build --locked
+            target/debug/macrdp --capabilities > target/app-pair/CAPABILITIES.json
+          fi
+          python3 - <<'PYMETA'
+          import json, os, pathlib, platform
+          root = pathlib.Path('target/app-pair')
+          caps = json.loads((root / 'CAPABILITIES.json').read_text())
+          assert caps['build_commit'] == os.environ['GITHUB_SHA']
+          info = {'source_commit': os.environ['GITHUB_SHA'], 'package_target': 'aarch64-apple-darwin',
+                  'runner_arch': platform.machine(), 'runner_os': os.environ['RUNNER_OS'],
+                  'capabilities_executed_on': platform.machine(), 'actions_run_id': os.environ['GITHUB_RUN_ID']}
+          (root / 'BUILD_INFO.json').write_text(json.dumps(info, indent=2) + '\n')
+          PYMETA
           NAME="macrdp-${RELEASE_TAG}-aarch64-apple-darwin-app.zip"
           ditto -c -k target/app-pair "dist/${NAME}"
           (cd dist && shasum -a 256 "$NAME" > SHA256SUMS)

@@ -108,14 +108,14 @@ jobs:
           ref: ${{ github.sha }}
           persist-credentials: false
 
-      # An Intel override would test different native code paths, so reject it
-      # explicitly instead of cross-running.
-      - name: Verify Apple Silicon runner
+      # ARM64 is preferred; an Intel override runs native host regressions and
+      # separately checks the ARM64 target. The package is always ARM64.
+      - name: Verify supported macOS runner
         run: |
-          if [[ "$(uname -m)" != "arm64" ]]; then
-            echo "::error::MACOS_RUNNER must select an Apple Silicon (arm64) runner."
-            exit 1
-          fi
+          case "$(uname -m)" in
+            arm64|x86_64) ;;
+            *) echo "::error::Unsupported macOS runner architecture"; exit 1 ;;
+          esac
 
       - name: Install Rust toolchain
         uses: actions-rust-lang/setup-rust-toolchain@46268bd060767258de96ed93c1251119784f2ab6 # v1.16.1
@@ -127,7 +127,8 @@ jobs:
       - name: Cache cargo build
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
-          key: aarch64-apple-darwin
+          shared-key: packaged-apps
+          key: native-and-arm64
 
       # Full suite including the macOS-gated pure-logic tests (resolve_dest,
       # keyboard-layout parsing, h264 NAL conversion, aac, etc.). These are
@@ -138,6 +139,10 @@ jobs:
       # the separate debug binary below remains available to the audit script.
       - name: Clippy (all macOS targets, warnings as errors)
         run: cargo clippy --locked --all-targets -- -D warnings
+
+      - name: Check ARM64 target on Intel fallback
+        if: runner.arch == 'X64'
+        run: cargo clippy --locked --target aarch64-apple-darwin --all-targets -- -D warnings
 
       - name: Test (macOS — full code paths)
         env:

@@ -7,8 +7,11 @@ Only implemented behavior and completed checks are recorded here. Client-side ma
 
 ### 2026-11-17 rebuild / 同版本重构建
 
-- Consolidate regression gates into reusable CI, then package, stage/download/verify, publish and prune serially without Actions artifacts. Use one macOS runner for native checks, default to ARM64 `macos-26`, and unify lowercase workflow names. The previous cancelled jobs failed to acquire GitHub hosted runners before executing steps.
-- 回归集中在可复用 CI，通过后串行打包、草稿上传／下载校验、发布和清理，不使用 Actions 归档。原生检查共用一个 macOS runner，默认 ARM64 `macos-26`，统一小写工作流名称。此前被取消的任务是在执行步骤前无法取得 GitHub 托管 runner。
+- Add an optional Intel macOS runner fallback when hosted ARM64 capacity is unavailable. Keep native host regression gates and separately check ARM64; explicitly cross-build all app components, verify every Mach-O contains ARM64 and four bundle source markers match, and record the build host in `BUILD_INFO.json`. This does not claim ARM64 execution on Intel. Fix the Linux gate for a macOS-only clipboard test helper.
+- 托管 ARM64 容量不足时可选 Intel macOS runner：保留主机原生回归，另查 ARM64，所有应用组件显式交叉编译，逐个核对 Mach-O 的 ARM64 架构及四份 bundle 源提交，并在 `BUILD_INFO.json` 记录构建主机，不把 Intel 检查说成 ARM64 运行验证。补齐剪贴板原生测试的 Linux 平台条件。
+
+- Consolidate regression checks into reusable CI. Release independently packages, stages/downloads/verifies, publishes and prunes serially without waiting for CI or using Actions artifacts; pre-tag review/regressions remain the maintainer workflow. Use one macOS runner for native checks, default to ARM64 `macos-26`, and unify lowercase workflow names. The previous cancelled jobs failed to acquire GitHub hosted runners before executing steps.
+- 回归集中在可复用 CI；发布独立串行打包、草稿上传／下载校验、发布和清理，不等待 CI、不使用 Actions 归档；维护者在打 tag 前完成必要审查和回归。原生检查共用一个 macOS runner，默认 ARM64 `macos-26`，统一小写工作流名称。此前被取消的任务是在执行步骤前无法取得 GitHub 托管 runner。
 - Same-tag replacement keeps the old owned Release available until the separate staging draft verifies. Validate remote tag/source identity and reject stale runs or concurrent edits; keep a verified draft retryable if final publication fails. Version remains `0.10.6`.
 - 同标签覆盖先保留旧 Release，独立暂存草稿验证完成后再替换；核对远端 tag 与来源提交，拒绝过期运行或并发修改。最终发布失败时保留可重试的已验证草稿。应用版本仍为 `0.10.6`。
 - Pre-push local validation: 491 Rust tests passed (8 ignored), strict Clippy, 33 configuration CLI checks, 10 controller configuration tests, 10 File Provider adapter checks and sanitized native audio-buffer checks. Actual Windows playback/paste, disconnect lock and monitor-free reconnect remain manual checks.
