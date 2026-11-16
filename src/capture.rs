@@ -831,10 +831,10 @@ impl RdpServerDisplay for CaptureDisplay {
             .observe_client_scale(monitor.desktop_scale_factor());
         // Compare against the applied mode, not the preceding PDU. Repeated
         // 200% layouts during debounce must retain an unapplied 100→200 change.
-        let applied_scale = self.virtual_display.as_ref().map(|vd| {
+        let applied_scale = self.virtual_display.as_ref().and_then(|vd| {
             vd.lock()
                 .expect("virtual display mutex poisoned")
-                .ui_scale()
+                .scale_if_active()
         });
         self.pending_resize.clear();
         let requested = cap_client_size(DesktopSize { width, height }, self.max_client_size);

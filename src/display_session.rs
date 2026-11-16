@@ -106,6 +106,9 @@ impl ManagedDisplay {
             primary,
         }))
     }
+    pub fn scale_if_active(&self) -> Option<u32> {
+        self.active.as_ref().map(VirtualDisplay::ui_scale)
+    }
     pub fn id_if_active(&self) -> Option<u32> {
         self.active.as_ref().map(VirtualDisplay::display_id)
     }
@@ -262,6 +265,7 @@ mod tests {
         );
         let s = shared.lock().unwrap();
         assert!(s.active.is_none());
+        assert_eq!(s.scale_if_active(), None);
         assert_eq!(s.lifecycle.users, 0);
     }
     #[test]

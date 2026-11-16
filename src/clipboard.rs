@@ -443,6 +443,9 @@ fn dib_to_png(dib: &[u8]) -> anyhow::Result<Vec<u8>> {
 /// inside cliprdr and silently break a paste that was about to work.
 #[derive(Debug, Default)]
 struct AdvertiseState {
+    /// Callbacks request a poller pass; never walk local/cloud files while
+    /// holding the RDP channel dispatch lock.
+    requested: std::sync::atomic::AtomicBool,
     /// Bumped each time the Mac pasteboard changes; identifies the current
     /// wave of (possibly retried) advertises.
     generation: std::sync::atomic::AtomicU64,
@@ -589,7 +592,10 @@ impl ServerEventSender for MacCliprdr {
                 }
                 tokio::time::sleep(POLL_INTERVAL).await;
                 let current = pb::change_count();
-                if current == last_seen {
+                let requested = advertise_state
+                    .requested
+                    .swap(false, std::sync::atomic::Ordering::AcqRel);
+                if current == last_seen && !requested {
                     continue;
                 }
                 last_seen = current;
@@ -1322,11 +1328,13 @@ impl CliprdrBackend for MacCliprdrBackend {
             });
             return;
         }
-        advertise_pasteboard(&self.sender, &self.file_paths, self.rich_clipboard);
+        self.on_request_format_list();
     }
 
     fn on_request_format_list(&mut self) {
-        advertise_pasteboard(&self.sender, &self.file_paths, self.rich_clipboard);
+        self.advertise_state
+            .requested
+            .store(true, std::sync::atomic::Ordering::Release);
     }
 
     fn on_format_list_response(&mut self, ok: bool) {
@@ -2555,19 +2563,26 @@ mod tests {
     /// Once the connect-time handshake has settled (`initial_advertise_pending`
     /// already false — set up directly here rather than via a real first
     /// `on_ready()` call, so this test doesn't have to interact with that
-    /// call's spawned deferred task), `on_ready` must advertise immediately,
-    /// exactly as it did before the connect-time fix.
+    /// call's spawned deferred task), `on_ready` requests the next poller
+    /// pass without doing filesystem/pasteboard work inside channel dispatch.
     #[test]
     #[cfg(target_os = "macos")]
-    fn on_ready_advertises_immediately_once_settled() {
+    fn on_ready_requests_a_poller_advertise_once_settled() {
         let (mut backend, mut rx) = test_backend();
         backend.initial_advertise_pending = false;
 
         pb::write_string("on_ready_settled_probe");
         backend.on_ready();
+        assert!(backend
+            .advertise_state
+            .requested
+            .swap(false, std::sync::atomic::Ordering::AcqRel));
+        assert!(rx.try_recv().is_err());
+        // The poller performs this work outside channel dispatch.
+        advertise_pasteboard(&backend.sender, &backend.file_paths, true);
         match rx
             .try_recv()
-            .expect("post-handshake on_ready must advertise immediately")
+            .expect("the requested poller pass advertises the clipboard")
         {
             ServerEvent::Clipboard(ClipboardMessage::SendInitiateCopy(formats)) => {
                 assert!(formats
@@ -3569,5 +3584,19 @@ mod tests {
         backend.fetch.got.html = Some("<p>screenshot.png</p>".into());
         backend.publish_fetched();
         assert!(pb::read_string().is_none());
+    }
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn format_list_callback_does_not_wait_for_the_os_pasteboard() {
+        let (mut backend, mut rx) = test_backend();
+        let _busy_pasteboard = pasteboard_guard();
+        backend.on_request_format_list();
+        assert!(backend
+            .advertise_state
+            .requested
+            .load(std::sync::atomic::Ordering::Acquire));
+        assert!(rx.try_recv().is_err());
+        // Drop the guard before backend teardown reads pasteboard state.
+        drop(_busy_pasteboard);
     }
 }
