@@ -3503,6 +3503,7 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn file_clipboard_advertises_streams_without_windows_source_paths() {
         let (backend, _rx) = test_backend();
