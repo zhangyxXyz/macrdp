@@ -96,6 +96,12 @@ and conflicting dedicated/extra-flag mappings fail validation. Automated checks
 cover the mapping and state transitions; this new feature has not yet been
 validated with real Windows shortcut/AltGr input.
 
+Upstream `v0.10.6` (`0255a8b`, #267) is merged. If a launchd-started server has
+missing/wrong stored credentials, it now waits and rechecks only a changed
+password instead of entering a failed-login restart loop. The controller shows
+the blocked state and offers password correction. This remains separate from
+per-connection auto-unlock, and validation commands remain side-effect free.
+
 ## Upstream NV12 capture experiment
 
 Merged upstream [cef6073](https://github.com/clintcan/macrdp/commit/cef6073ba461c595261a2705a2c84888cd522673)

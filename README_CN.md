@@ -83,6 +83,11 @@ CLI 参数为 `--modifier-layout standard|swap-left-win-alt|swap-win-alt`，
 `--map-ctrl-to-cmd` 独立控制编辑兼容。应用配置会重启服务；未知布局以及专用字段与 Extra flags 的重复映射会被校验拒绝。
 自动检查覆盖映射和状态变化，但新增功能尚未用真实 Windows 快捷键和 AltGr 输入完成验证。
 
+已合入上游 `v0.10.6`（`0255a8b`，#267）：launchd 启动时若存储的密码缺失或错误，
+服务等待凭证修正，仅在密码变化后重新验证，避免反复重启造成重复登录失败。
+控制器显示等待状态并提供密码修正入口。这与每次连接的自动解锁独立，
+配置检查仍不触发真实登录或写入状态文件。
+
 ## 上游 NV12 捕获实验
 
 已合入上游 [cef6073](https://github.com/clintcan/macrdp/commit/cef6073ba461c595261a2705a2c84888cd522673)

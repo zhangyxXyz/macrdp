@@ -7,6 +7,8 @@ Only implemented behavior and completed checks are recorded here. Client-side ma
 
 ### English
 
+- Merge upstream v0.10.6 / 0255a8b (#267): park headless startup on missing/wrong credentials, retry only changed passwords, and surface password correction in the controller. Preserve side-effect-free fork configuration inspection and pre-capture unlock.
+
 - Keep Windows file-copy intent through preparation: clear stale text, prioritize Explorer file streams over previews, refuse filename-as-text fallback and stale replies, and remove automatic Cmd+V after downloads. Preserve screenshot PNG/DIB and system dataless paths.
 - Move Mac→Windows clipboard I/O off the RDP loop with bounded workers/queues and a 30s deadline. Serialize format replies (including inline file/drop-effect replies), snapshot original locked paths, and discard retired-session completions. OS reads may outlive timeout but cannot create unbounded workers.
 - Create virtual displays only for authenticated capture; release after a 2.5s reactivation grace and physical restoration. Protect reconnects by generation and refresh input/audio/HUD IDs. Keep the only active display if physical restoration fails; fixed 4K/200% and keyboard configuration remain unchanged.
@@ -24,6 +26,8 @@ Only implemented behavior and completed checks are recorded here. Client-side ma
 - Verify the Rust regression suite, nine production adapter checks, and six real system checks with synthetic sources, including same-domain/same-name reconnect. The user reported successful testing of the previously installed `92f4c8c` build before this Win10 merge; this is not a manual check of the rebuilt binary. Release verification requires both embedded File Provider executables. Notes use a short bilingual template linking to this changelog; old owned releases and their tags are pruned only after retained-release verification.
 
 ### 简体中文
+
+- 合入上游 v0.10.6／0255a8b（#267）：无头启动凭证缺失或错误时等待，仅验证变化后的密码，控制器提供修正入口；保留本 fork 无副作用配置检查及捕获前解锁。
 
 - 保留 Windows 文件复制意图：准备期间清除旧文本，Explorer 文件流优先于预览，拒绝文件名降级成文本及过期回复，取消下载后的自动 Cmd+V；保留截图 PNG／DIB 和系统 dataless 路径。
 - Mac→Windows 剪贴板读取移出 RDP 循环，限制后台线程／队列，30 秒请求超时；格式回复（含内联文件列表／drop effect）保持顺序，绑定原锁路径，丢弃旧会话迟到完成。系统阻塞读取可能晚于超时结束，但不会无限增加线程。

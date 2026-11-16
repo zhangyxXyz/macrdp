@@ -602,6 +602,23 @@ each interval and waits `TIMEOUT_SECS` for it to run; a deadlocked runtime never
 runs it. A bounce logs `health-check watchdog: tokio runtime wedged …` before
 exiting.
 
+Startup password failures (#266). The server reads and checks the account
+password before any other setup (sleep blocker, virtual display, helpers). If
+there is no usable password, or the check rejects it, a **headless** server
+(launchd) does not exit, since `KeepAlive` would restart it about every 10 s and
+each restart would be another failed login against the Mac account. Instead it
+logs `cannot start: no valid password for this Mac account …` once, writes
+`auth-status` next to `config.env` (line 1 `no-password` or `wrong-password`,
+line 2 the account), and waits. Every 30 s it re-reads the Keychain or password
+file without an account check, and checks again only when the stored password
+has changed, so a Keychain that unlocks later or an entry fixed in Keychain
+Access recovers on its own (log: `the stored password changed — checking it
+again`). The menu-bar controller shows "waiting for a valid password" with
+**Re-enter Password…**, which checks the new password before saving it and
+restarts the server. An **interactive** run (stdout a TTY)
+exits with the error as before. Override with
+`MACRDP_PARK_ON_AUTH_FAILURE=1` (always wait) or `0` (always exit).
+
 Experimental QoE-based blank recovery is **off by default**, including with
 `--enable-h264`. The matching `config.env` keys omit the `MACRDP_` prefix.
 Only `MACRDP_BLANK_RECOVERY=1` (or `true`, `on`, `yes`, case-insensitive) opts in;
@@ -622,6 +639,7 @@ below do not turn QoE timing into reliable presentation evidence. With recovery
 disabled, the manual **Ctrl+Alt+Shift+R** resync remains available; for a genuinely
 blank mstsc surface, fully close and reopen its window. Auto-reconnect cookies
 are independent of this heuristic and remain enabled by default.
+
 ```
 MACRDP_BLANK_RECOVERY=0                # default OFF; 1/true/on/yes explicitly enables the experimental heuristic
 MACRDP_BLANK_RECOVERY_REACTIVATE=1     # only with recovery opted in: try reactivation first; 0 = drop-only
