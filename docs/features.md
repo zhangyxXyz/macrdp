@@ -67,7 +67,7 @@ The pipeline: the client's PCM arrives over `AUDIO_INPUT` → macrdp writes it i
 
 **Menu-bar controller — tabbed Settings window.** The bundled `macrdpController.app` (menu-bar front-end that drives the LaunchAgent + `config.env`; `gui/Sources/macrdptray`) presents a real **tabbed Settings window** ("Show macrdp…") with a System-Settings-style sidebar (Status · Connection · Video · Audio · Display · Input · Redirection · Advanced · Permissions — also a **Section** menu, ⌘1–⌘9) instead of the old flat menu submenus. Settings edit an in-memory **draft** and apply in **one** server restart via **Apply/Revert** (rather than one restart per toggle); the tray menu is trimmed to Show / Start / Stop / Restart / Quit. The **Status** tab shows live server RAM/CPU/uptime (`ps`) + the connected client (`lsof` + the log fingerprint), and — when `--stats-endpoint` is on — the live bitrate/RTT/fps/frames from the endpoint above. The **Video** tab exposes the **H.264 bitrate ceiling** (via the new `BITRATE` config key → `--bitrate`) + the adaptive-bitrate toggle. The **Display** tab has a **Lock while away** section for `--lock-on-disconnect` + `--auto-unlock` (the `LOCK_ON_DISCONNECT` / `AUTO_UNLOCK` keys) — both greyed out and cleared unless a Detach/Blank headless mode is picked, since the server ignores them without one, and an orange warning when the lock is on without auto-unlock, because a remote-only Mac is unreachable once it locks. Plus an **About macrdp** panel (version + status). The controller needs no TCC grants of its own.
 
-**Fork lock lifecycle correction (pending manual Windows verification).** With a headless display mode and AUTO_UNLOCK=1, authenticated capture preparation precedes SCK enumeration rather than waiting for a session to exist. Unsafe/unknown lock state and exhausted password-submission budget stop capture explicitly. LOCK_ON_DISCONNECT requests a true immediate lock and independently checks its state; it waits for physical-screen restore and bounded reconnect protection and does not change the screen-saver password policy. See [CLI](cli.md) and [quirks](known-quirks.md).
+**Fork lock lifecycle correction (pending manual Windows verification).** With a headless display mode and AUTO_UNLOCK=1, authenticated capture preparation precedes SCK enumeration rather than waiting for a session to exist. Unsafe/unknown lock state and exhausted password-submission budget stop capture explicitly. LOCK_ON_DISCONNECT requests a true immediate lock and independently checks its state. After reactivation grace and bounded reconnect protection, Detach confirms the lock before restoring physical screens; Capture/Shield retain restore-before-lock ordering. It does not change the screen-saver password policy. See [CLI](cli.md) and [quirks](known-quirks.md).
 
 **Pending fork audio/lock follow-up:** optional `AUDIO_REMOTE_ONLY=1` uses a private
 Core Audio tap (macOS 14.2+, system audio recording permission) with
@@ -77,9 +77,11 @@ capture state/error and a recent signal peak, not client audibility. An isolated
 native probe captured a nonzero 48 kHz tone and cleaned up successfully; the rebuilt
 server still needs mstsc playback/reconnect/route-change/crash verification.
 Disconnect locks now have no default extra 22.5s wait, reject stale capture epochs,
-handle merged transitions and serialize with auto-unlock. Physical restore, 2.5s
-reactivation grace and capped handshake holds still apply; no local-input takeover
-detection is added.
+handle merged transitions and serialize with auto-unlock. Detach locks before
+physical restoration and keeps the serial guard and virtual surface through it;
+failed locks retain the overlay, and successful restores never schedule a second
+lock. The 2.5s reactivation grace and capped handshake holds still apply; no
+local-input takeover detection is added.
 
 **Monitor-free sessions (pending live hardware verification):** authenticated
 virtual-display bootstrap precedes auto-unlock when no other display is online.
@@ -91,7 +93,12 @@ with their cables attached. Successful restore requires every queued target to
 be observed active; unconfirmed targets use bounded retries and best-effort
 process recovery. Restart is not guaranteed to restore physical output: a macOS 27
 dual-monitor failure required a video-cable reconnect. The corrected saved-target
-restore path still needs a live disconnect/reconnect test.
+restore path was verified in two live disconnect cycles: both physical monitors
+returned automatically. Native restoration took about 10.5s, followed by a
+0.13–0.15s lock, exposing the unlocked desktop under the old ordering. An isolated
+probe then confirmed locking in 102ms with only the virtual display active. The
+new lock-before-restore ordering has automated coverage; its complete real-client
+cycle still needs verification.
 Capture restores gamma/capture ownership before filtering unplugged layout targets.
 With no outstanding physical restoration, no-other-online-display permits idle
 virtual-display release. Unknown enumeration/online-but-inactive state is not

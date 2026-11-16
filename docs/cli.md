@@ -211,9 +211,11 @@ MACRDP_MODS_RESYNC_IDLE_MS=10000  # env-only: after this many ms with no input,
                           #   confirms the system lock flag (up to 2s). No screen-
                           #   saver fallback; missing API/request/confirmation is
                           #   logged as failure. Does not change the account's
-                          #   password-delay policy. Retains the disconnect grace,
-                          #   physical-display restoration, with no extra wait by
-                          #   default; reconnect holds remain bounded.
+                          #   password-delay policy. Retains the disconnect grace
+                          #   and bounded reconnect holds, with no extra wait by
+                          #   default. Detach confirms lock BEFORE physical restore;
+                          #   capture/shield restore first. A successful Detach
+                          #   restore never schedules a second delayed lock.
                           #   Never fires on server shutdown/kill, only a genuine
                           #   last-client-disconnect. Config: LOCK_ON_DISCONNECT.
                           #   A client still reconnecting when the timer ends
@@ -221,8 +223,9 @@ MACRDP_MODS_RESYNC_IDLE_MS=10000  # env-only: after this many ms with no input,
                           #   so an unauthenticated peer can only delay it).
                           #   MACRDP_LOCK_ON_DISCONNECT_DELAY_MS / config
                           #   LOCK_ON_DISCONNECT_DELAY_MS (default 0 — optional extra
-                          #   buffer beyond the ~2.5s reactivation grace) tunes the
-                          #   safety margin: lower for a snappier lock at higher
+                          #   buffer beyond the ~2.5s reactivation grace; before
+                          #   restore for Detach, after restore for other modes)
+                          #   tunes the safety margin: lower for a snappier lock at higher
                           #   false-positive risk, raise it on a slow/lossy link.
                           #   Verified on one machine, one macOS version; rests on a
                           #   private lock-state API. macOS-only.

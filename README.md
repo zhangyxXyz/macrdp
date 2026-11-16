@@ -38,7 +38,14 @@ disappears from CoreGraphics' online list. A successful transaction alone no
 longer counts as recovery: every saved display must be confirmed active. Failed
 restoration uses bounded recovery; with disconnect locking enabled, a recovery
 restart requires a confirmed lock and must not interrupt a newer session.
-Real two-monitor disconnect/reconnect verification of this follow-up is pending.
+The user verified automatic two-monitor recovery on `f2d30dc`. Logs showed about
+2.5s of disconnect grace, 10.5s of native display restoration, then a 0.13–0.15s
+lock; the desktop was visible before that lock. The correction locks Detach
+sessions before restoration and holds the auto-unlock gate through the native
+transition. Capture/Shield retain their existing restore-first ordering. The
+completed transition must not schedule a second, delayed lock. A live probe
+confirmed locking with only the virtual display active in 102ms; the complete
+reordered disconnect path still needs verification after installation.
 In the reported failure, restarting the old server did not restore either output;
 reconnecting a display cable restored both. Process restart is a recovery attempt,
 not a guarantee that a stuck display link will recover.
@@ -53,7 +60,8 @@ Permissions adds an optional Full Disk Access shortcut for Mac-to-Windows copies
 from protected locations. Grant it to the server `macrdp.app` in System Settings;
 this does not repair incoming Windows formats. Disconnect locking removes the
 old extra 22.5-second default wait, but still waits for the 2.5-second reactivation
-grace, physical-display restoration and any bounded reconnect hold. It is not
+grace and any bounded reconnect hold. Detach locks before restoring physical
+displays; the other modes restore first. It is not
 an instantaneous lock or a local-input takeover detector. At 4K/200%, macOS's
 1920×1080 logical workspace is distinct from the 3840×2160 RDP output.
 

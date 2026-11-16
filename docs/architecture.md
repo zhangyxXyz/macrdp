@@ -434,5 +434,17 @@ bounded retries and uses the existing best-effort process-recovery path instead 
 silently discarding saved targets. In a macOS 27 dual-monitor failure where the old
 online-list filter skipped restoration, process restart and
 `CGRestorePermanentDisplayConfiguration` did not revive physical outputs; a video
-cable reconnect did. The corrected direct re-enable path still needs live testing,
-and restart must not be described as a guaranteed substitute for restoring targets.
+cable reconnect did. The corrected direct re-enable path restored both monitors
+in two subsequent live disconnect cycles. Restart must not be described as a
+guaranteed substitute for restoring targets.
+
+With disconnect locking enabled, Detach confirms the lock before taking and
+dropping its overlay guard. A blocking worker retains SESSION_LOCK_SERIAL and
+the virtual-display lease throughout the coordinated native restore. This keeps
+a slow physical enable/layout transaction from exposing an unlocked desktop.
+Lock failure retains the overlay and surface; successful restoration does not
+queue another lock. Recovery reuses the original disconnect identity and deadline
+and may only verify the existing lock, never re-lock a user who has returned.
+Capture/Shield retain restore-before-lock because display capture can prevent
+macOS from locking. A sole-virtual-display lock was verified live; the complete
+reordered disconnect cycle remains to be verified.

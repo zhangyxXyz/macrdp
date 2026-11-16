@@ -156,6 +156,21 @@ pub enum DisconnectCompletion {
     LockFailed,
 }
 
+/// A detach transaction already locked before restoring the displays. Its
+/// later recovery may verify that lock, but must never re-lock a desktop the
+/// local user has since unlocked.
+pub fn confirm_disconnect_lock(
+    verify_only: bool,
+    state: Option<bool>,
+    request: impl FnOnce() -> bool,
+) -> bool {
+    if verify_only {
+        state == Some(true)
+    } else {
+        request()
+    }
+}
+
 /// An unresolved failed restore must retain its surface even when CoreGraphics
 /// no longer lists the disabled physical screens. A new capture owns its own
 /// lease; otherwise only a positively active other display permits release.
@@ -234,6 +249,91 @@ mod tests {
             ),
             DisconnectCompletion::LockFailed,
         );
+    }
+
+    #[test]
+    fn locked_detach_holds_serial_and_surface_through_a_blocked_restore() {
+        use std::sync::atomic::AtomicUsize;
+        let serial = Arc::new(StdMutex::new(()));
+        let locks = Arc::new(AtomicUsize::new(0));
+        let surface_alive = Arc::new(AtomicBool::new(true));
+        struct Surface(Arc<AtomicBool>);
+        impl Drop for Surface {
+            fn drop(&mut self) {
+                self.0.store(false, Ordering::SeqCst);
+            }
+        }
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let worker_serial = serial.clone();
+        let worker_locks = locks.clone();
+        let worker_surface = Surface(surface_alive.clone());
+        let worker = std::thread::spawn(move || {
+            let _surface = worker_surface;
+            complete_disconnect(
+                || Some(worker_serial.lock().unwrap()),
+                || true,
+                || {
+                    worker_locks.fetch_add(1, Ordering::SeqCst);
+                    true
+                },
+                || {
+                    entered_tx.send(()).unwrap();
+                    release_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+                },
+            )
+        });
+        entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert_eq!(
+            locks.load(Ordering::SeqCst),
+            1,
+            "lock precedes slow restore"
+        );
+        assert!(surface_alive.load(Ordering::SeqCst));
+        assert!(
+            serial.try_lock().is_err(),
+            "auto-unlock cannot enter during restore"
+        );
+        release_tx.send(()).unwrap();
+        assert_eq!(worker.join().unwrap(), DisconnectCompletion::Completed);
+        assert_eq!(
+            locks.load(Ordering::SeqCst),
+            1,
+            "no second late lock after restore"
+        );
+        assert!(!surface_alive.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn failed_prelock_does_not_take_or_drop_the_physical_overlay() {
+        let slot = Arc::new(StdMutex::new(Some("detached overlay")));
+        let worker_slot = slot.clone();
+        assert_eq!(
+            complete_disconnect(
+                || Some(()),
+                || true,
+                || false,
+                move || {
+                    worker_slot.lock().unwrap().take();
+                },
+            ),
+            DisconnectCompletion::LockFailed,
+        );
+        assert_eq!(*slot.lock().unwrap(), Some("detached overlay"));
+    }
+
+    #[test]
+    fn recovery_after_prelock_only_verifies_and_never_locks_again() {
+        for state in [Some(true), Some(false), None] {
+            assert_eq!(
+                confirm_disconnect_lock(true, state, || panic!(
+                    "must not lock a returned local user"
+                )),
+                state == Some(true),
+            );
+        }
+        assert!(confirm_disconnect_lock(false, Some(false), || true));
+        assert!(!confirm_disconnect_lock(false, None, || false));
     }
 
     #[test]

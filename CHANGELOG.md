@@ -7,6 +7,9 @@ Only implemented behavior and completed checks are recorded here. Client-side ma
 
 ### 2026-11-17 rebuild / 同版本重构建
 
+- After `f2d30dc` restored both monitors in live testing, the user observed an unlocked desktop before the delayed lock. Logs measured ~2.5s grace + ~10.5s native restoration + ~0.15s lock. Detach now confirms the lock before restoring physical displays, holds the auto-unlock gate through restoration and avoids a second delayed lock; capture/shield ordering is unchanged. An isolated, authorized live probe locked with only the virtual display active in 102ms. Full reordered-session verification remains separate.
+- `f2d30dc` 实测恢复了两台显示器，但用户看到桌面先亮起、随后才锁屏；日志为约 2.5 秒宽限 + 10.5 秒原生恢复 + 0.15 秒锁屏。Detach 改为先确认锁屏再恢复实体屏，恢复期间保持与自动解锁互斥，完成后不再补延迟锁屏；Capture／Shield 顺序不变。获授权的独立实测在仅虚拟屏活动时 102 毫秒内锁定，完整新会话顺序另行验证。
+
 - Follow-up to manual feedback on `31ee2fb`: audio and Windows desktop file copies work, while Directory Opus copies and two-monitor restoration still have failures. Keep saved detach targets even when disabled displays disappear from the online list; attempt every enable and verify each display is active. Recovery restart must preserve disconnect locking and newer-session protection. Actual hardware verification of the correction is pending.
 - 根据 `31ee2fb` 的用户实测继续修正：音频和 Windows 桌面文件复制正常，Directory Opus 复制及双屏恢复仍有失败。保留从在线列表消失的已禁用屏幕，逐个尝试启用并确认活动状态；恢复重启须保留断开锁屏及新会话保护。修正版的真实硬件验证待完成。
 - Retry a failed remote file descriptor once, like other clipboard formats, instead of dropping it as an unexpected format. A second failure stops with a clear diagnostic; malformed successful responses are not decoded as text. This does not claim to fix a client's persistent inability to supply file data.

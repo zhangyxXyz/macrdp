@@ -1104,11 +1104,13 @@ mod macos {
             const ENABLE_RETRY_BACKOFF: Duration = Duration::from_secs(2);
             let mut enable_ok = false;
             for attempt in 1..=MAX_ENABLE_ATTEMPTS {
+                let begin_started = std::time::Instant::now();
                 let config = match any.begin_configuration() {
                     Ok(c) => c,
                     Err(e) => {
                         tracing::warn!(
                             attempt,
+                            begin_ms = begin_started.elapsed().as_millis() as u64,
                             "could not begin enable-tx during detach restore (CGError {e})"
                         );
                         if attempt < MAX_ENABLE_ATTEMPTS {
@@ -1117,6 +1119,8 @@ mod macos {
                         continue;
                     }
                 };
+                let begin_ms = begin_started.elapsed().as_millis() as u64;
+                let queue_started = std::time::Instant::now();
                 let all_queued = super::queue_detached_restore(&self.detached, |id| match enabler
                     .set(config, id, true)
                 {
@@ -1126,17 +1130,42 @@ mod macos {
                         false
                     }
                 });
-                match any.complete_configuration(&config, CGConfigureOption::ConfigureForAppOnly) {
+                let queue_ms = queue_started.elapsed().as_millis() as u64;
+                let complete_started = std::time::Instant::now();
+                let completion =
+                    any.complete_configuration(&config, CGConfigureOption::ConfigureForAppOnly);
+                tracing::info!(
+                    attempt,
+                    detached_count = self.detached.len(),
+                    begin_ms,
+                    queue_ms,
+                    complete_ms = complete_started.elapsed().as_millis() as u64,
+                    all_queued,
+                    committed = completion.is_ok(),
+                    "detach restore enable transaction timing"
+                );
+                match completion {
                     Ok(()) => {
                         // A committed transaction is not proof that every
                         // per-display enable succeeded or became active.
+                        let settle_started = std::time::Instant::now();
                         std::thread::sleep(TX_SETTLE);
+                        let settle_ms = settle_started.elapsed().as_millis() as u64;
+                        let active_started = std::time::Instant::now();
                         let active = CGDisplay::active_displays();
-                        if super::detach_restore_confirmed(
+                        let confirmed = super::detach_restore_confirmed(
                             &self.detached,
                             all_queued,
                             active.as_deref().ok(),
-                        ) {
+                        );
+                        tracing::info!(
+                            attempt,
+                            settle_ms,
+                            active_check_ms = active_started.elapsed().as_millis() as u64,
+                            confirmed,
+                            "detach restore active confirmation timing"
+                        );
+                        if confirmed {
                             if attempt > 1 {
                                 tracing::info!(attempt, "enable-tx succeeded on retry");
                             }
@@ -1181,16 +1210,20 @@ mod macos {
             // Now the displays are live again; queue origin restores in a
             // second transaction. Best-effort — a wrong origin is far less
             // bad than a dark display.
+            let begin_started = std::time::Instant::now();
             let config = match any.begin_configuration() {
                 Ok(c) => c,
                 Err(e) => {
                     tracing::warn!(
+                        begin_ms = begin_started.elapsed().as_millis() as u64,
                         "displays re-enabled but could not begin reposition-tx \
                          (CGError {e}); layout will be wrong until logout"
                     );
                     return;
                 }
             };
+            let begin_ms = begin_started.elapsed().as_millis() as u64;
+            let queue_started = std::time::Instant::now();
             for (id, origin) in &self.detached {
                 let _ = CGDisplay::new(*id).configure_display_origin(&config, origin.0, origin.1);
             }
@@ -1199,9 +1232,19 @@ mod macos {
                 self.virtual_old_origin.0,
                 self.virtual_old_origin.1,
             );
-            if let Err(e) =
-                any.complete_configuration(&config, CGConfigureOption::ConfigureForAppOnly)
-            {
+            let queue_ms = queue_started.elapsed().as_millis() as u64;
+            let complete_started = std::time::Instant::now();
+            let completion =
+                any.complete_configuration(&config, CGConfigureOption::ConfigureForAppOnly);
+            tracing::info!(
+                detached_count = self.detached.len(),
+                begin_ms,
+                queue_ms,
+                complete_ms = complete_started.elapsed().as_millis() as u64,
+                committed = completion.is_ok(),
+                "detach restore reposition transaction timing"
+            );
+            if let Err(e) = completion {
                 tracing::warn!(
                     "displays re-enabled but reposition-tx failed (CGError {e}); \
                      layout will revert to original on process exit"
