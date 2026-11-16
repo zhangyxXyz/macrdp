@@ -30,6 +30,54 @@ struct Checks {
           } catch {}
         }
         result = ["ok": true]
+      } else if input.operation == "local-copy" {
+        let archive = directory.appendingPathComponent("metadata.json")
+        let catalog = try FilesCatalog(client: client, archive: archive)
+        try await catalog.refresh()
+        let file = try await catalog.children("root")[0]
+        let anchor = await catalog.anchor()
+        let source = directory.appendingPathComponent("edited.bin")
+        let bytes = Data("local edited bytes".utf8)
+        try bytes.write(to: source)
+        let version = Data(file.identifier.utf8)
+        let saved = try await catalog.saveLocalCopy(
+          file.identifier, contentVersion: version,
+          metadataVersion: version, contents: source, flags: nil, modified: nil, lastUsed: nil)
+        guard saved.size == bytes.count, saved.content != nil else { throw FilesError.invalid }
+        do {
+          _ = try await catalog.saveLocalCopy(
+            file.identifier, contentVersion: version,
+            metadataVersion: version, contents: source, flags: nil, modified: nil, lastUsed: nil)
+          fatalError("stale edit accepted")
+        } catch FilesError.stale {}
+        let localDirectory = directory.appendingPathComponent("local-copies")
+        let orphan = localDirectory.appendingPathComponent(UUID().uuidString)
+        try Data("aborted save".utf8).write(to: orphan)
+        let count = try FileManager.default.contentsOfDirectory(atPath: localDirectory.path).count
+        do {
+          _ = try stageLocalCopy(from: source, into: localDirectory, maximumBytes: 1)
+          fatalError("byte budget exceeded")
+        } catch FilesError.limit {}
+        guard
+          try FileManager.default.contentsOfDirectory(atPath: localDirectory.path).count == count
+        else { throw FilesError.invalid }
+        let restored = try FilesCatalog(client: client, archive: archive)
+        guard !FileManager.default.fileExists(atPath: orphan.path),
+          try await restored.snapshot(file.identifier) == file
+        else { throw FilesError.invalid }
+        let path = try await restored.materializeLocalCopy(
+          file.identifier,
+          version: Data(saved.content!.utf8), directory: directory)!
+        guard try Data(contentsOf: path) == bytes else { throw FilesError.invalid }
+        let changes = try await restored.changes(since: anchor, container: "working")
+        guard changes.files == [file], changes.anchor > anchor else { throw FilesError.invalid }
+        // Unknown version and invalid metadata cannot replace the committed data.
+        do {
+          _ = try await restored.materializeLocalCopy(
+            file.identifier, version: version, directory: directory)
+          fatalError("stale read accepted")
+        } catch FilesError.stale {}
+        result = ["ok": true]
       } else if input.operation == "catalog" {
         let archive = directory.appendingPathComponent("metadata.json")
         let first = try FilesCatalog(client: client, archive: archive)

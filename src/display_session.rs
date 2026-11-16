@@ -10,6 +10,7 @@ use std::sync::{
     atomic::{AtomicU32, Ordering},
     Arc, Mutex,
 };
+use std::time::{Duration, Instant};
 static ACTIVE: AtomicU32 = AtomicU32::new(0);
 static READY: AtomicU32 = AtomicU32::new(0);
 pub fn mark_ready(id: u32) {
@@ -60,6 +61,7 @@ pub fn active_display_id() -> Option<u32> {
 struct Lifecycle {
     users: usize,
     generation: u64,
+    cleanup_not_before: Option<Instant>,
 }
 impl Lifecycle {
     fn enter(&mut self) {
@@ -69,6 +71,17 @@ impl Lifecycle {
     fn leave(&mut self) -> Option<u64> {
         self.users = self.users.saturating_sub(1);
         (self.users == 0).then_some(self.generation)
+    }
+    fn leave_after(&mut self, now: Instant, grace: Duration) -> Option<(u64, Instant)> {
+        // A capture may finish while an older lock keepalive remains. Record
+        // its grace even when it is NOT the final user; the eventual zero-grace
+        // keepalive drop must not erase that newer capture's reactivation window.
+        let requested = now + grace;
+        let deadline = self
+            .cleanup_not_before
+            .map_or(requested, |pending| pending.max(requested));
+        self.cleanup_not_before = Some(deadline);
+        self.leave().map(|generation| (generation, deadline))
     }
     fn may_release(&self, generation: u64) -> bool {
         self.users == 0 && self.generation == generation
@@ -112,6 +125,18 @@ impl ManagedDisplay {
     pub fn id_if_active(&self) -> Option<u32> {
         self.active.as_ref().map(VirtualDisplay::display_id)
     }
+    /// Keep the already-existing surface alive through disconnect locking.
+    /// Never creates a display for an idle server or changes SessionTracker.
+    pub fn retain_active(shared: &SharedDisplay) -> Option<Lease> {
+        let mut s = shared.lock().unwrap();
+        s.active.as_ref()?;
+        s.lifecycle.enter();
+        Some(Lease {
+            shared: shared.clone(),
+            cleanup_runtime: tokio::runtime::Handle::try_current().ok(),
+            cleanup_grace: std::time::Duration::ZERO,
+        })
+    }
     pub async fn acquire(shared: &SharedDisplay) -> Result<Lease> {
         let coordinator = shared.lock().unwrap().coordinator.clone();
         let state = shared.clone();
@@ -141,6 +166,8 @@ impl ManagedDisplay {
                 s.lifecycle.enter();
                 Ok::<_, anyhow::Error>(Lease {
                     shared: state.clone(),
+                    cleanup_runtime: tokio::runtime::Handle::try_current().ok(),
+                    cleanup_grace: std::time::Duration::from_millis(2500),
                 })
             })
             .await?
@@ -166,22 +193,35 @@ impl DerefMut for ManagedDisplay {
 
 pub struct Lease {
     shared: SharedDisplay,
+    cleanup_runtime: Option<tokio::runtime::Handle>,
+    cleanup_grace: std::time::Duration,
 }
 impl Drop for Lease {
     fn drop(&mut self) {
-        let generation = { self.shared.lock().unwrap().lifecycle.leave() };
-        let Some(generation) = generation else {
+        let pending = {
+            self.shared
+                .lock()
+                .unwrap()
+                .lifecycle
+                .leave_after(Instant::now(), self.cleanup_grace)
+        };
+        let Some((generation, deadline)) = pending else {
             return;
         };
         let shared = self.shared.clone();
         let coordinator = shared.lock().unwrap().coordinator.clone();
-        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+        let Some(runtime) = self
+            .cleanup_runtime
+            .clone()
+            .or_else(|| tokio::runtime::Handle::try_current().ok())
+        else {
             return;
         };
         runtime.spawn(async move {
             // Resize/reactivation briefly drops capture; preserve the display
-            // through the same grace as physical-overlay restoration.
-            tokio::time::sleep(std::time::Duration::from_millis(2500)).await;
+            // through the latest capture's grace, regardless of which lease
+            // happened to be released last. A completed lock adds no extra grace.
+            tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)).await;
             loop {
                 let state = shared.clone();
                 let result = coordinator
@@ -288,5 +328,55 @@ mod tests {
         assert!(life.leave().is_none());
         let last = life.leave().unwrap();
         assert!(life.may_release(last));
+    }
+    #[test]
+    fn lock_keepalive_blocks_old_cleanup_and_reconnect_supersedes_it() {
+        let mut life = Lifecycle::default();
+        life.enter();
+        let capture_end = life.leave().unwrap();
+        // Watcher retains the already-existing surface while the original
+        // capture's disconnect grace is pending.
+        life.enter();
+        assert!(!life.may_release(capture_end));
+        let lock_end = life.leave().unwrap();
+        assert!(life.may_release(lock_end));
+        life.enter(); // new authenticated capture beats pending cleanup
+        assert!(!life.may_release(lock_end));
+    }
+    #[test]
+    fn old_lock_keepalive_cannot_shorten_a_new_captures_grace() {
+        let start = Instant::now();
+        let grace = Duration::from_millis(2500);
+        let mut life = Lifecycle::default();
+        life.enter(); // original capture
+        let (old, _) = life.leave_after(start, grace).unwrap();
+        life.enter(); // pending lock keeps the original display alive
+        assert!(!life.may_release(old));
+        life.enter(); // a brief reconnect completes during the lock hold
+        let latest_disconnect = start + Duration::from_secs(10);
+        assert!(life.leave_after(latest_disconnect, grace).is_none());
+        let lock_cancelled = latest_disconnect + Duration::from_millis(100);
+        let (last, deadline) = life.leave_after(lock_cancelled, Duration::ZERO).unwrap();
+        assert!(life.may_release(last));
+        assert_eq!(deadline, latest_disconnect + grace);
+        assert_eq!(
+            deadline.duration_since(lock_cancelled),
+            Duration::from_millis(2400)
+        );
+        // Another reconnect invalidates this cleanup even while its timer runs.
+        life.enter();
+        assert!(!life.may_release(last));
+    }
+    #[test]
+    fn completed_lock_does_not_add_a_second_grace_period() {
+        let start = Instant::now();
+        let mut life = Lifecycle::default();
+        life.enter();
+        life.leave_after(start, Duration::from_millis(2500))
+            .unwrap();
+        life.enter();
+        let lock_finished = start + Duration::from_secs(3);
+        let (_, deadline) = life.leave_after(lock_finished, Duration::ZERO).unwrap();
+        assert_eq!(deadline, lock_finished);
     }
 }

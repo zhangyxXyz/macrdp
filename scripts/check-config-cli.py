@@ -29,7 +29,7 @@ def invoke(*args, expected=0):
 caps = invoke("--capabilities")
 assert caps["schema_version"] == 1
 assert {"config_validation", "display_state_v2"} <= set(caps["features"])
-assert {"RESOLUTION_POLICY", "LIVE_RESIZE", "VD_HIDPI", "CAPTURE_NV12"} <= set(caps["supported_config_keys"])
+assert {"RESOLUTION_POLICY", "LIVE_RESIZE", "VD_HIDPI", "CAPTURE_NV12", "AUDIO_REMOTE_ONLY"} <= set(caps["supported_config_keys"])
 
 with tempfile.TemporaryDirectory(prefix="macrdp-config-smoke-") as temporary:
     directory = Path(temporary)

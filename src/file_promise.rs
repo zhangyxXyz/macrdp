@@ -1,26 +1,15 @@
-//! Windows→Mac file clipboard download + NSPasteboard publication.
+//! Windows→Mac file clipboard preparation and NSPasteboard publication.
+//! Supported flat file copies use system File Provider dataless URLs; actual
+//! reads fetch content on demand. Unsupported batches/provider failures use
+//! complete downloads in a private temp directory before publishing URLs.
+//! Finder paste consumes file URLs, not the drag-only NSFilePromiseReceiver.
+//! File items carry concrete URL strings, with read-back verification before
+//! success is reported. Never substitute a plain-text pathname for a file.
 //!
-//! Originally tried via `NSFilePromiseProvider` so Finder could lazy-fetch
-//! on paste, but Finder's Cmd-V does NOT invoke `NSFilePromiseReceiver`
-//! (it's a drag-and-drop-only path); paste reads `NSPasteboardTypeFileURL`
-//! directly and beeps when the URL is missing. So we eagerly download the
-//! file bytes to a per-paste temp directory in `/tmp` the moment Windows
-//! announces the copy, then publish the temp paths as real file URLs on
-//! the pasteboard. Finder's paste then does a normal `cp` from /tmp to
-//! the destination.
-//!
-//! Trade-offs vs. the promise approach:
-//! - Network + disk happen eagerly even if the user never pastes. Cost is
-//!   bounded by the cap in `clipboard.rs::MAX_INCOMING_PAYLOAD` analog
-//!   (we don't enforce one yet — Phase 3 should add it).
-//! - Finder paste is instantaneous once the temp file exists.
-//! - Temp files outlive the paste; we clean them up on the next remote
-//!   copy and on process exit. Stale files in `/tmp` are fine until then.
-//!
-//! Threading: download tasks run on the tokio runtime captured at
-//! `on_remote_file_list` time. The `cocoa` helper in this module writes
-//! to NSPasteboard from whichever thread the calling task is on —
-//! NSPasteboard's API is documented thread-safe.
+//! Work runs on the captured tokio runtime. Every pasteboard access is serialized
+//! with clipboard::pasteboard_guard; copy tickets protect newer local/remote
+//! contents from late completions. Complete fallback files are cleaned on the
+//! next remote copy/disconnect, with dead-process staging reaped at startup.
 
 #![cfg(target_os = "macos")]
 
@@ -572,24 +561,31 @@ pub fn publish_file_urls(
     if paths.is_empty() {
         return false;
     }
-    let urls: Vec<Retained<NSURL>> = paths
-        .iter()
-        .filter_map(|p| {
-            let s = p.to_str()?;
-            let ns = NSString::from_str(s);
-            unsafe { NSURL::fileURLWithPath(&ns) }.into()
-        })
-        .collect();
-    if urls.is_empty() {
-        return false;
+    use objc2_app_kit::{NSPasteboardItem, NSPasteboardTypeFileURL};
+    // Supply concrete file-URL data, rather than delegating serialization to
+    // NSURL's pasteboard writer. A successful writeObjects alone is not proof
+    // of usable contents (observed: true + unchanged CC, but zero file items).
+    // No plain-text filename fallback: Finder would paste a text clipping.
+    let mut writers: Vec<Retained<ProtocolObject<dyn objc2_app_kit::NSPasteboardWriting>>> =
+        Vec::new();
+    let mut expected = Vec::new();
+    for path in paths {
+        let Some(path) = path.to_str() else {
+            return false;
+        };
+        unsafe {
+            let url = NSURL::fileURLWithPath(&NSString::from_str(path));
+            let Some(value) = url.absoluteString() else {
+                return false;
+            };
+            let item = NSPasteboardItem::new();
+            if !item.setString_forType(&value, NSPasteboardTypeFileURL) {
+                return false;
+            }
+            expected.push(value);
+            writers.push(ProtocolObject::from_retained(item));
+        }
     }
-    // NSPasteboard.writeObjects takes NSArray<NSPasteboardWriting>; NSURL
-    // conforms to NSPasteboardWriting (under the `NSPasteboard` feature
-    // we already enable).
-    let writers: Vec<Retained<ProtocolObject<dyn objc2_app_kit::NSPasteboardWriting>>> = urls
-        .into_iter()
-        .map(ProtocolObject::from_retained)
-        .collect();
     let array = NSArray::from_vec(writers);
     // Serialize against the advertise poller + every other pasteboard toucher
     // (NSPasteboard is not thread-safe). The changeCount read stays inside the
@@ -606,6 +602,23 @@ pub fn publish_file_urls(
         }
         let cc = pb.changeCount() as i64;
         self_change_count.store(cc, Ordering::Relaxed);
+        let valid = pb.pasteboardItems().is_some_and(|items| {
+            items.len() == expected.len()
+                && expected.iter().enumerate().all(|(index, url)| {
+                    items
+                        .objectAtIndex(index)
+                        .stringForType(NSPasteboardTypeFileURL)
+                        .is_some_and(|actual| actual.isEqualToString(url))
+                })
+        });
+        if !valid {
+            warn!(
+                files = paths.len(),
+                change_count = cc,
+                "file clipboard publication failed read-back verification"
+            );
+            return false;
+        }
         cc
     };
     // Tell the Mac-side poller "we just wrote these; ignore the next
@@ -992,6 +1005,48 @@ mod tests {
             std::fs::remove_dir_all(dir).unwrap();
         }
     }
+    #[test]
+    fn file_publication_exposes_urls_without_text_and_rejects_local_copy_races() {
+        use objc2_app_kit::{NSPasteboardTypeFileURL, NSPasteboardTypeString};
+        let dir = make_temp_dir().unwrap();
+        let paths = vec![dir.join("测试 file #1.txt"), dir.join("second.txt")];
+        for path in &paths {
+            std::fs::write(path, b"fixture").unwrap();
+        }
+        let mark = Arc::new(AtomicI64::new(-1));
+        let cc = {
+            let _guard = crate::clipboard::pasteboard_guard();
+            unsafe { crate::clipboard::pasteboard().changeCount() as i64 }
+        };
+        let ticket = crate::clipboard_image::CopyTicket::new(
+            Arc::new(std::sync::atomic::AtomicU64::new(1)),
+            cc,
+        );
+        assert!(publish_file_urls(&paths, &mark, &ticket));
+        {
+            let _guard = crate::clipboard::pasteboard_guard();
+            unsafe {
+                let pb = crate::clipboard::pasteboard();
+                let items = pb.pasteboardItems().expect("published file items");
+                assert_eq!(items.len(), paths.len());
+                for (index, path) in paths.iter().enumerate() {
+                    let item = items.objectAtIndex(index);
+                    let value = item
+                        .stringForType(NSPasteboardTypeFileURL)
+                        .expect("every file must expose a URL");
+                    let url = NSURL::URLWithString(&value).unwrap();
+                    assert_eq!(url.path().unwrap().to_string(), path.to_str().unwrap());
+                    assert!(item.stringForType(NSPasteboardTypeString).is_none());
+                }
+                assert_eq!(mark.load(Ordering::Relaxed), pb.changeCount() as i64);
+                pb.clearContents();
+                pb.setString_forType(&NSString::from_str("local copy"), NSPasteboardTypeString);
+            }
+        }
+        assert!(!publish_file_urls(&paths, &mark, &ticket));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     #[test]
     fn ready_image_publication_includes_real_file_and_rejects_local_copy_races() {
         use image::ImageEncoder;

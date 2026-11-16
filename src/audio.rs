@@ -32,8 +32,83 @@ const SAMPLE_RATE: u32 = 44100;
 const CHANNELS: u16 = 2;
 const BITS_PER_SAMPLE: u16 = 16;
 
+static SHUTTING_DOWN: AtomicBool = AtomicBool::new(false);
+/// Retire capture before slow physical-display shutdown. Private tap teardown
+/// normally follows on the next 250ms tick; process exit also releases its HAL objects.
+pub fn shutdown() {
+    SHUTTING_DOWN.store(true, Ordering::SeqCst);
+}
+#[cfg(target_os = "macos")]
+fn capture_is_current(generation: &AtomicU64, mine: u64) -> bool {
+    !SHUTTING_DOWN.load(Ordering::SeqCst) && generation.load(Ordering::SeqCst) == mine
+}
+
+/// First-use failure can be a TCC denial and must not trigger another prompt.
+/// After capture has started, route changes may temporarily make HAL unavailable.
+/// Limit reopen retries (250/500/1000/2000/4000ms), replenishing the budget only
+/// after receiving samples, not merely after another successful open.
+#[cfg(any(target_os = "macos", test))]
+#[derive(Default)]
+struct TapRecovery {
+    started: bool,
+    reopen_failures: u32,
+}
+#[cfg(any(target_os = "macos", test))]
+impl TapRecovery {
+    fn opened(&mut self) {
+        self.started = true;
+    }
+    fn received_samples(&mut self) {
+        self.reopen_failures = 0;
+    }
+    fn retry_after_open_error(&mut self) -> Option<u64> {
+        if !self.started {
+            return None;
+        }
+        self.reopen_failures = self.reopen_failures.saturating_add(1);
+        (self.reopen_failures <= 5).then(|| 250 << (self.reopen_failures - 1))
+    }
+}
+
 type Sender = Arc<Mutex<Option<mpsc::UnboundedSender<ServerEvent>>>>;
 type AudioSender = Arc<Mutex<Option<mpsc::Sender<AudioWave>>>>;
+
+// Session-scoped diagnostics; never infer audible playback from capture start.
+#[derive(Default)]
+struct AudioStatus {
+    generation: u64,
+    phase: &'static str,
+    remote_only: Option<bool>,
+    last_error: Option<String>,
+    peak: Option<f32>,
+}
+fn audio_status() -> &'static Mutex<AudioStatus> {
+    static STATUS: std::sync::OnceLock<Mutex<AudioStatus>> = std::sync::OnceLock::new();
+    STATUS.get_or_init(|| Mutex::new(AudioStatus::default()))
+}
+pub fn status() -> serde_json::Value {
+    let s = audio_status().lock().unwrap_or_else(|e| e.into_inner());
+    serde_json::json!({"phase": if s.phase.is_empty() { "idle" } else { s.phase },
+        "remote_only": s.remote_only, "last_error": s.last_error,
+        "source_peak_last_window": s.peak})
+}
+fn update_status(generation: u64, update: impl FnOnce(&mut AudioStatus)) {
+    let mut s = audio_status().lock().unwrap_or_else(|e| e.into_inner());
+    if s.generation == generation {
+        update(&mut s);
+    }
+}
+struct StatusGuard(u64);
+impl Drop for StatusGuard {
+    fn drop(&mut self) {
+        update_status(self.0, |s| {
+            if s.phase != "failed" {
+                s.phase = "idle";
+                s.peak = None;
+            }
+        });
+    }
+}
 
 #[derive(Debug)]
 pub struct MacRdpsnd {
@@ -63,6 +138,7 @@ pub struct MacRdpsnd {
     /// the client's audio renderer drains naturally. Pass
     /// `--no-mute-on-minimize` on the CLI to flip this off.
     mute_on_minimize: bool,
+    remote_only: bool,
     /// When true (`--enable-aac`), advertise AAC-LC ahead of PCM so clients
     /// that decode it negotiate compressed audio (~11x smaller than PCM).
     /// PCM stays in the list as the automatic fallback.
@@ -84,6 +160,7 @@ impl MacRdpsnd {
     pub fn new(
         display_suppressed: Option<Arc<AtomicBool>>,
         mute_on_minimize: bool,
+        remote_only: bool,
         enable_aac: bool,
         aac_bitrate: u32,
         target_display_id: Option<u32>,
@@ -94,6 +171,7 @@ impl MacRdpsnd {
             generation: Arc::new(AtomicU64::new(0)),
             display_suppressed,
             mute_on_minimize,
+            remote_only,
             enable_aac,
             aac_bitrate,
             target_display_id,
@@ -121,6 +199,7 @@ impl SoundServerFactory for MacRdpsnd {
             formats,
             display_suppressed: self.display_suppressed.clone(),
             mute_on_minimize: self.mute_on_minimize,
+            remote_only: self.remote_only,
             aac_bitrate: self.aac_bitrate,
             target_display_id: self.target_display_id,
         })
@@ -189,6 +268,7 @@ struct MacRdpsndBackend {
     display_suppressed: Option<Arc<AtomicBool>>,
     /// Default-on opt-out via `--no-mute-on-minimize`.
     mute_on_minimize: bool,
+    remote_only: bool,
     /// Target AAC bitrate (bits/sec); only consulted when the negotiated
     /// format is `WAVE_FORMAT_AAC_MS`.
     aac_bitrate: u32,
@@ -222,6 +302,9 @@ impl RdpsndServerHandler for MacRdpsndBackend {
     }
 
     fn start(&mut self, format: &NegotiatedFormat) -> Result<(), Box<dyn RdpsndError>> {
+        if SHUTTING_DOWN.load(Ordering::SeqCst) {
+            return Ok(());
+        }
         // `format` is the one `choose_format` just returned; the crate stamps its
         // wFormatNo onto every wave, so we only need to know whether to encode AAC or
         // ship PCM.
@@ -235,6 +318,12 @@ impl RdpsndServerHandler for MacRdpsndBackend {
         // connection sees the bump on its next iteration and exits, so it
         // never feeds the shared event channel alongside this one.
         self.my_gen = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
+        *audio_status().lock().unwrap_or_else(|e| e.into_inner()) = AudioStatus {
+            generation: self.my_gen,
+            phase: "starting",
+            remote_only: Some(self.remote_only),
+            ..AudioStatus::default()
+        };
 
         let sender = self.sender.clone();
         let audio_sender = self.audio_sender.clone();
@@ -242,6 +331,7 @@ impl RdpsndServerHandler for MacRdpsndBackend {
         let my_gen = self.my_gen;
         let display_suppressed = self.display_suppressed.clone();
         let mute_on_minimize = self.mute_on_minimize;
+        let remote_only = self.remote_only;
         let aac_bitrate = self.aac_bitrate;
         // A virtual display may exist before SCK can enumerate it. Resolve
         // READY in capture_loop instead of capturing its provisional ID here.
@@ -257,6 +347,7 @@ impl RdpsndServerHandler for MacRdpsndBackend {
         std::thread::Builder::new()
             .name(format!("macrdp-audio-{my_gen}"))
             .spawn(move || {
+                let _status = StatusGuard(my_gen);
                 #[cfg(target_os = "macos")]
                 boost_audio_qos();
                 let rt = match tokio::runtime::Builder::new_current_thread()
@@ -265,6 +356,10 @@ impl RdpsndServerHandler for MacRdpsndBackend {
                 {
                     Ok(rt) => rt,
                     Err(e) => {
+                        update_status(my_gen, |s| {
+                            s.phase = "failed";
+                            s.last_error = Some(e.to_string());
+                        });
                         warn!("audio: failed to build dedicated runtime: {e}");
                         return;
                     }
@@ -277,12 +372,17 @@ impl RdpsndServerHandler for MacRdpsndBackend {
                         my_gen,
                         display_suppressed,
                         mute_on_minimize,
+                        remote_only,
                         use_aac,
                         aac_bitrate,
                         target_display_id,
                     )
                     .await
                     {
+                        update_status(my_gen, |s| {
+                            s.phase = "failed";
+                            s.last_error = Some(e.to_string());
+                        });
                         warn!("audio capture loop ended: {e}");
                     }
                 });
@@ -292,6 +392,9 @@ impl RdpsndServerHandler for MacRdpsndBackend {
     }
 
     fn stop(&mut self) {
+        if self.my_gen == 0 {
+            return;
+        }
         // Retire our capture loop, but only if it is still the active one — a
         // newer connection may have already superseded us.
         let _ = self.generation.compare_exchange(
@@ -300,6 +403,12 @@ impl RdpsndServerHandler for MacRdpsndBackend {
             Ordering::SeqCst,
             Ordering::SeqCst,
         );
+    }
+}
+
+impl Drop for MacRdpsndBackend {
+    fn drop(&mut self) {
+        self.stop();
     }
 }
 
@@ -322,6 +431,53 @@ fn boost_audio_qos() {
 }
 
 #[cfg(target_os = "macos")]
+enum CaptureStream {
+    Screen(screencapturekit::async_api::AsyncSCStream, bool),
+    Tap(crate::audio_tap::Tap),
+}
+#[cfg(target_os = "macos")]
+impl CaptureStream {
+    async fn next(&mut self) -> anyhow::Result<Option<(Vec<f32>, Vec<f32>)>> {
+        match self {
+            Self::Tap(tap) => tap.next().await.map(Some),
+            Self::Screen(stream, logged) => loop {
+                let Some(sample) = stream.next().await else {
+                    return Ok(None);
+                };
+                if !*logged {
+                    *logged = true;
+                    if let Some(fd) = sample.format_description() {
+                        let rate = fd.audio_sample_rate().unwrap_or(0.0);
+                        let channels = fd.audio_channel_count().unwrap_or(0);
+                        info!(rate, channels, "SCK audio format");
+                        if rate != 0.0 && (rate - f64::from(SCK_SAMPLE_RATE)).abs() > 1.0 {
+                            warn!(
+                                rate,
+                                "SCK delivered rate differs from the requested 48 kHz input"
+                            );
+                        }
+                    }
+                }
+                if let Some(list) = sample.audio_buffer_list() {
+                    return Ok(Some(float_list_to_planar_f32_stereo(&list)));
+                }
+            },
+        }
+    }
+    fn stop_capture(&self) {
+        if let Self::Screen(stream, _) = self {
+            let _ = stream.stop_capture();
+        }
+    }
+}
+#[cfg(target_os = "macos")]
+impl Drop for CaptureStream {
+    fn drop(&mut self) {
+        self.stop_capture();
+    }
+}
+
+#[cfg(target_os = "macos")]
 #[allow(clippy::too_many_arguments)]
 async fn capture_loop(
     sender: Sender,
@@ -330,6 +486,7 @@ async fn capture_loop(
     my_gen: u64,
     display_suppressed: Option<Arc<AtomicBool>>,
     mute_on_minimize: bool,
+    remote_only: bool,
     use_aac: bool,
     aac_bitrate: u32,
     target_display_id: Option<u32>,
@@ -339,68 +496,61 @@ async fn capture_loop(
     use screencapturekit::async_api::{AsyncSCShareableContent, AsyncSCStream};
     use screencapturekit::prelude::{SCContentFilter, SCStreamConfiguration, SCStreamOutputType};
 
-    let target_display_id = crate::display_session::audio_display(target_display_id, || {
-        generation.load(Ordering::Acquire) == my_gen
-    })
-    .await?;
-    if generation.load(Ordering::Acquire) != my_gen {
-        return Ok(());
-    }
-    let content = AsyncSCShareableContent::get()
-        .await
-        .map_err(|e| anyhow!("SCShareableContent for audio: {e:?}"))?;
-    let displays = content.displays();
-    // Bind to the SAME display the video path captures. With --detach-primary /
-    // --capture-primary the physical primary is disabled/captured once a client
-    // connects, so binding the audio stream to it (the old `displays.first()`)
-    // killed the stream's content source — audio cut out, or the restart loop
-    // thrashed it in and out. The virtual display survives both, so follow it.
-    // Falls back to the first display if the id isn't enumerated (transient).
-    let display = match target_display_id {
-        Some(id) => displays
-            .iter()
-            .find(|d| d.display_id() == id)
-            .or_else(|| {
-                warn!(
-                    target_id = id,
-                    "audio: no SCK display with that id; using the first display"
-                );
-                displays.first()
-            })
-            .context("no displays for audio capture")?,
-        None => displays.first().context("no displays for audio capture")?,
+    let screen_setup = if !remote_only {
+        let target_display_id = crate::display_session::audio_display(target_display_id, || {
+            capture_is_current(&generation, my_gen)
+        })
+        .await?;
+        let content = AsyncSCShareableContent::get()
+            .await
+            .map_err(|e| anyhow!("SCShareableContent for audio: {e:?}"))?;
+        let displays = content.displays();
+        // Bind to the SAME display the video path captures. With --detach-primary /
+        // --capture-primary the physical primary is disabled/captured once a client
+        // connects, so binding the audio stream to it (the old `displays.first()`)
+        // killed the stream's content source — audio cut out, or the restart loop
+        // thrashed it in and out. The virtual display survives both, so follow it.
+        // Falls back to the first display if the id isn't enumerated (transient).
+        let display = match target_display_id {
+            Some(id) => displays
+                .iter()
+                .find(|d| d.display_id() == id)
+                .or_else(|| {
+                    warn!(
+                        target_id = id,
+                        "audio: no SCK display with that id; using the first display"
+                    );
+                    displays.first()
+                })
+                .context("no displays for audio capture")?,
+            None => displays.first().context("no displays for audio capture")?,
+        };
+        let bound_display_id = display.display_id();
+        tracing::debug!(
+            bound_display_id,
+            requested = ?target_display_id,
+            "audio: SCStream content filter bound to display"
+        );
+
+        let filter = SCContentFilter::create()
+            .with_display(display)
+            .with_excluding_windows(&[])
+            .build();
+
+        let config = SCStreamConfiguration::new()
+            .with_captures_audio(true)
+            .with_sample_rate(SCK_SAMPLE_RATE as i32)
+            .with_channel_count(CHANNELS as i32);
+
+        Some((filter, config))
+    } else {
+        None
     };
-    let bound_display_id = display.display_id();
-    tracing::debug!(
-        bound_display_id,
-        requested = ?target_display_id,
-        "audio: SCStream content filter bound to display"
-    );
-
-    let filter = SCContentFilter::create()
-        .with_display(display)
-        .with_excluding_windows(&[])
-        .build();
-
-    let config = SCStreamConfiguration::new()
-        .with_captures_audio(true)
-        .with_sample_rate(SCK_SAMPLE_RATE as i32)
-        .with_channel_count(CHANNELS as i32);
-
-    // SCK only delivers 8/16/24/48 kHz. We capture at 48 and resample to the
-    // advertised SAMPLE_RATE (44.1 kHz) so the client plays at its native rate
-    // without internal resampling. Chunk size matches a typical SCK audio
+    // SCK captures at 48 kHz; the optional tap reports its actual input rate.
+    // Both resample to the negotiated SAMPLE_RATE (44.1 kHz). Chunk size matches a typical SCK audio
     // buffer (~21 ms at 48 kHz) — input is buffered until we have a full
     // chunk, then fed to the resampler.
     const RESAMPLE_CHUNK: usize = 1024;
-    let mut resampler = rubato::FftFixedIn::<f32>::new(
-        SCK_SAMPLE_RATE as usize,
-        SAMPLE_RATE as usize,
-        RESAMPLE_CHUNK,
-        1,
-        CHANNELS as usize,
-    )
-    .map_err(|e| anyhow!("rubato resampler init: {e}"))?;
     let mut input_buf: [Vec<f32>; 2] = [
         Vec::with_capacity(RESAMPLE_CHUNK * 2),
         Vec::with_capacity(RESAMPLE_CHUNK * 2),
@@ -450,16 +600,13 @@ async fn capture_loop(
     const RESTART_BACKOFF_BASE_MS: u64 = 250;
     const RESTART_BACKOFF_MAX_MS: u64 = 5000;
     let mut consecutive_failures: u32 = 0;
+    let mut tap_recovery = TapRecovery::default();
     // Capped exponential backoff for capture (re)start failures (250ms→5s).
     let backoff_ms = |failures: u32| {
         RESTART_BACKOFF_MAX_MS.min(RESTART_BACKOFF_BASE_MS << failures.saturating_sub(1).min(5))
     };
 
     let start_instant = std::time::Instant::now();
-    // Set false at the top of every (re)connect so SCK's delivered format is
-    // re-logged after a restart; the first read is always dominated by that
-    // assignment.
-    let mut format_logged: bool;
 
     // Per-reader debounce for the mute-on-minimize gate (mirrors
     // `capture.rs`'s `suppressed_since`). `None` while the shared
@@ -471,22 +618,13 @@ async fn capture_loop(
     const SUPPRESS_DEBOUNCE: std::time::Duration = std::time::Duration::from_secs(1);
     let mut suppressed_since: Option<std::time::Instant> = None;
 
-    // SCK delivery-rate measurement. The vendor server's audio-lag model
-    // assumes one Wave = `WAVE_MS = 1024/48 = 21.33 ms` of real audio,
-    // which is only true if SCK actually delivers at 48 kHz. Some
-    // configurations (system audio rate ≠ requested capture rate) cause
-    // SCK to deliver samples at a different effective rate while still
-    // *reporting* 48 kHz in the format description, which manifests as
-    // a steady-state audio-shipped-vs-wall-clock deficit that the resync
-    // mechanism papers over every few seconds. Logging measured arrival
-    // rate over a wall-clock window tells us empirically whether that's
-    // the bug. Enable with `RUST_LOG=macrdp::audio=debug`.
+    // Capture diagnostics do not prove client audibility; peak distinguishes
+    // actual signal from a healthy-looking stream of zero samples.
     let mut samples_received: u64 = 0;
+    let mut source_peak = 0.0_f32;
     let mut last_rate_log = std::time::Instant::now();
     // Output-side counters. If output samples don't match 44.1 kHz × elapsed
     // (after warm-up), the resampler is producing less audio than it should.
-    // If output samples match but wave count is below 46.875/sec, average
-    // wave size is bigger than the server's hardcoded WAVE_MS expects.
     let mut output_samples: u64 = 0;
     let mut waves_emitted: u64 = 0;
     // Encoded bytes actually shipped per window. Logged as `wire_kbps` so the
@@ -496,7 +634,7 @@ async fn capture_loop(
     let mut bytes_emitted: u64 = 0;
 
     'reconnect: loop {
-        if generation.load(Ordering::SeqCst) != my_gen {
+        if !capture_is_current(&generation, my_gen) {
             debug!(my_gen, "audio capture loop superseded; exiting");
             break 'reconnect;
         }
@@ -504,31 +642,86 @@ async fn capture_loop(
         // (Re)build the audio SCStream. On a start_capture error, back off and
         // retry rather than ending the loop — a transient failure mid-session
         // must not silence the rest of the connection.
-        let stream = AsyncSCStream::new(&filter, &config, 2, SCStreamOutputType::Audio);
-        if let Err(e) = stream.start_capture() {
-            consecutive_failures = consecutive_failures.saturating_add(1);
-            let backoff = backoff_ms(consecutive_failures);
-            warn!(
-                attempt = consecutive_failures,
-                backoff_ms = backoff,
-                "audio start_capture failed; retrying: {e:?}"
-            );
-            tokio::time::sleep(std::time::Duration::from_millis(backoff)).await;
-            continue 'reconnect;
+        let opened = if remote_only {
+            crate::audio_tap::Tap::open().map(|tap| {
+                let rate = tap.rate as usize;
+                (CaptureStream::Tap(tap), rate)
+            })
+        } else {
+            let (filter, config) = screen_setup.as_ref().expect("SCK configuration");
+            let stream = AsyncSCStream::new(filter, config, 2, SCStreamOutputType::Audio);
+            stream
+                .start_capture()
+                .map(|()| {
+                    (
+                        CaptureStream::Screen(stream, false),
+                        SCK_SAMPLE_RATE as usize,
+                    )
+                })
+                .map_err(|e| anyhow!("ScreenCaptureKit start_capture: {e:?}"))
+        };
+        let (mut stream, input_rate) = match opened {
+            Ok(opened) => {
+                if remote_only {
+                    tap_recovery.opened();
+                }
+                opened
+            }
+            Err(e) => {
+                consecutive_failures = consecutive_failures.saturating_add(1);
+                let backoff = if remote_only {
+                    // No repeated first-use permission prompt, no audible SCK
+                    // fallback, and no permanent silence on the first transient
+                    // HAL error during an already-running session's route change.
+                    let Some(delay) = tap_recovery.retry_after_open_error() else {
+                        return Err(e);
+                    };
+                    delay
+                } else {
+                    backoff_ms(consecutive_failures)
+                };
+                update_status(my_gen, |s| {
+                    s.phase = "recovering";
+                    s.last_error = Some(e.to_string());
+                    s.peak = None;
+                });
+                warn!(
+                    attempt = consecutive_failures,
+                    backoff_ms = backoff,
+                    "audio capture start failed; retrying: {e}"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(backoff)).await;
+                continue 'reconnect;
+            }
+        };
+        if !capture_is_current(&generation, my_gen) {
+            break 'reconnect;
         }
+        let mut resampler = rubato::FftFixedIn::<f32>::new(
+            input_rate,
+            SAMPLE_RATE as usize,
+            RESAMPLE_CHUNK,
+            1,
+            CHANNELS as usize,
+        )
+        .map_err(|e| anyhow!("rubato resampler init: {e}"))?;
         debug!(my_gen, "audio capture started");
         // A fresh format line per (re)start doubles as a "stream healthy again"
         // marker in the log.
-        format_logged = false;
+        info!(input_rate, remote_only, "audio capture source ready");
+        update_status(my_gen, |s| {
+            s.phase = "capturing";
+            s.last_error = None;
+        });
         // Drop any partial pre-gap chunk so we don't stitch samples across the
         // restart discontinuity.
         input_buf[0].clear();
         input_buf[1].clear();
 
         loop {
-            if generation.load(Ordering::SeqCst) != my_gen {
+            if !capture_is_current(&generation, my_gen) {
                 debug!(my_gen, "audio capture loop superseded; exiting");
-                let _ = stream.stop_capture();
+                stream.stop_capture();
                 break 'reconnect;
             }
             // Manual A/V resync hotkey (Ctrl+Alt+Shift+R, set in input.rs via
@@ -538,7 +731,7 @@ async fn capture_loop(
             // minimize→unminimize achieves. This is a deliberate resync, not a
             // failure, so reset the backoff and rebuild immediately.
             if crate::RESYNC_AUDIO.swap(false, Ordering::Relaxed) {
-                let _ = stream.stop_capture();
+                stream.stop_capture();
                 consecutive_failures = 0;
                 info!(
                     my_gen,
@@ -546,56 +739,38 @@ async fn capture_loop(
                 );
                 continue 'reconnect;
             }
-            let Some(sample) = stream.next().await else {
-                // SCK stopped delivering. Stop, back off, and rebuild rather
-                // than ending the loop (which would silence audio for the rest
-                // of the session).
-                let _ = stream.stop_capture();
-                consecutive_failures = consecutive_failures.saturating_add(1);
-                let backoff = backoff_ms(consecutive_failures);
-                warn!(
-                    attempt = consecutive_failures,
-                    backoff_ms = backoff,
-                    "audio SCK stream ended; restarting capture"
-                );
-                tokio::time::sleep(std::time::Duration::from_millis(backoff)).await;
-                continue 'reconnect;
-            };
-            // Delivered a sample → the stream is healthy; reset the backoff.
-            consecutive_failures = 0;
-
-            // Log the format SCK actually delivers, once per session. SCK does not
-            // always honor the requested rate/channels; a mismatch against the
-            // advertised RDPSND format makes the client play at the wrong frame
-            // rate — audible as drift and lowered pitch.
-            if !format_logged {
-                format_logged = true;
-                if let Some(fd) = sample.format_description() {
-                    let rate = fd.audio_sample_rate().unwrap_or(0.0);
-                    let channels = fd.audio_channel_count().unwrap_or(0);
-                    info!(rate, channels, "SCK audio format");
-                    if rate != 0.0 && (rate - f64::from(SCK_SAMPLE_RATE)).abs() > 1.0 {
-                        warn!(
-                            delivered = rate,
-                            requested = SCK_SAMPLE_RATE,
-                            "SCK audio rate differs from what we requested; \
-                         the 48->44.1 resampler assumes 48 kHz input"
-                        );
+            // Both sources dequeue only on Ready. Silence is not an error;
+            // the tick still observes disconnect and the resync hotkey.
+            let sample =
+                match tokio::time::timeout(std::time::Duration::from_millis(250), stream.next())
+                    .await
+                {
+                    Err(_) => continue,
+                    Ok(Ok(Some(sample))) => sample,
+                    ended => {
+                        warn!(?ended, "audio source ended; rebuilding capture");
+                        stream.stop_capture();
+                        drop(stream); // Release local muting BEFORE any backoff.
+                        consecutive_failures = consecutive_failures.saturating_add(1);
+                        tokio::time::sleep(std::time::Duration::from_millis(backoff_ms(
+                            consecutive_failures,
+                        )))
+                        .await;
+                        continue 'reconnect;
                     }
-                }
+                };
+            if !capture_is_current(&generation, my_gen) {
+                break 'reconnect;
             }
-
-            let Some(list) = sample.audio_buffer_list() else {
-                continue;
-            };
-
-            // SCK delivers float32 PCM as planar (one buffer per channel) or a
-            // single interleaved buffer. Normalize to planar stereo f32 at the
-            // SCK rate, accumulate into the resampler input buffer, then emit
-            // resampled chunks as interleaved 16-bit stereo at SAMPLE_RATE.
-            let (in_left, in_right) = float_list_to_planar_f32_stereo(&list);
-            if in_left.is_empty() {
-                continue;
+            consecutive_failures = 0;
+            let (in_left, in_right) = sample;
+            if remote_only && !in_left.is_empty() {
+                tap_recovery.received_samples();
+            }
+            for value in in_left.iter().chain(&in_right) {
+                if value.is_finite() {
+                    source_peak = source_peak.max(value.abs());
+                }
             }
             input_buf[0].extend_from_slice(&in_left);
             input_buf[1].extend_from_slice(&in_right);
@@ -608,33 +783,29 @@ async fn capture_loop(
                 let measured_in = samples_received as f64 / elapsed;
                 let measured_out = output_samples as f64 / elapsed;
                 let measured_waves = waves_emitted as f64 / elapsed;
-                let expected_in = f64::from(SCK_SAMPLE_RATE);
+                let expected_in = input_rate as f64;
                 let expected_out = f64::from(SAMPLE_RATE);
-                // PCM emits one wave per resampled chunk (RESAMPLE_CHUNK input
-                // samples at the SCK rate → ~46.875/s). AAC emits one wave per
-                // 1024-frame access unit at the *output* rate → ~43.07/s. Pick the
-                // right baseline so `waves_per_sec` vs `waves_expected` is a real
-                // health check for the active codec, not always the PCM number.
-                let expected_waves = if use_aac {
-                    expected_out / crate::aac::FRAMES_PER_PACKET as f64
-                } else {
-                    expected_in / RESAMPLE_CHUNK as f64
-                };
                 let avg_wave_samples = if waves_emitted > 0 {
                     output_samples as f64 / waves_emitted as f64
                 } else {
                     0.0
                 };
-                // Server's vendored audio-lag model assumes each wave is exactly
-                // 1024/48 = 21.33 ms. If avg_wave_samples / SAMPLE_RATE * 1000
-                // differs from that, the model drifts.
                 let avg_wave_ms = if waves_emitted > 0 {
                     avg_wave_samples / f64::from(SAMPLE_RATE) * 1000.0
                 } else {
                     0.0
                 };
+                // FFT resampling may emit empty chunks; count actual nonempty
+                // waves instead of assuming one wave per input callback.
+                let expected_waves = if avg_wave_samples > 0.0 {
+                    expected_out / avg_wave_samples
+                } else {
+                    0.0
+                };
                 let wire_kbps = bytes_emitted as f64 * 8.0 / elapsed / 1000.0;
+                update_status(my_gen, |s| s.peak = Some(source_peak));
                 debug!(
+                    source_peak,
                     in_rate = measured_in,
                     in_expected = expected_in,
                     out_rate = measured_out,
@@ -645,9 +816,9 @@ async fn capture_loop(
                     avg_wave_ms,
                     wire_kbps,
                     codec = if use_aac { "aac" } else { "pcm" },
-                    model_wave_ms = 1024.0 / 48.0,
                     "audio capture rates"
                 );
+                source_peak = 0.0;
                 samples_received = 0;
                 output_samples = 0;
                 waves_emitted = 0;
@@ -728,6 +899,9 @@ async fn capture_loop(
                 };
 
                 for (data, duration_ms) in waves {
+                    if !capture_is_current(&generation, my_gen) {
+                        break 'reconnect;
+                    }
                     waves_emitted += 1;
                     bytes_emitted += data.len() as u64;
                     let ts_ms = start_instant.elapsed().as_millis() as u32;
@@ -788,6 +962,7 @@ async fn capture_loop(
     _my_gen: u64,
     _display_suppressed: Option<Arc<AtomicBool>>,
     _mute_on_minimize: bool,
+    _remote_only: bool,
     _use_aac: bool,
     _aac_bitrate: u32,
     _target_display_id: Option<u32>,
@@ -899,5 +1074,73 @@ mod tests {
         let pcm_only = server_audio_formats(false, 128_000);
         assert_eq!(pcm_only.len(), 1);
         assert_eq!(pcm_only[0].format, WaveFormat::PCM);
+    }
+    #[test]
+    fn stale_backend_stop_does_not_retire_new_session() {
+        let factory = MacRdpsnd::new(None, true, false, false, 128_000, None);
+        let mut backend = MacRdpsndBackend {
+            sender: factory.sender.clone(),
+            audio_sender: factory.audio_sender.clone(),
+            generation: factory.generation.clone(),
+            my_gen: 1,
+            formats: server_audio_formats(false, 128_000),
+            display_suppressed: None,
+            mute_on_minimize: true,
+            remote_only: false,
+            aac_bitrate: 128_000,
+            target_display_id: None,
+        };
+        factory.generation.store(2, Ordering::SeqCst);
+        backend.stop();
+        assert_eq!(factory.generation.load(Ordering::SeqCst), 2);
+        backend.my_gen = 2;
+        drop(backend);
+        assert_eq!(factory.generation.load(Ordering::SeqCst), 3);
+        drop(factory.build_backend()); // An unstarted backend must be harmless.
+        assert_eq!(factory.generation.load(Ordering::SeqCst), 3);
+    }
+
+    #[test]
+    fn initial_tap_permission_failure_is_never_retried() {
+        let mut recovery = TapRecovery::default();
+        assert_eq!(recovery.retry_after_open_error(), None);
+        assert_eq!(recovery.retry_after_open_error(), None);
+    }
+
+    #[test]
+    fn temporary_route_failure_retries_but_successful_open_alone_cannot_extend_budget() {
+        let mut recovery = TapRecovery::default();
+        recovery.opened();
+        recovery.received_samples();
+        for expected_delay in [250, 500, 1000, 2000, 4000] {
+            assert_eq!(recovery.retry_after_open_error(), Some(expected_delay));
+            // A new tap may open but fail before producing any samples.
+            recovery.opened();
+        }
+        assert_eq!(recovery.retry_after_open_error(), None);
+        assert_eq!(recovery.retry_after_open_error(), None);
+        recovery.received_samples();
+        // Once recovery is actually working, a later device switch gets its
+        // own bounded budget rather than inheriting the earlier outage.
+        assert_eq!(recovery.retry_after_open_error(), Some(250));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn tap_rates_resample_to_the_negotiated_pcm_rate() {
+        use rubato::Resampler;
+        for rate in [44100, 48000, 96000, 192000] {
+            let mut resampler = rubato::FftFixedIn::<f32>::new(rate, 44100, 1024, 1, 2).unwrap();
+            let mut total = 0;
+            for _ in 0..100 {
+                let output = resampler
+                    .process(&[vec![0.25; 1024], vec![-0.25; 1024]], None)
+                    .unwrap();
+                assert_eq!(output[0].len(), output[1].len());
+                total += output[0].len();
+            }
+            let expected = 102400.0 * 44100.0 / rate as f64;
+            assert!((total as f64 - expected).abs() < 2048.0);
+        }
     }
 }

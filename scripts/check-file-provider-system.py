@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Opt-in OS dataless/same-domain reconnect checks with synthetic bytes, not mstsc."""
+import time,stat
 import argparse,base64,hashlib,hmac,json,os,secrets,subprocess,threading,uuid
 from http.server import BaseHTTPRequestHandler,ThreadingHTTPServer
 from pathlib import Path
@@ -42,9 +43,30 @@ def main(app,root):
         assert ranges==0;checks.append('same-domain flat multi-file metadata is genuinely dataless, zero content requests')
         result=cat(a);assert result.returncode==0 and result.stdout==data and not a.stat().st_flags&0x40000000
         checks.append('direct POSIX read hydrates complete bytes with known SHA-256')
+        assert a.stat().st_mode & stat.S_IWUSR and not a.stat().st_flags & stat.UF_IMMUTABLE
+        copied=root/'exported.bin'
+        result=subprocess.run(['/bin/cp','-p',str(a),str(copied)],capture_output=True,timeout=30)
+        assert result.returncode==0,result.stderr
+        assert copied.read_bytes()==data and not copied.stat().st_flags & stat.UF_IMMUTABLE
+        with copied.open('ab') as stream:stream.write(b'editable')
+        checks.append('native metadata-preserving copy is unlocked, owner-writable and editable')
         before=ranges;connected=False;cached=cat(a);assert cached.returncode==0 and cached.stdout==data and ranges==before
         checks.append('OS-materialized file is readable offline without network')
         failed=cat(b);assert failed.returncode!=0 and not failed.stdout;checks.append('unmaterialized read after disconnect fails without zero-filled success')
+        edited=b'local edit while source is disconnected'
+        a.write_bytes(edited)
+        for attempt in range(30):
+            try:
+                host('evict',items=[f"{old[0]['session']}/{old[0]['copy']}/{old[0]['index']}"])
+                break
+            except AssertionError:
+                if attempt==29:raise
+                time.sleep(0.5)
+        assert a.stat().st_flags & 0x40000000
+        before=ranges;result=cat(a)
+        assert result.returncode==0 and result.stdout==edited and ranges==before
+        checks.append('local edits survive OS eviction/offline rehydration without Windows fetch or upload')
+
         connected=True;current[:]=new
         c=resolve(new)[0];assert c!=a and c.name==a.name and c.stat().st_flags&0x40000000
         result=cat(c);assert result.returncode==0 and result.stdout==fresh;checks.append('same domain reconnect resolves same filename under a fresh immutable copy and reads new bytes')

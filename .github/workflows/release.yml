@@ -18,40 +18,43 @@ env:
   CARGO_NET_RETRY: '10'
 
 jobs:
-  build:
-    name: Verify, build, publish and retain current release
+  checks:
+    name: checks
     if: github.repository == 'zhangyxXyz/macrdp' && github.event.deleted == false
-    runs-on: macos-15
+    uses: ./.github/workflows/ci.yml
+    permissions:
+      contents: read
+
+  build:
+    name: build and publish
+    needs: checks
+    if: github.repository == 'zhangyxXyz/macrdp' && github.event.deleted == false
+    runs-on: ${{ vars.MACOS_RUNNER || 'macos-26' }}
     timeout-minutes: 60
     permissions:
       contents: write
     steps:
+      - name: Require Apple Silicon runner
+        run: test "$(uname -m)" = arm64
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
         with:
+          ref: ${{ github.sha }}
           persist-credentials: false
           fetch-depth: 0
-      - name: Verify tag belongs to dev
-        run: git merge-base --is-ancestor HEAD origin/dev
+      - name: Verify source revision and dev ancestry
+        run: |
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          git merge-base --is-ancestor HEAD origin/dev
       - uses: actions-rust-lang/setup-rust-toolchain@46268bd060767258de96ed93c1251119784f2ab6
         with:
           toolchain: '1.95.0'
-          components: rustfmt, clippy
       - name: Reuse package dependency cache
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4
         with:
           shared-key: packaged-apps
           key: fork-packaging-check
-      - name: Regression gates
-        run: |
-          cargo fmt --all -- --check
-          cargo clippy --locked --all-targets -- -D warnings
-          cargo test --release --locked
-          cargo test --manifest-path vendor/ironrdp-server/Cargo.toml --lib --features egfx
-          cargo build --release --locked
-          python3 scripts/check-config-cli.py target/release/macrdp
-          swift run --package-path gui --scratch-path gui/.build ConfigSupportTests
-          python3 -m unittest discover -s scripts/tests
-          python3 scripts/check-file-provider.py --build-root "$RUNNER_TEMP/file-provider-checks"
+      - name: Build release binary
+        run: cargo build --release --locked
       - name: Build and verify both apps
         env:
           CODESIGN_IDENTITY: '-'

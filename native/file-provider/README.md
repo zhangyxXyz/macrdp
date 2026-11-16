@@ -97,3 +97,30 @@ Mac 回传 Windows 的读取放到 RDP 循环之外，未物化文件可以请�
 避免同一网络循环互等。限制 4 线程／32 操作／含排队 30 秒；系统读取不能强制取消，
 超时后名额仍保留到读取返回。迟到回复不跨会话。文件准备期间清除旧文本，
 完整下载就绪只播放提示音，不再自动发送 Cmd+V。此次修改仍待真实 mstsc 回归。
+
+## Local copy permissions / 本地副本权限
+
+Read-only item capabilities made macOS add `UF_IMMUTABLE`, which Finder copied
+onto exported files. Files now allow reading/writing, with owner read/write
+filesystem flags. Content, filesystem flags and access/modification dates can be
+saved in this transient local cache; create/rename/delete remain unsupported.
+Local edits use separate UUID content versions and an atomic catalog commit;
+stale saves are rejected. They never upload to or change the Windows source.
+Committed edited content is bounded to 128 GiB per domain and 4,096 entries;
+streaming saves enforce the remaining byte budget. Domain cache files may remain
+in the sandbox after domain removal, like the existing metadata journal.
+
+Current checks: ten adapter checks and eight real-OS synthetic-source checks.
+They include unlocked, editable metadata-preserving copies and local edits that
+survive eviction/offline rehydration without a Windows request. The internal host
+`evict` diagnostic command is scoped to its own exact domain UUID. These checks do
+not substitute for mstsc/Finder testing of the rebuilt application.
+
+只读 capability 会使系统添加 `UF_IMMUTABLE`，并被 Finder 带到导出文件。
+文件现声明可读写及用户读写权限，缓存中的内容、文件系统标记和时间戳可本地保存；
+不支持新增、重命名、删除。修改按独立 UUID 版本和原子目录提交，不回写 Windows 源文件，
+旧版本保存会被拒绝。每域已提交修改内容上限 128 GiB／4,096 项，流式保存检查剩余额度。
+删除域后沙箱可能保留缓存，与原有元数据行为一致。
+
+现有 10 项适配层和 8 项真实系统合成源检查，涵盖导出文件可写无锁、清除缓存后离线
+恢复本地修改且不请求 Windows；仍需新版 mstsc／Finder 端到端实测。

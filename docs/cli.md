@@ -212,15 +212,15 @@ MACRDP_MODS_RESYNC_IDLE_MS=10000  # env-only: after this many ms with no input,
                           #   saver fallback; missing API/request/confirmation is
                           #   logged as failure. Does not change the account's
                           #   password-delay policy. Retains the disconnect grace,
-                          #   physical-display restoration and safety buffer (~25s
-                          #   plus restoration time), with bounded reconnect hold.
+                          #   physical-display restoration, with no extra wait by
+                          #   default; reconnect holds remain bounded.
                           #   Never fires on server shutdown/kill, only a genuine
                           #   last-client-disconnect. Config: LOCK_ON_DISCONNECT.
                           #   A client still reconnecting when the timer ends
                           #   holds the lock until it connects (capped at 30 s,
                           #   so an unauthenticated peer can only delay it).
                           #   MACRDP_LOCK_ON_DISCONNECT_DELAY_MS / config
-                          #   LOCK_ON_DISCONNECT_DELAY_MS (default 22500 — the extra
+                          #   LOCK_ON_DISCONNECT_DELAY_MS (default 0 — optional extra
                           #   buffer beyond the ~2.5s reactivation grace) tunes the
                           #   safety margin: lower for a snappier lock at higher
                           #   false-positive risk, raise it on a slow/lossy link.
@@ -271,6 +271,15 @@ MACRDP_MODS_RESYNC_IDLE_MS=10000  # env-only: after this many ms with no input,
                           #   conversion or copy (14.3 → 3.3 ms CPU/frame at 3456x2168).
                           #   Frames sent as legacy bitmaps are converted back to BGRA.
                           #   Config key: CAPTURE_NV12.
+--audio-remote-only       # Experimental, default OFF; config AUDIO_REMOTE_ONLY=1.
+                          #   macOS 14.2+ private Core Audio process tap captures
+                          #   audio and suppresses local playback only while read.
+                          #   Requires system audio recording permission. Does not
+                          #   change system volume/mute/default output. Startup
+                          #   errors are reported; no automatic SCK fallback.
+                          #   Disconnect releases the private tap. Minimize still
+                          #   follows --no-mute-on-minimize. End-to-end mstsc,
+                          #   route changes and crash recovery await live testing.
 --enable-aac              # Compress RDPSND audio as AAC-LC (WAVE_FORMAT_AAC_MS)
                           #   instead of raw PCM; ~11x less bandwidth. PCM fallback is
                           #   automatic for clients without AAC decode. Adds ~40-50 ms
@@ -728,7 +737,8 @@ table and validation limits in [README](../README.md#modifier-positions-and-ctrl
 `--virtual-display` (`VIRTUAL_DISPLAY=1`) stores its width/height/scale at startup,
 but creates the display only during authenticated capture. `--make-primary` also
 applies per active display and restores on release. A 2.5s reactivation grace and
-physical restoration precede last-capture cleanup; no other active display means
-retaining the virtual display. SCK registration after creation or confirmed
+physical restoration precede last-capture cleanup. Retain the virtual display if
+an online physical display has not recovered. If no other display is online, it
+can be released after the disconnect lock completes or is cancelled. SCK registration after creation or confirmed
 unlock has a fixed 8s maximum, polled every 200ms with immediate success.
 Publishing/building does not activate this behavior in an older installed app.

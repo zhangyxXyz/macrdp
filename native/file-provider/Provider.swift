@@ -20,7 +20,9 @@ private func providerError(_ error: Error) -> NSError {
 private final class FileItem: NSObject, NSFileProviderItem {
   let file: FileSnapshot?
   let batch: String?
-  init(file: FileSnapshot? = nil, batch: String? = nil) {
+  let local: LocalCopy?
+  init(file: FileSnapshot? = nil, batch: String? = nil, local: LocalCopy? = nil) {
+    self.local = local
     self.file = file
     self.batch = batch
   }
@@ -38,13 +40,21 @@ private final class FileItem: NSObject, NSFileProviderItem {
     file.map { UTType(filenameExtension: ($0.name as NSString).pathExtension) ?? .data } ?? .folder
   }
   var capabilities: NSFileProviderItemCapabilities {
-    file == nil ? [.allowsReading, .allowsContentEnumerating] : [.allowsReading]
+    file == nil ? [.allowsReading, .allowsContentEnumerating] : [.allowsReading, .allowsWriting]
   }
-  var documentSize: NSNumber? { file.map { NSNumber(value: $0.size) } }
+  // Read-only capabilities cause macOS to add UF_IMMUTABLE, which Finder
+  // propagates to pasted files. Writable local snapshots are persisted below;
+  // remote clipboard sources remain immutable and are never uploaded to.
+  var fileSystemFlags: NSFileProviderFileSystemFlags {
+    file == nil ? [.userReadable, .userExecutable] : .init(rawValue: local?.flags ?? 6)
+  }
+  var documentSize: NSNumber? { file.map { NSNumber(value: local?.size ?? $0.size) } }
+  var contentModificationDate: Date? { local?.modified }
+  var lastUsedDate: Date? { local?.lastUsed }
   var itemVersion: NSFileProviderItemVersion {
     .init(
-      contentVersion: Data(itemIdentifier.rawValue.utf8),
-      metadataVersion: Data(itemIdentifier.rawValue.utf8))
+      contentVersion: Data((local?.content ?? itemIdentifier.rawValue).utf8),
+      metadataVersion: Data((local?.revision ?? itemIdentifier.rawValue).utf8))
   }
   var contentPolicy: NSFileProviderContentPolicy { .downloadLazily }
 }
@@ -101,9 +111,13 @@ private final class FilesEnumerator: NSObject, NSFileProviderEnumerator {
           let files = try await catalog.children("root")
           items =
             Array(Set(files.map { $0.container })).sorted().map { FileItem(batch: $0) }
-            + files.map { FileItem(file: $0) }
+          for file in files {
+            items.append(await FileItem(file: file, local: catalog.localCopy(file.identifier)))
+          }
         } else if container != .trashContainer {
-          items = try await catalog.children(container.rawValue).map { FileItem(file: $0) }
+          for file in try await catalog.children(container.rawValue) {
+            items.append(await FileItem(file: file, local: catalog.localCopy(file.identifier)))
+          }
         }
         try Task.checkCancellation()
         observer.didEnumerate(items)
@@ -128,7 +142,9 @@ private final class FilesEnumerator: NSObject, NSFileProviderEnumerator {
           items += changes.batches.map { FileItem(batch: $0) }
         }
         if container != .rootContainer && container != .trashContainer {
-          items += changes.files.map { FileItem(file: $0) }
+          for file in changes.files {
+            items.append(await FileItem(file: file, local: catalog.localCopy(file.identifier)))
+          }
         }
         try Task.checkCancellation()
         observer.didUpdate(items)
@@ -210,7 +226,8 @@ final class MacrdpFilesExtension: NSObject, NSFileProviderReplicatedExtension {
           }
           item = FileItem(batch: identifier.rawValue)
         } else {
-          item = try await FileItem(file: catalog.snapshot(identifier.rawValue))
+          let file = try await catalog.snapshot(identifier.rawValue)
+          item = await FileItem(file: file, local: catalog.localCopy(identifier.rawValue))
         }
         try Task.checkCancellation()
         progress.completedUnitCount = 1
@@ -230,11 +247,19 @@ final class MacrdpFilesExtension: NSObject, NSFileProviderReplicatedExtension {
       do {
         guard let catalog, let manager else { throw FilesError.unauthorized }
         let snapshot = try await catalog.snapshot(identifier.rawValue)
-        let item = FileItem(file: snapshot)
+        let item = await FileItem(file: snapshot, local: catalog.localCopy(identifier.rawValue))
         if let version, version != item.itemVersion { throw FilesError.stale }
         self.log.info("fetch start index=\(snapshot.index) bytes=\(snapshot.size)")
-        let path = try await catalog.client.materialize(
-          snapshot, directory: manager.temporaryDirectoryURL())
+        let directory = try manager.temporaryDirectoryURL()
+        let path: URL
+        if let local = try await catalog.materializeLocalCopy(
+          identifier.rawValue,
+          version: item.itemVersion.contentVersion, directory: directory)
+        {
+          path = local
+        } else {
+          path = try await catalog.client.materialize(snapshot, directory: directory)
+        }
         do { try Task.checkCancellation() } catch {
           try? FileManager.default.removeItem(at: path)
           throw error
@@ -264,9 +289,39 @@ final class MacrdpFilesExtension: NSObject, NSFileProviderReplicatedExtension {
     completionHandler:
       @escaping (NSFileProviderItem?, NSFileProviderItemFields, Bool, Error?) -> Void
   ) -> Progress {
-    completionHandler(
-      nil, [], false, NSError(domain: NSCocoaErrorDomain, code: NSFileWriteNoPermissionError))
-    return Progress()
+    let progress = Progress(totalUnitCount: 1)
+    let task = work.start { [self] in
+      do {
+        guard let catalog else { throw FilesError.unauthorized }
+        let supported: NSFileProviderItemFields = [
+          .contents, .fileSystemFlags, .contentModificationDate, .lastUsedDate,
+        ]
+        guard changedFields.subtracting(supported).isEmpty,
+          !changedFields.contains(.contents) || contents != nil
+        else {
+          completionHandler(
+            nil, [], false, NSError(domain: NSCocoaErrorDomain, code: NSFileWriteNoPermissionError))
+          return
+        }
+        let id = item.itemIdentifier.rawValue
+        let snapshot = try await catalog.snapshot(id)
+        let local = try await catalog.saveLocalCopy(
+          id,
+          contentVersion: baseVersion.contentVersion, metadataVersion: baseVersion.metadataVersion,
+          contents: changedFields.contains(.contents) ? contents : nil,
+          flags: changedFields.contains(.fileSystemFlags) ? item.fileSystemFlags?.rawValue : nil,
+          modified: changedFields.contains(.contentModificationDate)
+            ? (item.contentModificationDate ?? nil) : nil,
+          lastUsed: changedFields.contains(.lastUsedDate) ? (item.lastUsedDate ?? nil) : nil)
+        progress.completedUnitCount = 1
+        completionHandler(FileItem(file: snapshot, local: local), [], false, nil)
+        for container in [NSFileProviderItemIdentifier.workingSet, .init(snapshot.container)] {
+          try? await manager?.signalEnumerator(for: container)
+        }
+      } catch { completionHandler(nil, [], false, providerError(error)) }
+    }
+    progress.cancellationHandler = { task.cancel() }
+    return progress
   }
   func deleteItem(
     identifier: NSFileProviderItemIdentifier, baseVersion: NSFileProviderItemVersion,

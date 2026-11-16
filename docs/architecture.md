@@ -155,6 +155,11 @@ src/audio.rs      RDPSND ← second SCK stream with system-audio capture,
                   backoff resets on the first delivered sample. The 'reconnect
                   outer loop preserves my_gen, so the generation guard still
                   retires it on client reconnect (no double-capture).
+src/audio_tap/    Optional remote-only Core Audio process tap. native.m owns the
+                  private tap/aggregate/IOProc and a bounded stereo ring; realtime
+                  callbacks neither allocate nor wait for the reader. mod.rs owns
+                  lifetime and polls from the audio worker. No system volume/mute
+                  or default-device writes. The normal SCK source stays default.
 src/aac.rs        AudioToolbox AAC-LC encoder (--enable-aac). AudioConverter
                   FFI: interleaved i16 PCM → raw AAC access units for the
                   WAVE_FORMAT_AAC_MS RDPSND path. macOS-only.
@@ -414,3 +419,11 @@ Cross-cutting:
 - **Single capture loop** — `MacRdpsnd` (the audio factory) holds an `Arc<AtomicU64>` generation counter shared with every backend it builds. Each `start()` claims a fresh generation; older capture loops observe the bump on their next iteration and exit. Without this, an mstsc cert-prompt reconnect leaves the first capture loop running while the second starts, both feeding the shared event channel → ~2× audio reaching the client.
 
 When adding a feature, locate it in one of those modules first; if it spans them (e.g., a new virtual channel), it belongs in a dedicated module alongside `clipboard.rs`, driven by `ironrdp_server`'s factory traits.
+
+Monitor-free lifecycle: an authenticated caller may acquire its display lease
+before auto-unlock, using CG active/bounds readiness rather than locked SCK
+visibility. CapturePreparation retains that lease inside its blocking worker.
+The disconnect watcher retains the existing surface through lock completion;
+that lease uses the saved runtime handle for cleanup from its plain worker
+thread, without adding a second reactivation grace. Topology distinguishes no
+other online display from online-but-inactive restoration failures.

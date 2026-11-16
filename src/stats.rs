@@ -82,6 +82,7 @@ impl SessionStats {
         let file_clipboard = serde_json::Value::Null;
         serde_json::json!({
             "file_clipboard": file_clipboard,
+            "audio": crate::audio::status(),
             "schema_version": 2,
             "build_commit": metadata.build_commit,
             "config_revision": metadata.config_revision,

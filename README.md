@@ -24,6 +24,60 @@ is included in the same-version `v0.10.6-dev` rebuild. The version stays `0.10.6
 use `SOURCE_COMMIT` in the download to distinguish builds. Win10 client rendering
 requires a post-update manual check; upstream's frozen-start fix #230 is included. See [changes](CHANGELOG.md#v0106-dev).
 
+## This same-version rebuild
+
+New remote clipboard announcements now invalidate old text/images even when no
+supported format is offered. File URLs are explicitly serialized and read back
+before publication is reported as successful; File Provider downloads remain
+on demand. Unsupported Windows private formats still need a standard
+`FileGroupDescriptorW` stream from the client.
+
+Permissions adds an optional Full Disk Access shortcut for Mac-to-Windows copies
+from protected locations. Grant it to the server `macrdp.app` in System Settings;
+this does not repair incoming Windows formats. Disconnect locking removes the
+old extra 22.5-second default wait, but still waits for the 2.5-second reactivation
+grace, physical-display restoration and any bounded reconnect hold. It is not
+an instantaneous lock or a local-input takeover detector. At 4K/200%, macOS's
+1920×1080 logical workspace is distinct from the 3840×2160 RDP output.
+
+File Provider files now expose owner-writable local copies rather than locked
+read-only items. Local edits are persisted with version checks and are never
+uploaded to the Windows source. Ten adapter checks and eight synthetic system
+checks cover on-demand reads, editable exported copies, offline cache eviction/
+rehydration and reconnect isolation. This is not a real mstsc test of the new build.
+The menu-bar status tooltip is removed; status remains in the menu and Status tab.
+Use `SOURCE_COMMIT` to identify this rebuild; real-client regression testing remains necessary.
+
+The default-off experimental **Audio → Remote-only playback** option
+(`AUDIO_REMOTE_ONLY=1`) uses a private Core Audio tap on macOS 14.2+. It suppresses
+local playback only while capturing, without changing system volume, mute or the
+default output device. System audio recording permission is required. Initialization
+failure is reported; it does not silently fall back to dual playback. An established
+tap retries a changed/disappearing output device up to five times with bounded
+backoff; initial permission failures require correction. The existing
+minimize policy still pauses forwarded audio; disconnect destroys the tap to restore
+local playback. Status reports capture state/errors, not confirmed client audibility.
+An isolated local probe captured a nonzero 48 kHz test tone and destroyed the tap
+successfully. Playback through the rebuilt server/mstsc, output-device changes,
+reconnects and abnormal exit still need live validation. The direct speaker-mute
+control test did not preserve the remote tone, so that approach is not used.
+The earlier intermittent Mac-only playback recovered after restart; its separate
+root cause is not yet confirmed. Disconnect locking additionally checks capture
+session epochs, handles coalesced transitions and serializes with auto-unlock.
+
+Monitor-free, already logged-in sessions use the same disconnect-lock policy.
+Detach/Blank do no physical transactions when no other display is online. The
+virtual surface is retained through lock completion/cancellation and can then be
+released; online-but-inactive displays remain a restoration concern. Authenticated
+headless reconnect prepares a temporary virtual surface before auto-unlock and
+retains its lease until in-flight password work ends, even if its waiter cancels.
+Shield still requires helper acknowledgement with zero targets, retaining hot-plug
+protection. Automated regression coverage is added; actual unplug/replug and
+monitor-free locked reconnect testing with the rebuilt server remain pending.
+This covers logged-in user sessions, not FileVault/pre-login boot screens. An
+attempt cancelled during password input can still finish unlocking; automatic
+re-lock of that pre-existing abandoned-preparation path is not guaranteed.
+
 ## Changes on dev
 
 | Area | Implemented behavior |
@@ -47,8 +101,9 @@ IDs are used by capture, input, audio and the switcher HUD. Newly created displa
 and confirmed unlocks wait up to 8 seconds for SCK registration, returning as soon
 as the requested display appears; this is a fixed maximum, not an 8-second delay.
 
-If physical restoration fails or no other active display exists, keep the virtual
-display rather than removing the only usable screen. Configuration (including
+If an online physical display fails to become active, retain the virtual display.
+When no other display is online, it may be released after the disconnect lock
+completes; a locked headless reconnect prepares a new virtual surface before unlock. Configuration (including
 fixed 4K/200%) remains saved for the next connection. Real mstsc lock/reconnect,
 bidirectional paste and physical-screen restoration of this rebuild are pending
 manual testing; no installed app or local configuration is replaced by publishing.
@@ -132,8 +187,8 @@ via runtime-resolved private login.framework and confirms the system lock flag
 for up to 2 seconds. It does not depend on the screen-saver password delay,
 change security preferences, or silently fall back to a screen saver. Missing API,
 request errors and unconfirmed lock state are reported as failures. The existing
-physical-display restoration, disconnect grace, safety delay and bounded
-reconnect hold remain; **disconnect locking is delayed, not instantaneous**.
+physical-display restoration, disconnect grace and bounded
+reconnect hold remain; the extra safety delay defaults to zero; **disconnect locking is delayed, not instantaneous**.
 Auto-unlock affects the physical desktop, and these private macOS APIs may change.
 
 Regression tests cover preparation ordering/failure, serialization, display
@@ -271,8 +326,9 @@ readiness after accept was about 0.73–0.75 seconds on reconnect; this does not
 measure client-visible first-frame latency. Physical-screen transitions still
 took about 10.5 seconds. A 60 Hz mode / 60 fps target is not a sustained-fps guarantee.
 
-For the initial `92f4c8c` build of `v0.10.6-dev`: 430 Rust tests passed, 8 ignored; 10 Foundation configuration
-checks and 25 configuration CLI process checks passed. Hardware behavior,
+For this `v0.10.6-dev` rebuild: 491 Rust tests passed, 8 ignored; strict Clippy,
+10 Foundation configuration checks and 33 configuration CLI process checks passed.
+The native audio-buffer checks passed with AddressSanitizer/UndefinedBehaviorSanitizer. Hardware behavior,
 permissions, and actual client rendering still require manual validation.
 Client-following and live resizing depend on the client sending the relevant
 requests; fixed 4K mstsc checks do not validate every client or scale policy.
@@ -280,10 +336,11 @@ This fork makes no additional soak-test or production-readiness claim.
 
 ## Actions and maintenance
 
-- `ci.yml`: Linux/macOS regression checks, configuration checks, and audit integration on `dev` changes and pull requests; also callable manually.
-- `release.yml`: only `v*` tag pushes package Apple Silicon apps after Rust/Swift/Python checks. The tagged commit must belong to `dev`. Both apps, source metadata and checksum go directly to a draft Release; round-trip verification precedes publication. There are no intermediate Actions Artifacts. Tags containing `-` are prereleases (for example `v0.10.6-dev`). Re-run a failed tag workflow to resume its owned draft; published releases are never overwritten.
-- `build-check.yml`: manual-only packaging verification without publishing or uploading artifacts. Ordinary dev pushes do not duplicate the release packaging job.
-- Draft assets upload/download by stable Release/asset IDs. An exact pipeline-owned `untagged-*` draft can resume; verified publication explicitly restores the version tag. A same-version replacement must first be deliberately prepared as an owned draft; it is not an automatic overwrite of a published release.
+- `ci.yml`: the reusable regression gate for Linux/macOS tests, strict Clippy, configuration, native adapters, release scripts and audit integration. All macOS checks share one runner; Linux checks run alongside them. It also runs on branch changes/PRs and can be started manually.
+- `release.yml`: only `v*` tag pushes trigger `checks → build/package → draft upload/download verification → publish → cleanup`. The tagged commit must belong to `dev`. Both apps, source metadata and checksum go directly to a draft Release; there are no intermediate Actions Artifacts. Tags containing `-` are prereleases (for example `v0.10.6-dev`).
+- `build-check.yml`: manual-only `checks → build/package verification`, without publishing or uploading artifacts. Ordinary dev pushes do not run a packaging job.
+- Same-tag rebuilds use a separate `staging-<tag>-<source>` draft and stable Release/asset IDs. The current download remains available until the replacement passes round-trip verification and ownership checks. Publication replaces only the owned Release, preserving that version tag. GitHub has no atomic Release swap: a final publish failure leaves the verified draft for retry. Tag/source checks reject obsolete runs. Re-run a failed workflow to resume its owned draft.
+- Native jobs default to the Apple Silicon `macos-26` runner; repository variable `MACOS_RUNNER` can select another ARM64 runner. Architecture is verified before building. Runner capacity is still controlled by GitHub. Workflow names consistently use lowercase.
 - Release notes use the [short bilingual template](packaging/RELEASE_NOTES.md) and link to that version in [CHANGELOG.md](CHANGELOG.md). Add the changelog section before tagging; the full section is not duplicated in release notes.
 - `cleanup-releases.yml`: manual preview defaults on. The release pipeline also prunes after publishing: verify the newest owned release first, retain it, remove older pipeline-owned releases and their matching tags. Unknown releases and drafts are untouched; failed verification or concurrent edits abort cleanup. Inspired by CLIProxyAPI-Plugins. The former manual `dev-build.yml` artifact build has been removed.
 - `security.yml`: dependency checks, including `dev` dependency changes.

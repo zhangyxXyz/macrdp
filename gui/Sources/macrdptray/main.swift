@@ -101,11 +101,15 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // glanceable without opening the menu.
         let blocked = running && authStatus() != nil
         statusItem.button?.alphaValue = running && !blocked ? 1.0 : 0.4
-        statusItem.button?.toolTip = blocked
+        let accessibleStatus = blocked
             ? "macrdp: waiting for a valid password"
             : running
             ? "macrdp: running (pid \(st.pid!))"
             : (st.loaded ? "macrdp: stopped" : "macrdp: not installed")
+        // AppKit tooltips can remain visible across remote display changes.
+        // Keep status in the menu/Status panel and in the accessibility label.
+        statusItem.button?.toolTip = nil
+        statusItem.button?.setAccessibilityLabel(accessibleStatus)
     }
 
     // MARK: - Server status (parsed from the log)
@@ -693,6 +697,12 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc func openAccessibility() {
         openURL("x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")
     }
+    @objc func openFullDiskAccess() {
+        openURL("x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles")
+    }
+    func revealServerForPermissions() {
+        if let app = locateServerApp() { NSWorkspace.shared.activateFileViewerSelecting([app]) }
+    }
     @objc func quit() { if !configurationIsApplying { NSApp.terminate(nil) } }
 
     func openURL(_ s: String) { if let u = URL(string: s) { NSWorkspace.shared.open(u) } }
@@ -714,6 +724,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
             BIND="127.0.0.1:3390"
             USE_KEYCHAIN=1
             ENABLE_H264=0
+            AUDIO_REMOTE_ONLY=0
             ENABLE_AAC=0
             HIDPI=0
             UNMINIMIZE=0

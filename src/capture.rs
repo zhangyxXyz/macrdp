@@ -8,7 +8,7 @@ use std::num::{NonZeroU16, NonZeroUsize};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::Arc;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use bytes::Bytes;
 use ironrdp_server::{
     BitmapUpdate, DesktopSize, DisplayUpdate, PixelFormat, RdpServerDisplay,
@@ -332,6 +332,8 @@ impl SharedDesktopSize {
 /// attach them as soon as the last client disconnects.
 #[derive(Clone, Default)]
 pub struct SessionTracker {
+    /// Incremented on every capture entry, including reconnects entirely between watcher polls.
+    pub connection_epoch: Arc<AtomicU64>,
     pub count: Arc<AtomicUsize>,
     /// Notified whenever `count` changes. `tokio::sync::Notify` is
     /// edge-triggered; we wake one waiter per state transition, which
@@ -341,6 +343,7 @@ pub struct SessionTracker {
 
 impl SessionTracker {
     fn enter(&self) {
+        self.connection_epoch.fetch_add(1, Ordering::SeqCst);
         let prev = self.count.fetch_add(1, Ordering::SeqCst);
         tracing::info!(prev, now = prev + 1, "SessionTracker::enter");
         self.notify.notify_one();
@@ -869,23 +872,50 @@ impl RdpServerDisplay for CaptureDisplay {
     }
 
     async fn updates(&mut self) -> ServerResult<Box<dyn RdpServerDisplayUpdates>> {
-        // Include preparation failures in the same truthful telemetry as SCK
-        // failures. No capture, input-size commit or display sync before this gate.
+        // Authenticated callers only. A fully headless locked session needs a
+        // display for loginwindow before password input, but still starts no
+        // screen capture/input-size commit until preparation succeeds.
         let result = async {
-            let unlocked = if let Some(preparation) = &self.preparation {
-                preparation.run().await?
-            } else {
-                false
-            };
-            let lease = if let Some(vd) = &self.virtual_display {
+            let bootstrap = self.preparation.is_some()
+                && self.virtual_display.is_some()
+                && crate::virtual_display::other_displays(
+                    crate::display_session::active_display_id(),
+                )? == crate::display_transition::OtherDisplays::None;
+            let early_lease = if bootstrap {
+                let vd = self
+                    .virtual_display
+                    .as_ref()
+                    .expect("virtual display bootstrap");
                 let lease = crate::display_session::ManagedDisplay::acquire(vd).await?;
-                let vd = vd.lock().unwrap();
-                self.display_id = vd.id_if_active();
-                self.screen_size_pts = vd.size_pts();
+                let id = vd
+                    .lock()
+                    .unwrap()
+                    .id_if_active()
+                    .context("bootstrap display missing")?;
+                crate::session_lock::wait_for_unlock_surface(id).await?;
                 Some(lease)
             } else {
                 None
             };
+            // The blocking password worker owns an early lease until it ends,
+            // even if this connection stops awaiting its result.
+            let (unlocked, mut lease) = if let Some(preparation) = &self.preparation {
+                if early_lease.is_some() {
+                    preparation.run_with_guard(early_lease).await?
+                } else {
+                    (preparation.run().await?, None)
+                }
+            } else {
+                (false, early_lease)
+            };
+            if let Some(vd) = &self.virtual_display {
+                if lease.is_none() {
+                    lease = Some(crate::display_session::ManagedDisplay::acquire(vd).await?);
+                }
+                let vd = vd.lock().unwrap();
+                self.display_id = vd.id_if_active();
+                self.screen_size_pts = vd.size_pts();
+            }
             // The sync block keeps the display mutex out of every await point.
             let (width, height) = self.sync_virtual_display();
             self.desktop_size.commit_input_size(width, height);
@@ -3164,5 +3194,16 @@ mod tests {
         }
         // ...and then the stream ends (the test constructor sets end_on_drain).
         assert!(updates.next_update().await.unwrap().is_none());
+    }
+    #[test]
+    fn reconnect_that_ends_between_polls_still_invalidates_old_disconnect() {
+        let tracker = SessionTracker::default();
+        tracker.enter();
+        tracker.leave();
+        let old_epoch = tracker.connection_epoch.load(Ordering::SeqCst);
+        tracker.enter();
+        tracker.leave();
+        assert_eq!(tracker.count.load(Ordering::SeqCst), 0);
+        assert_ne!(tracker.connection_epoch.load(Ordering::SeqCst), old_epoch);
     }
 }

@@ -25,16 +25,62 @@ impl CapturePreparation {
     /// keyboard/lock polling never occupies a tokio worker. No detached task is
     /// launched by on_accept/on_authenticated (a preemption probe is not served).
     pub async fn run(&self) -> Result<bool> {
+        self.run_with_guard(()).await.map(|(unlocked, ())| unlocked)
+    }
+
+    /// Keep an authenticated preparation's display lease alive until password
+    /// work actually finishes, including when the awaiting connection is cancelled.
+    /// On success ownership returns to the caller for the following capture.
+    pub async fn run_with_guard<G: Send + 'static>(&self, guard: G) -> Result<(bool, G)> {
         let serial = self.serial.clone().lock_owned().await;
         let operation = self.operation.clone();
         tokio::task::spawn_blocking(move || {
             // Cancellation of the awaiting connection must not release the
             // guard while its blocking password operation is still executing.
             let _serial = serial;
-            operation()
+            Ok((operation()?, guard))
         })
         .await?
     }
+}
+
+/// A Mac with no other display needs a WindowServer surface before input can
+/// wake the lock screen. ScreenCaptureKit enumeration is deliberately not used
+/// here: it can hide the desktop while locked, which would invert the dependency.
+#[cfg(target_os = "macos")]
+pub async fn wait_for_unlock_surface(id: u32) -> Result<()> {
+    use core_graphics::display::CGDisplay;
+    use std::time::Duration;
+    tokio::time::timeout(Duration::from_secs(8), async {
+        loop {
+            let active = CGDisplay::active_displays().unwrap_or_default();
+            let bounds = CGDisplay::new(id).bounds();
+            if unlock_surface_ready(&active, id, bounds.size.width, bounds.size.height) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    })
+    .await
+    .map_err(|_| {
+        anyhow::anyhow!(
+            "WindowServer did not activate virtual display {id} within 8 seconds before unlock"
+        )
+    })
+}
+#[cfg(not(target_os = "macos"))]
+pub async fn wait_for_unlock_surface(_: u32) -> Result<()> {
+    Ok(())
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn unlock_surface_ready(active: &[u32], id: u32, width: f64, height: f64) -> bool {
+    id != 0
+        && active.contains(&id)
+        && width.is_finite()
+        && height.is_finite()
+        && width > 0.0
+        && height > 0.0
 }
 
 /// Only after a confirmed unlock: WindowServer/SCK can lag the lock flag.
@@ -181,6 +227,17 @@ mod tests {
         assert!(display_available(&[38], None));
     }
     #[test]
+    fn unlock_surface_requires_the_target_active_with_valid_bounds() {
+        assert!(unlock_surface_ready(&[37], 37, 1920.0, 1080.0));
+        assert!(!unlock_surface_ready(&[], 37, 1920.0, 1080.0));
+        assert!(!unlock_surface_ready(&[38], 37, 1920.0, 1080.0));
+        assert!(!unlock_surface_ready(&[0], 0, 1920.0, 1080.0));
+        for bad in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+            assert!(!unlock_surface_ready(&[37], 37, bad, 1080.0));
+            assert!(!unlock_surface_ready(&[37], 37, 1920.0, bad));
+        }
+    }
+    #[test]
     fn already_locked_does_not_issue_another_request() {
         assert!(request_and_confirm(
             || Some(true),
@@ -275,6 +332,80 @@ mod tests {
         assert_eq!(before_release, 1);
         assert!(!second.await.unwrap().unwrap());
         assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+    #[tokio::test]
+    async fn cancelled_preparation_retains_its_display_guard_until_worker_finishes() {
+        use std::sync::atomic::AtomicBool;
+        struct DisplayGuard {
+            finished: Arc<AtomicBool>,
+            dropped: Option<tokio::sync::oneshot::Sender<bool>>,
+        }
+        impl Drop for DisplayGuard {
+            fn drop(&mut self) {
+                let _ = self
+                    .dropped
+                    .take()
+                    .unwrap()
+                    .send(self.finished.load(Ordering::SeqCst));
+            }
+        }
+        let finished = Arc::new(AtomicBool::new(false));
+        let started = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        let (worker_finished, worker_started, gate) =
+            (finished.clone(), started.clone(), release.clone());
+        let prep = CapturePreparation::new(move || {
+            worker_started.notify_one();
+            let (mutex, condition) = &*gate;
+            let mut done = mutex.lock().unwrap();
+            while !*done {
+                done = condition.wait(done).unwrap();
+            }
+            worker_finished.store(true, Ordering::SeqCst);
+            Ok(true)
+        });
+        let (dropped, mut drop_result) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            prep.run_with_guard(DisplayGuard {
+                finished,
+                dropped: Some(dropped),
+            })
+            .await
+        });
+        let entered =
+            tokio::time::timeout(std::time::Duration::from_secs(2), started.notified()).await;
+        task.abort();
+        let _ = task.await;
+        let before_release = drop_result.try_recv();
+        // Always unblock the worker before assertions, including a failing
+        // regression, so tokio runtime shutdown cannot hang on this test.
+        *release.0.lock().unwrap() = true;
+        release.1.notify_one();
+        assert!(entered.is_ok());
+        assert!(matches!(
+            before_release,
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(2), drop_result)
+                .await
+                .unwrap()
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn successful_preparation_returns_display_ownership_to_capture() {
+        let display = Arc::new(());
+        let prep = CapturePreparation::new(|| Ok(true));
+        let (unlocked, lease) = prep.run_with_guard(display.clone()).await.unwrap();
+        assert!(unlocked);
+        assert_eq!(Arc::strong_count(&display), 2);
+        drop(lease);
+        assert_eq!(Arc::strong_count(&display), 1);
+        let failed = CapturePreparation::new(|| anyhow::bail!("unsafe lock state"));
+        assert!(failed.run_with_guard(display.clone()).await.is_err());
+        assert_eq!(Arc::strong_count(&display), 1);
     }
     #[tokio::test]
     async fn concurrent_preparations_do_not_submit_passwords_together() {

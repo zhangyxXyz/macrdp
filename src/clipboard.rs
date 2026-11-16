@@ -1001,11 +1001,13 @@ impl MacCliprdrBackend {
         }
     }
 
-    /// Once the client announces files, old text is no longer a valid paste.
-    /// Reserve an inert, local-only item until complete/provider URLs are ready.
+    /// A new remote copy supersedes every representation of the previous one,
+    /// even when its formats are unsupported. Reserve an inert, local-only
+    /// item until usable data arrives; otherwise Finder can paste stale HTML
+    /// or an old image as if it were the newly copied file.
     /// A newer local copy still wins: never clear it or retarget its ticket.
     #[cfg(target_os = "macos")]
-    fn reserve_file_clipboard(&mut self) -> bool {
+    fn reserve_remote_clipboard(&mut self) -> bool {
         use objc2_foundation::NSString;
         let _guard = pasteboard_guard();
         let Some(ticket) = self.image_ticket.as_ref() else {
@@ -1018,8 +1020,8 @@ impl MacCliprdrBackend {
             }
             begin_local_write(&pb);
             pb.setString_forType(
-                &NSString::from_str("files"),
-                &NSString::from_str("com.clintcan.macrdp.pending-files"),
+                &NSString::from_str("pending"),
+                &NSString::from_str("com.clintcan.macrdp.pending-clipboard"),
             );
             let cc = pb.changeCount() as i64;
             self.self_change_count
@@ -1291,6 +1293,7 @@ impl CliprdrBackend for MacCliprdrBackend {
         // lets cliprdr issue LockData on the incoming format list and
         // UnlockData on supersession/timeout automatically.
         ClipboardGeneralCapabilityFlags::STREAM_FILECLIP_ENABLED
+            | ClipboardGeneralCapabilityFlags::FILECLIP_NO_FILE_PATHS
             | ClipboardGeneralCapabilityFlags::CAN_LOCK_CLIPDATA
     }
 
@@ -1445,7 +1448,7 @@ impl CliprdrBackend for MacCliprdrBackend {
             ..RemoteFetch::default()
         };
         #[cfg(target_os = "macos")]
-        if has_file_intent(available_formats) && !self.reserve_file_clipboard() {
+        if !self.reserve_remote_clipboard() {
             return;
         }
         match plan_remote_fetch(available_formats, self.rich_clipboard) {
@@ -1461,8 +1464,9 @@ impl CliprdrBackend for MacCliprdrBackend {
             }
             RemotePlan::Nothing => {
                 if !available_formats.is_empty() {
-                    debug!(
-                        "remote format list had none of our supported formats; nothing requested"
+                    warn!(
+                        format_count = available_formats.len(),
+                        "remote clipboard has no supported representation; previous clipboard invalidated (file copies require FileGroupDescriptorW)"
                     );
                 }
             }
@@ -3454,6 +3458,61 @@ mod tests {
         ));
         assert_eq!(pb::read_string().as_deref(), Some("new local copy wins"));
     }
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn unsupported_remote_copy_invalidates_old_html_image_and_text() {
+        // Exact format family observed from mstsc / Directory Opus. No RDP
+        // file stream is offered. The same rule applies to any unknown format.
+        for formats in [
+            vec![
+                named(50476, "dopus_cf_hdrop"),
+                named(50570, "dopus_cf_typetable"),
+            ],
+            vec![named(0xc999, "Unknown Application Format")],
+            vec![],
+        ] {
+            let (mut backend, mut rx) = test_backend();
+            pb::write_items(
+                Some("old text"),
+                Some("<b>old HTML</b>"),
+                None,
+                Some(b"old image bytes"),
+                &backend.remote_write_cc,
+                None,
+            );
+            let old_ticket = crate::clipboard_image::CopyTicket::new(
+                backend.image_epoch.clone(),
+                pb::change_count(),
+            );
+            backend.on_remote_copy(&formats);
+            assert!(!pb::has_string());
+            assert!(!pb::has_html());
+            assert!(!pb::has_image());
+            assert!(!old_ticket.may_publish(pb::change_count()));
+            assert!(
+                rx.try_recv().is_err(),
+                "never request private formats as file bytes"
+            );
+            assert!(
+                backend.own_writes().is_own(pb::change_count()),
+                "do not echo the pending marker"
+            );
+            pb::write_string("later local copy");
+            assert!(!backend.reserve_remote_clipboard());
+            assert_eq!(pb::read_string().as_deref(), Some("later local copy"));
+        }
+    }
+
+    #[test]
+    fn file_clipboard_advertises_streams_without_windows_source_paths() {
+        let (backend, _rx) = test_backend();
+        assert!(backend.client_capabilities().contains(
+            ClipboardGeneralCapabilityFlags::STREAM_FILECLIP_ENABLED
+                | ClipboardGeneralCapabilityFlags::FILECLIP_NO_FILE_PATHS
+                | ClipboardGeneralCapabilityFlags::CAN_LOCK_CLIPDATA
+        ));
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
     fn unsolicited_reply_is_not_reinterpreted_as_text() {

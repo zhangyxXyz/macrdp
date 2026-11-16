@@ -32,10 +32,11 @@ def build(destination, sdk, identity, prefix):
     provider.parent.mkdir(parents=True, exist_ok=True)
     common = ['swiftc', '-O', '-sdk', sdk, '-target', 'arm64-apple-macos15.0', '-swift-version', '5']
     core = ROOT/'native/file-provider/Core.swift'
-    run(*common, core, ROOT/'native/file-provider/Host.swift', '-o', host)
+    local = ROOT/'native/file-provider/LocalCopies.swift'
+    run(*common, core, local, ROOT/'native/file-provider/Host.swift', '-o', host)
     run(*common, '-parse-as-library', '-application-extension', '-module-name', 'MacrdpFiles',
         '-emit-executable', '-Xlinker', '-e', '-Xlinker', '_NSExtensionMain',
-        core, ROOT/'native/file-provider/Provider.swift', '-o', provider)
+        core, local, ROOT/'native/file-provider/Provider.swift', '-o', provider)
     count = git_value('rev-list', '--count', 'HEAD')
     base = dict(CFBundleVersion=count if count.isdigit() else '1',
                 CFBundleShortVersionString=re.search(r'^version = "([^"]+)"', (ROOT/'Cargo.toml').read_text(), re.M)[1], LSMinimumSystemVersion='15.0',

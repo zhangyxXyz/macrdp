@@ -49,6 +49,13 @@ fn main() {
         return;
     }
 
+    println!("cargo:rerun-if-changed=src/audio_tap/native.m");
+    cc::Build::new()
+        .file("src/audio_tap/native.m")
+        .flag("-fobjc-arc")
+        .compile("macrdp_audio_tap");
+    println!("cargo:rustc-link-lib=framework=CoreAudio");
+
     // Compile the USB-redirection Obj-C shim (Phase-1b UserHCI spike) and link
     // the public IOUSBHost framework. macOS-only; the module's non-macOS stub
     // never references the extern, so Linux CI builds without any of this.

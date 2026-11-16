@@ -129,6 +129,7 @@ private struct CatalogArchive: Codable {
   let generation: UInt64
   let files: [String: FileSnapshot]
   let inserted: [String: UInt64]
+  var localCopies: [String: LocalCopy]? = nil
 }
 actor FilesCatalog {
   let client: FilesClient
@@ -136,6 +137,10 @@ actor FilesCatalog {
   var files: [String: FileSnapshot]
   var inserted: [String: UInt64]
   var generation: UInt64
+  var localCopies: [String: LocalCopy] = [:]
+  var localDirectory: URL {
+    archive.deletingLastPathComponent().appendingPathComponent("local-copies", isDirectory: true)
+  }
   init(client: FilesClient, archive: URL) throws {
     self.client = client
     self.archive = archive
@@ -147,6 +152,12 @@ actor FilesCatalog {
       files = saved.files
       inserted = saved.inserted
       generation = saved.generation
+      localCopies = saved.localCopies ?? [:]
+      guard localCopies.count <= 4096 else { throw FilesError.limit }
+      for (key, value) in localCopies {
+        guard files[key] != nil else { throw FilesError.invalid }
+        try value.validate()
+      }
       guard files.count <= 4096, Set(inserted.keys) == Set(files.keys) else {
         throw FilesError.limit
       }
@@ -159,6 +170,18 @@ actor FilesCatalog {
       files = [:]
       inserted = [:]
       generation = 0
+    }
+    let referenced = Set(localCopies.values.compactMap { $0.content })
+    if let contents = try? FileManager.default.contentsOfDirectory(
+      at: archive.deletingLastPathComponent().appendingPathComponent("local-copies"),
+      includingPropertiesForKeys: nil)
+    {
+      for path in contents
+      where UUID(uuidString: path.lastPathComponent) != nil
+        && !referenced.contains(path.lastPathComponent)
+      {
+        try? FileManager.default.removeItem(at: path)
+      }
     }
   }
   func refresh() async throws {
@@ -177,7 +200,8 @@ actor FilesCatalog {
     var positions = inserted
     for key in added { positions[key] = revision }
     let data = try JSONEncoder().encode(
-      CatalogArchive(generation: revision, files: next, inserted: positions))
+      CatalogArchive(
+        generation: revision, files: next, inserted: positions, localCopies: localCopies))
     guard data.count <= 4 * 1024 * 1024 else { throw FilesError.limit }
     try data.write(to: archive, options: .atomic)
     try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: archive.path)
@@ -210,6 +234,79 @@ actor FilesCatalog {
         .min()! > anchor
     }
     return (Array(selected).sorted { $0.identifier < $1.identifier }, batches.sorted(), generation)
+  }
+  func localCopy(_ id: String) -> LocalCopy? { localCopies[id] }
+
+  func saveLocalCopy(
+    _ id: String, contentVersion: Data, metadataVersion: Data,
+    contents: URL?, flags: UInt?, modified: Date?, lastUsed: Date?
+  ) throws -> LocalCopy {
+    guard let file = files[id] else { throw FilesError.stale }
+    let previous = localCopies[id]
+    guard contentVersion == Data((previous?.content ?? id).utf8),
+      metadataVersion == Data((previous?.revision ?? id).utf8), generation < UInt64.max
+    else { throw FilesError.stale }
+    var staged: String?
+    var committed = false
+    defer {
+      if !committed, let staged {
+        try? FileManager.default.removeItem(at: localDirectory.appendingPathComponent(staged))
+      }
+    }
+    var size = previous?.size ?? file.size
+    if let contents {
+      let retainedBytes = localCopies.filter { $0.key != id }.values.reduce(Int64(0)) {
+        $0 + ($1.content == nil ? 0 : $1.size)
+      }
+      let result = try stageLocalCopy(
+        from: contents, into: localDirectory,
+        maximumBytes: 128 * 1024 * 1024 * 1024 - retainedBytes)
+      staged = result.0
+      size = result.1
+    }
+    let updated = LocalCopy(
+      revision: UUID().uuidString, content: staged ?? previous?.content,
+      size: size, flags: flags ?? previous?.flags ?? 6,
+      modified: modified ?? previous?.modified, lastUsed: lastUsed ?? previous?.lastUsed)
+    try updated.validate()
+    var copies = localCopies
+    copies[id] = updated
+    guard copies.count <= 4096,
+      copies.values.reduce(Int64(0), { $0 + ($1.content == nil ? 0 : $1.size) }) <= 128 * 1024
+        * 1024 * 1024
+    else { throw FilesError.limit }
+    let revision = generation + 1
+    var positions = inserted
+    positions[id] = revision
+    let data = try JSONEncoder().encode(
+      CatalogArchive(
+        generation: revision, files: files,
+        inserted: positions, localCopies: copies))
+    guard data.count <= 4 * 1024 * 1024 else { throw FilesError.limit }
+    try Task.checkCancellation()
+    try data.write(to: archive, options: .atomic)
+    // The atomic journal is the commit point. Never report cancellation after it.
+    localCopies = copies
+    inserted = positions
+    generation = revision
+    committed = true
+    if let old = previous?.content, old != updated.content {
+      try? FileManager.default.removeItem(at: localDirectory.appendingPathComponent(old))
+    }
+    return updated
+  }
+
+  func materializeLocalCopy(_ id: String, version: Data, directory: URL) throws -> URL? {
+    guard let local = localCopies[id], let content = local.content else { return nil }
+    guard version == Data(content.utf8) else { throw FilesError.stale }
+    let (name, size) = try stageLocalCopy(
+      from: localDirectory.appendingPathComponent(content), into: directory)
+    let result = directory.appendingPathComponent(name)
+    guard size == local.size else {
+      try? FileManager.default.removeItem(at: result)
+      throw FilesError.stale
+    }
+    return result
   }
   func anchor() -> UInt64 { generation }
 }

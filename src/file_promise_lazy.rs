@@ -61,8 +61,7 @@ pub fn clear_pasteboard_if_stale(self_change_count: &SelfChangeCount) {
     }
     info!(
         cleared_cc = our_cc,
-        "pasteboard cleared: Windows clipboard transitioned but no FileGroupDescriptorW \
-         followed (likely a shell-extension archive type — .zip/.gz/.7z/etc)"
+        "pasteboard cleared: previous remote file publication invalidated"
     );
 }
 

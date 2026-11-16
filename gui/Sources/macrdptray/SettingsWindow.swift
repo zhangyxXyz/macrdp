@@ -346,6 +346,9 @@ private struct AudioTab: View {
     var body: some View {
         Form {
             Section {
+                Toggle("Remote-only playback (experimental)", isOn: model.boolBinding("AUDIO_REMOTE_ONLY"))
+                Text("Uses a private Core Audio tap on macOS 14.2+. Requires system audio recording permission. Suppresses local playback while capturing for the client, without changing system volume. Disconnect restores local playback. Keep the RDP window open; minimize may pause forwarded audio.")
+                    .font(.caption).foregroundColor(.secondary)
                 Toggle("AAC audio", isOn: model.boolBinding("ENABLE_AAC"))
                 Text("Compresses forwarded audio as AAC-LC (~11× less bandwidth than PCM). Clients "
                     + "without AAC fall back to PCM. Adds ~40–50 ms latency, so it's off by default.")
@@ -443,7 +446,7 @@ private struct DisplayTab: View {
                         .lineLimit(nil).fixedSize(horizontal: false, vertical: true)
                 }
                 Text("Locking waits for physical-display restoration and the disconnect safety delay "
-                    + "(about 25 s plus restoration time), then requests a password-required lock. "
+                    + "(2.5 s reactivation grace plus restoration time; reconnects may hold longer), then requests a password-required lock. "
                     + "The screen-saver password delay is unchanged; failures are recorded in the log. "
                     + "Automatic unlock runs after authentication, before capture, and types your account "
                     + "password — while unlocked, anyone at the Mac has your desktop.")
@@ -660,6 +663,18 @@ private struct PermissionsTab: View {
             Section("Accessibility") {
                 permRow(granted: accessibility) { model.controller.openAccessibility() }
             }
+            Section("Full Disk Access (optional)") {
+                Text("For Mac-to-Windows file copies from protected folders or volumes. "
+                    + "Add macrdp.app (the server, not this controller) in System Settings, "
+                    + "enable it, then restart the server. This does not repair Windows-to-Mac clipboard formats.")
+                    .font(.caption).foregroundColor(.secondary)
+                Text("View or change this permission in System Settings.")
+                    .font(.caption).foregroundColor(.secondary)
+                HStack {
+                    Button("Open Full Disk Access…") { model.controller.openFullDiskAccess() }
+                    Button("Show macrdp.app in Finder") { model.controller.revealServerForPermissions() }
+                }
+            }
             Button("Refresh status") { refresh() }
         }
         .formStyle(.grouped)
@@ -765,6 +780,7 @@ private struct StatusView: View {
                     row("Client-requested scale", d.scale("requested"))
                     row("RDP output pixels", d.dimensions("wire"))
                     row("Mac workspace (points)", d.dimensions("actual", width: "points_width", height: "points_height"))
+                    Text("At 200% HiDPI, 3840 × 2160 pixels use a 1920 × 1080 workspace. macOS Displays may label this 1080p; check RDP pixels for the transmitted resolution.").font(.caption).foregroundColor(.secondary)
                     row("Mac backing pixels", d.dimensions("actual", width: "backing_width", height: "backing_height"))
                     row("Remote interface scale", d.scale("actual"))
                     row("Mac rendering scale", d.scale("actual", key: "backing_scale_percent"))
@@ -783,6 +799,16 @@ private struct StatusView: View {
                     Text("Requested settings are not proof of the active display mode.").font(.caption).foregroundColor(.secondary)
                         .lineLimit(nil).fixedSize(horizontal: false, vertical: true)
                 }
+            }
+            Section("Audio — reported by server") {
+                if let audio = displayStatus?.object["audio"] as? [String: Any] {
+                    row("Capture state", audio["phase"] as? String ?? "Unknown")
+                    row("Capture mode", (audio["remote_only"] as? Bool).map { $0 ? "Remote only" : "Local and remote" } ?? "Not negotiated")
+                    if let error = audio["last_error"] as? String {
+                        Text(error).font(.caption).foregroundColor(.orange)
+                    }
+                    Text("Capture state does not confirm that the client can hear sound.").font(.caption).foregroundColor(.secondary)
+                } else { Text("Audio status unavailable in this server build.").font(.caption) }
             }
             Section("Connection") {
                 if let connected = displayStatus?.object["connected"] as? Bool {

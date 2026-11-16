@@ -58,7 +58,7 @@ struct FilesHost {
         guard UUID(uuidString: command.instance) != nil else { throw HostError.invalid }
         let id = prefix + command.instance
         var domains = try await allDomains()
-        if operation == "resolve" || operation == "stop" {
+        if operation == "resolve" || operation == "stop" || operation == "evict" {
           for _ in 0..<10 where !domains.contains(where: { $0.identifier.rawValue == id }) {
             try await Task.sleep(nanoseconds: 100_000_000)
             domains = try await allDomains()
@@ -115,6 +115,15 @@ struct FilesHost {
         guard let manager = NSFileProviderManager(for: domain) else {
           output(["error": "FileProviderManagerUnavailable", "domain": id])
           exit(1)
+        }
+        // Diagnostic cache eviction; scoped to this host's exact domain UUID.
+        if operation == "evict" {
+          guard let items = command.items, !items.isEmpty, items.count <= 4096 else {
+            throw HostError.invalid
+          }
+          for item in items { try await manager.evictItem(identifier: .init(item)) }
+          output(["evicted": true])
+          exit(0)
         }
         if operation == "resolve" {
           for container in [NSFileProviderItemIdentifier.rootContainer, .workingSet] {

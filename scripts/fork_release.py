@@ -13,6 +13,7 @@ from urllib.parse import quote
 
 MARKER = '<!-- macrdp-fork-release:v1 '
 TAG = re.compile(r'v\d+\.\d+\.\d+(?:-[A-Za-z0-9][A-Za-z0-9.-]*)?\Z')
+SHA = re.compile(r'[a-f0-9]{40}\Z')
 
 
 def gh(*args, data=None):
@@ -35,13 +36,58 @@ def owner_sha(release):
     return marker_sha(release) if TAG.fullmatch(release['tag_name']) else None
 
 
+def resolve_tag_commit(repo, tag):
+    """Peel lightweight/annotated tags without trusting target_commitish."""
+    obj = api(f'repos/{repo}/git/ref/tags/{quote(tag, safe="")}')['object']
+    seen = set()
+    for _ in range(16):
+        sha = obj.get('sha')
+        if not isinstance(sha, str) or not SHA.fullmatch(sha) or sha in seen:
+            raise ValueError('invalid or cyclic remote tag target')
+        if obj.get('type') == 'commit':
+            return sha
+        if obj.get('type') != 'tag':
+            raise ValueError('remote version tag does not reference a commit')
+        seen.add(sha)
+        obj = api(f'repos/{repo}/git/tags/{sha}')['object']
+    raise ValueError('remote annotated tag chain is too deep')
+
+
+def require_tag_source(repo, tag, sha):
+    if resolve_tag_commit(repo, tag) != sha:
+        raise ValueError(f'version tag {tag} no longer points to expected source commit; refusing mutation')
+
+
+def staging_tag(tag, sha):
+    return f'staging-{tag}-{sha}'
+
+
+def owned_published(release, tag):
+    sha = owner_sha(release)
+    return (release.get('draft') is False and release.get('tag_name') == tag
+            and bool(sha) and release.get('name') == 'macrdp ' + tag
+            and release.get('target_commitish') == sha)
+
+
+def release_identity(release):
+    # Downloads change counters without editing a release. Compare immutable
+    # asset identity and edit-sensitive fields, not download_count/browser URLs.
+    fields = ('id', 'tag_name', 'draft', 'body', 'name', 'target_commitish',
+              'published_at', 'updated_at', 'prerelease')
+    asset_fields = ('id', 'name', 'size', 'digest', 'state', 'created_at', 'updated_at')
+    return {**{key: release.get(key) for key in fields},
+            'assets': sorted(({key: asset.get(key) for key in asset_fields}
+                              for asset in release.get('assets', [])), key=lambda a: a['id'])}
+
+
 def owned_draft(release, tag, sha):
     # GitHub may rename a draft to untagged-* after an edit. Its stable ID,
     # exact pipeline name, target commit and provenance must all still match.
     return (release.get('draft') is True and marker_sha(release) == sha
             and release.get('name') == 'macrdp ' + tag
             and release.get('target_commitish') == sha
-            and (release['tag_name'] == tag or release['tag_name'].startswith('untagged-')))
+            and (release['tag_name'] in (tag, staging_tag(tag, sha))
+                 or release['tag_name'].startswith('untagged-')))
 
 
 def upload_assets(repo, release, paths):
@@ -110,25 +156,39 @@ def notes(tag, sha, repo):
 
 
 def stage(repo, tag, sha, directory):
-    if not TAG.fullmatch(tag):
+    if not isinstance(tag, str) or not TAG.fullmatch(tag):
         raise ValueError('unsupported version tag')
+    if not isinstance(sha, str) or not SHA.fullmatch(sha):
+        raise ValueError('source commit must be a full lowercase SHA')
     name = f'macrdp-{tag}-aarch64-apple-darwin-app.zip'
     verify_files(Path(directory, name).read_bytes(), Path(directory, 'SHA256SUMS').read_bytes(), sha, name)
     existing = json.loads(gh('api', '--paginate', '--slurp', f'repos/{repo}/releases?per_page=100'))
     records = [r for page in existing for r in page]
-    matches = [r for r in records if r['tag_name'] == tag or owned_draft(r, tag, sha)]
-    if len(matches) > 1:
+    staged_tag = staging_tag(tag, sha)
+    # Authenticate both the public release and any candidate draft before the
+    # first mutation. Same-tag republish never edits/uploads into the public ID.
+    published = [r for r in records if r['tag_name'] == tag and not r.get('draft')]
+    drafts = [r for r in records if owned_draft(r, tag, sha)]
+    collisions = [r for r in records if r['tag_name'] in (tag, staged_tag)
+                  and not (owned_published(r, tag) or owned_draft(r, tag, sha))]
+    if collisions:
+        raise ValueError('refusing to overwrite an unowned release or draft')
+    if len(published) > 1 or len(drafts) > 1:
         raise ValueError('ambiguous release drafts; refusing to select one')
-    release = matches[0] if matches else None
+    old = published[0] if published else None
+    old_identity = release_identity(old) if old else None
+    release = drafts[0] if drafts else None
     body = notes(tag, sha, repo)
+    require_tag_source(repo, tag, sha)
+    data = {'tag_name': staged_tag, 'target_commitish': sha, 'name': 'macrdp ' + tag,
+            'body': body, 'draft': True, 'prerelease': '-' in tag}
     if release:
-        if not owned_draft(release, tag, sha):
-            raise ValueError('refusing to overwrite a published or unowned release')
-        release = api(f"repos/{repo}/releases/{release['id']}", 'PATCH',
-            {'tag_name': tag, 'target_commitish': sha, 'name': 'macrdp ' + tag, 'body': body, 'draft': True})
+        fresh_draft = api(f"repos/{repo}/releases/{release['id']}")
+        if not owned_draft(fresh_draft, tag, sha) or release_identity(fresh_draft) != release_identity(release):
+            raise ValueError('staging draft changed before reuse')
+        release = api(f"repos/{repo}/releases/{release['id']}", 'PATCH', data)
     else:
-        release = api(f'repos/{repo}/releases', 'POST', {'tag_name': tag, 'target_commitish': sha,
-            'name': 'macrdp ' + tag, 'body': body, 'draft': True, 'prerelease': '-' in tag})
+        release = api(f'repos/{repo}/releases', 'POST', data)
     # Re-read and authenticate before deleting/replacing any asset.
     release = api(f"repos/{repo}/releases/{release['id']}")
     if not owned_draft(release, tag, sha):
@@ -136,7 +196,24 @@ def stage(repo, tag, sha, directory):
     upload_assets(repo, release, [Path(directory, name), Path(directory, 'SHA256SUMS')])
     release = api(f"repos/{repo}/releases/{release['id']}")
     verify_release(repo, release, tag, sha)
-    # Only publish after round-trip verification. Always restore the real tag.
+    fresh_verified = api(f"repos/{repo}/releases/{release['id']}")
+    if not owned_draft(fresh_verified, tag, sha) or release_identity(fresh_verified) != release_identity(release):
+        raise ValueError('verified staging draft changed; refusing publication')
+    # The old public download remains available until its replacement has
+    # passed checksum, SOURCE_COMMIT and bundle checks after downloading it.
+    if old:
+        fresh_old = api(f"repos/{repo}/releases/{old['id']}")
+        if not owned_published(fresh_old, tag) or release_identity(fresh_old) != old_identity:
+            raise ValueError('published release changed during staging; refusing replacement')
+        require_tag_source(repo, tag, sha)
+        # Deleting the Release resource does NOT delete its Git tag. Never use
+        # gh release delete --cleanup-tag for a same-version replacement.
+        gh('api', '--method', 'DELETE', f"repos/{repo}/releases/{old['id']}")
+    else:
+        require_tag_source(repo, tag, sha)
+    # GitHub has no atomic Release swap. If this final PATCH fails, the verified
+    # owned staging draft is retained for retry; neither Git tag is deleted here.
+    # Always restore the real version tag when publishing (asset names use it).
     published = api(f"repos/{repo}/releases/{release['id']}", 'PATCH',
         {'tag_name': tag, 'target_commitish': sha, 'name': 'macrdp ' + tag,
          'draft': False, 'prerelease': '-' in tag, 'make_latest': 'false' if '-' in tag else 'true'})
@@ -155,13 +232,16 @@ def cleanup(repo, dry_run):
         return
     current = owned[0]
     verify_release(repo, current)  # Fail closed: never prune before verifying the retained download.
+    require_tag_source(repo, current['tag_name'], owner_sha(current))
     for old in owned[1:]:
         # Re-read before mutation: drafts, edits or a changed retained release abort deletion.
         fresh_current = api(f"repos/{repo}/releases/{current['id']}")
         fresh_old = api(f"repos/{repo}/releases/{old['id']}")
         for fresh, original in [(fresh_current, current), (fresh_old, old)]:
-            if any(fresh.get(k) != original.get(k) for k in ('body', 'draft', 'tag_name', 'assets', 'published_at')):
+            if release_identity(fresh) != release_identity(original):
                 raise ValueError('release changed during cleanup; refusing deletion')
+        require_tag_source(repo, current['tag_name'], owner_sha(current))
+        require_tag_source(repo, old['tag_name'], owner_sha(old))
         print(('Would delete ' if dry_run else 'Deleting ') + old['tag_name'] + ' (including its tag)')
         if not dry_run:
             gh('release', 'delete', old['tag_name'], '--repo', repo, '--cleanup-tag', '--yes')

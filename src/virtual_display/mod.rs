@@ -25,6 +25,33 @@ pub use stub::{
     DetachedPrimary, PrimaryOverride, ShieldedPrimary, VirtualDisplay,
 };
 
+#[cfg(any(target_os = "macos", test))]
+fn shield_ack_sufficient(ack: Option<u16>, targets: usize) -> bool {
+    ack.is_some_and(|n| usize::from(n) >= targets)
+}
+
+/// Query failures remain errors: never interpret a failed enumeration as unplugged.
+#[cfg(target_os = "macos")]
+pub fn other_displays(
+    virtual_id: Option<u32>,
+) -> anyhow::Result<crate::display_transition::OtherDisplays> {
+    let active = core_graphics::display::CGDisplay::active_displays()
+        .map_err(|e| anyhow::anyhow!("CGGetActiveDisplayList: CGError {e}"))?;
+    let online = macos::online_displays()
+        .map_err(|e| anyhow::anyhow!("CGGetOnlineDisplayList: CGError {e}"))?;
+    Ok(crate::display_transition::OtherDisplays::classify(
+        &active, &online, virtual_id,
+    ))
+}
+#[cfg(not(target_os = "macos"))]
+pub fn other_displays(_: Option<u32>) -> anyhow::Result<crate::display_transition::OtherDisplays> {
+    Ok(crate::display_transition::OtherDisplays::classify(
+        &[],
+        &[],
+        None,
+    ))
+}
+
 /// Measurements, not configuration intent. A missing CoreGraphics pixel mode
 /// remains unknown instead of being guessed from a requested HiDPI flag.
 #[derive(Clone, Debug, Default)]
@@ -308,7 +335,7 @@ mod macos {
     // online-but-currently-disabled displays — which is exactly the set we
     // need to look at when recovering from a prior install/drop that left a
     // physical display stuck disabled.
-    fn online_displays() -> Result<Vec<CGDirectDisplayID>, CGError> {
+    pub(super) fn online_displays() -> Result<Vec<CGDirectDisplayID>, CGError> {
         extern "C" {
             fn CGGetOnlineDisplayList(
                 max_displays: u32,
@@ -328,6 +355,9 @@ mod macos {
             if r != 0 {
                 return Err(r);
             }
+            if got as usize > buf.len() {
+                return Err(1000);
+            } // topology changed during enumeration
             buf.truncate(got as usize);
             Ok(buf)
         }
@@ -893,14 +923,11 @@ mod macos {
         /// Each physical display we disabled, with its origin at
         /// install time (so Drop can put it back where it was).
         detached: Vec<(u32, (i32, i32))>,
-        enabler: private_api::DisplayEnabler,
+        enabler: Option<private_api::DisplayEnabler>,
     }
 
     impl DetachedPrimary {
         pub fn install(virtual_display_id: u32) -> Result<Self> {
-            let enabler = private_api::DisplayEnabler::load()
-                .context("loading CGSConfigureDisplayEnabled private symbol")?;
-
             // Capture vd's pre-install bounds.
             let vd = CGDisplay::new(virtual_display_id);
             let vd_bounds = vd.bounds();
@@ -949,11 +976,16 @@ mod macos {
                 }
             }
             if detached.is_empty() {
-                return Err(anyhow!(
-                    "no physical display to detach — the virtual display is the \
-                     only active one already"
-                ));
+                tracing::info!("no physical displays online — detach is a no-op");
+                return Ok(Self {
+                    virtual_id: virtual_display_id,
+                    virtual_old_origin,
+                    detached,
+                    enabler: None,
+                });
             }
+            let enabler = private_api::DisplayEnabler::load()
+                .context("loading CGSConfigureDisplayEnabled private symbol")?;
 
             // Any CGDisplay handle works for begin/complete; the config is global.
             let any = CGDisplay::new(virtual_display_id);
@@ -1007,13 +1039,25 @@ mod macos {
                 virtual_id: virtual_display_id,
                 virtual_old_origin,
                 detached,
-                enabler,
+                enabler: Some(enabler),
             })
         }
     }
 
     impl Drop for DetachedPrimary {
         fn drop(&mut self) {
+            let Some(enabler) = &self.enabler else {
+                return;
+            };
+            // A monitor unplugged during RDP cannot be re-enabled. Do not spend
+            // retry delays or trigger a process restart for that absent device.
+            // On enumeration failure retain targets and the existing recovery.
+            if let Ok(online) = online_displays() {
+                self.detached.retain(|(id, _)| online.contains(id));
+                if self.detached.is_empty() {
+                    return;
+                }
+            }
             tracing::info!(
                 detached_count = self.detached.len(),
                 "DetachedPrimary::drop running — re-enabling physical displays"
@@ -1052,7 +1096,7 @@ mod macos {
                     }
                 };
                 for (id, _) in &self.detached {
-                    if let Err(e) = self.enabler.set(config, *id, true) {
+                    if let Err(e) = enabler.set(config, *id, true) {
                         tracing::warn!(attempt, "could not queue enable for display {id} ({e})");
                     }
                 }
@@ -1220,6 +1264,16 @@ mod macos {
                 })
                 .collect();
             if targets.is_empty() {
+                if super::other_displays(Some(virtual_display_id))?
+                    == crate::display_transition::OtherDisplays::None
+                {
+                    tracing::info!("no physical displays online — capture-primary is a no-op");
+                    return Ok(Self {
+                        virtual_id: virtual_display_id,
+                        virtual_old_origin,
+                        captured: Vec::new(),
+                    });
+                }
                 return Err(anyhow!(
                     "no physical display to capture — the virtual display is \
                      the only active one already"
@@ -1368,6 +1422,9 @@ mod macos {
 
     impl Drop for CapturedPrimary {
         fn drop(&mut self) {
+            if self.captured.is_empty() {
+                return;
+            }
             tracing::info!(
                 captured_count = self.captured.len(),
                 "CapturedPrimary::drop running — restoring gamma + releasing displays"
@@ -1394,6 +1451,12 @@ mod macos {
                 }
             }
 
+            if let Ok(online) = online_displays() {
+                self.captured.retain(|(id, _)| online.contains(id));
+                if self.captured.is_empty() {
+                    return;
+                }
+            }
             std::thread::sleep(TX_SETTLE);
 
             // Best-effort restore of the pre-install origins.
@@ -1838,7 +1901,7 @@ mod macos {
             // than to keep widening this.
             const SHOW_BACKOFF_MS: [u64; 6] = [300, 500, 800, 1200, 1600, 2000];
             let need = targets.len();
-            let mut shielded_count = 0u16;
+            let mut shielded_count = None;
             let mut last_err: Option<anyhow::Error> = None;
             for (attempt, backoff) in SHOW_BACKOFF_MS
                 .iter()
@@ -1848,7 +1911,7 @@ mod macos {
             {
                 match crate::shield::show(&[virtual_display_id]) {
                     Ok(n) => {
-                        shielded_count = n;
+                        shielded_count = Some(n);
                         if usize::from(n) >= need {
                             last_err = None;
                             break;
@@ -1873,7 +1936,7 @@ mod macos {
                     None => break,
                 }
             }
-            if usize::from(shielded_count) < need {
+            if !super::shield_ack_sufficient(shielded_count, need) {
                 let _ = crate::shield::hide();
                 // Undo the mirror-break (which also undoes the displace) — we
                 // return before `Self` exists, so Drop will never do it, and
@@ -1901,8 +1964,10 @@ mod macos {
             // keep_physical_main = false: the old behaviour — move vd → (0,0),
             // physicals aside. Remote gets the menu bar + Dock, but the lock
             // screen renders on the invisible headless vd (refuted 2026-07-20).
-            let keep_physical_main = shield_keeps_physical_main();
-            if keep_physical_main {
+            let keep_physical_main = shield_keeps_physical_main() || targets.is_empty();
+            if targets.is_empty() {
+                tracing::info!("--shield-primary: no physical panels; helper is ready for hot-plugged displays");
+            } else if keep_physical_main {
                 tracing::info!(
                     "--shield-primary: keeping the PHYSICAL panel as system main so a \
                      lock screen stays visible locally (the vd is NOT moved to (0,0)). \
@@ -2500,5 +2565,12 @@ mod tests {
         // Fixed width (it can't change after creation), aspect follows.
         assert_eq!(panel_size_mm(1920, 1080, true).0, w_mm);
         assert!((h_mm / w_mm - 2168.0 / 3456.0).abs() < 1e-9);
+    }
+    #[test]
+    fn no_monitors_still_requires_shield_helper_acknowledgement() {
+        assert!(!shield_ack_sufficient(None, 0));
+        assert!(shield_ack_sufficient(Some(0), 0));
+        assert!(!shield_ack_sufficient(Some(0), 1));
+        assert!(shield_ack_sufficient(Some(2), 2));
     }
 }

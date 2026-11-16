@@ -59,6 +59,30 @@ impl Coordinator {
     }
 }
 
+/// Topology of displays other than this session's virtual display. Offline is
+/// not a restoration failure; online-but-inactive must never be mistaken for it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OtherDisplays {
+    None,
+    Active,
+    Inactive,
+}
+impl OtherDisplays {
+    pub fn classify(active: &[u32], online: &[u32], virtual_id: Option<u32>) -> Self {
+        let other = |id: &u32| *id != 0 && Some(*id) != virtual_id;
+        if active.iter().any(other) {
+            Self::Active
+        } else if online.iter().any(other) {
+            Self::Inactive
+        } else {
+            Self::None
+        }
+    }
+    pub fn can_release_virtual(self) -> bool {
+        self != Self::Inactive
+    }
+}
+
 /// A cancelled restore retains its guard; absence and successful removal do
 /// not. Keeping these outcomes distinct prevents a brief reconnect from making
 /// the watcher believe a still-detached physical screen was restored.
@@ -267,5 +291,30 @@ mod tests {
                 .unwrap(),
             None::<()>
         );
+    }
+    #[test]
+    fn offline_and_failed_restoration_are_different() {
+        use OtherDisplays::*;
+        assert_eq!(OtherDisplays::classify(&[42], &[42], Some(42)), None);
+        assert_eq!(OtherDisplays::classify(&[], &[], Option::None), None);
+        assert!(None.can_release_virtual());
+        assert_eq!(OtherDisplays::classify(&[42], &[1, 42], Some(42)), Inactive);
+        assert!(!Inactive.can_release_virtual());
+        assert_eq!(
+            OtherDisplays::classify(&[1, 42], &[1, 42], Some(42)),
+            Active
+        );
+        assert!(Active.can_release_virtual());
+        // Plugging in, detaching, then unplugging the only physical monitor.
+        let states = [
+            (&[1, 42][..], &[1, 42][..]),
+            (&[42][..], &[1, 42][..]),
+            (&[42][..], &[42][..]),
+        ];
+        let allowed: Vec<_> = states
+            .iter()
+            .map(|(a, o)| OtherDisplays::classify(a, o, Some(42)).can_release_virtual())
+            .collect();
+        assert_eq!(allowed, [true, false, true]);
     }
 }

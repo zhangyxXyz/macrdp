@@ -5,6 +5,33 @@ Only implemented behavior and completed checks are recorded here. Client-side ma
 
 ## v0.10.6-dev
 
+### 2026-11-17 rebuild / 同版本重构建
+
+- Consolidate regression gates into reusable CI, then package, stage/download/verify, publish and prune serially without Actions artifacts. Use one macOS runner for native checks, default to ARM64 `macos-26`, and unify lowercase workflow names. The previous cancelled jobs failed to acquire GitHub hosted runners before executing steps.
+- 回归集中在可复用 CI，通过后串行打包、草稿上传／下载校验、发布和清理，不使用 Actions 归档。原生检查共用一个 macOS runner，默认 ARM64 `macos-26`，统一小写工作流名称。此前被取消的任务是在执行步骤前无法取得 GitHub 托管 runner。
+- Same-tag replacement keeps the old owned Release available until the separate staging draft verifies. Validate remote tag/source identity and reject stale runs or concurrent edits; keep a verified draft retryable if final publication fails. Version remains `0.10.6`.
+- 同标签覆盖先保留旧 Release，独立暂存草稿验证完成后再替换；核对远端 tag 与来源提交，拒绝过期运行或并发修改。最终发布失败时保留可重试的已验证草稿。应用版本仍为 `0.10.6`。
+- Pre-push local validation: 491 Rust tests passed (8 ignored), strict Clippy, 33 configuration CLI checks, 10 controller configuration tests, 10 File Provider adapter checks and sanitized native audio-buffer checks. Actual Windows playback/paste, disconnect lock and monitor-free reconnect remain manual checks.
+- 推送前本地验证：491 项 Rust 测试通过（8 项忽略）、严格 Clippy、33 项配置 CLI、10 项控制器配置、10 项 File Provider 适配检查及带内存／未定义行为检查的原生音频缓冲测试。真实 Windows 音频、粘贴、断开锁屏及无屏重连仍需手动验证。
+
+- Handle logged-in sessions without monitors: distinguish no online display from failed restore, use no-op physical guards, filter unplugged restoration targets, keep the virtual surface through disconnect locking, and bootstrap it before headless auto-unlock with cancellation-safe ownership. Shield requires a helper ACK even with zero targets. Real unplug/replug/locked reconnect checks remain pending.
+- 覆盖已登录但未插显示器：区分无屏与恢复失败，实体屏空操作、过滤已拔目标、持有虚拟屏至断开锁屏结束，无屏解锁前准备显示面并保护取消时的所有权。Shield 零目标也要求辅助进程确认；真实拔插及无屏锁定重连仍待验证。
+
+- Add an opt-in private Core Audio tap for remote-only playback, capture state/error reporting, actual-rate resampling, and cancellable audio waits. No hardware mute/volume/default-device writes. A local isolated probe captured a nonzero 48 kHz test tone and cleaned up successfully; rebuilt-server/mstsc verification is pending.
+- 新增可选的 Core Audio 私有 Tap，仅远端播放、报告捕获状态与错误、按实际采样率转换，并在无回调时仍响应取消。不修改硬件静音、音量或默认设备。独立本机诊断已捕获 48 kHz 非零提示音并成功清理；新版 mstsc 端到端验证待进行。
+- Cancel obsolete disconnect locks across reconnect epochs, retain the final disconnect when notifications merge, and serialize final lock requests with auto-unlock. Physical restoration and bounded handshake protection remain; the default extra delay is zero.
+- 跨重连代次取消过期锁屏任务，通知合并时仍处理最后断开，最终锁屏与自动解锁串行执行；保留实体屏恢复和有上限的握手保护，默认额外等待为零。
+
+- File Provider publishes writable local clipboard snapshots, persists local edits with version checks and atomic metadata, and never uploads to the Windows source. Ten adapter and eight synthetic OS checks include unlocked/editable exported copies and offline rehydration of local edits. Remove the menu-bar status tooltip that can linger across display changes.
+- File Provider 提供可写本地剪贴板副本，按版本及原子元数据保存本地修改，不回写 Windows 源文件。10 项适配层与 8 项合成源系统检查包含导出文件无锁可编辑、本地修改离线再物化；取消可能在显示切换后滞留的菜单栏状态浮条。
+
+- Invalidate stale remote clipboard representations for unsupported formats, including the observed Directory Opus private-format announcement. Publish concrete file-URL items and verify read-back; keep on-demand File Provider hydration. Real Finder paste with the revised binary is pending.
+- Add an optional Full Disk Access settings entry for protected Mac source files, explain logical points versus 4K output, remove the extra default 22.5-second disconnect-lock delay, and account for reconnect attempts during native display restoration. Restoration/grace/reconnect holds still apply.
+- 新的远端格式声明使旧内容失效，覆盖实测 Directory Opus 私有格式；文件 URL 显式写入并读回核对，保留系统按需物化。修正版的 Finder 实际粘贴仍待验证。
+- 增加可选的完全磁盘访问入口，说明逻辑工作区与 4K 输出差异；移除默认额外 22.5 秒断开锁屏等待，计入实体屏恢复期间发生的重连。仍保留恢复、宽限及重连保护。
+
+### Earlier changes / 既有变更
+
 ### English
 
 - Bound event batches to 32, preserve async clipboard priority and retain completion permits until dispatch ends. Add regressions for reply priority, budget lifetime, bounded draining and timed-out OS worker retention. This does not eliminate TCP backpressure; real mstsc verification remains pending.

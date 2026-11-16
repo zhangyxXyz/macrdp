@@ -40,6 +40,8 @@
     <true/>
     <key>NSAppleEventsUsageDescription</key>
     <string>macrdp uses AppleScript to forward macOS hotkeys (Spotlight, clipboard paste) on behalf of connected RDP clients.</string>
+    <key>NSAudioCaptureUsageDescription</key>
+    <string>macrdp captures system audio for remote playback. Remote-only audio suppresses local playback while a connected client receives sound.</string>
     <key>NSHumanReadableCopyright</key>
     <string>macrdp — native RDP server for macOS.</string>
 </dict>

@@ -11,6 +11,8 @@
 mod aac;
 mod audin;
 mod audio;
+#[cfg(target_os = "macos")]
+mod audio_tap;
 mod auth;
 mod auth_guard;
 mod auth_status;
@@ -425,8 +427,8 @@ struct Args {
     /// disconnects (opt-in; needs --detach-primary/--capture-primary/--shield-primary).
     /// Uses an immediate lock request plus system-state confirmation, without
     /// changing the screen-saver password delay or falling back to a screen saver.
-    /// Existing display restoration, disconnect grace and safety buffer remain
-    /// (MACRDP_LOCK_ON_DISCONNECT_DELAY_MS, default 22500ms extra); a reconnect
+    /// Locks after display restoration and disconnect grace, without an extra
+    /// wait by default (MACRDP_LOCK_ON_DISCONNECT_DELAY_MS=0); a reconnect
     /// may hold the timer briefly. Does not fire on server shutdown. macOS-only.
     #[arg(long)]
     lock_on_disconnect: bool,
@@ -589,6 +591,12 @@ struct Args {
     /// at the cost of accepting that drift on refocus.
     #[arg(long = "no-mute-on-minimize", action = clap::ArgAction::SetTrue)]
     no_mute_on_minimize: bool,
+
+    /// Capture via a private Core Audio tap and suppress local playback while
+    /// streaming to the client. Requires macOS 14.2+ and audio capture permission.
+    /// Does not change system volume, mute or the default output device.
+    #[arg(long)]
+    audio_remote_only: bool,
 
     /// Compress forwarded audio as AAC-LC over RDPSND (MS-RDPEA
     /// WAVE_FORMAT_AAC_MS) instead of raw 16-bit PCM — ~11x less audio
@@ -1482,15 +1490,13 @@ fn restore_gather_windows(_display_id: u32) -> usize {
     0
 }
 
-/// Extra safety buffer on top of the overlay watcher's `REACTIVATION_GRACE`
-/// before `--lock-on-disconnect` actually locks the screen. Default chosen to
-/// clear the documented blank-recovery worst case (~12-15s drop-then-ARC-
-/// reconnect cycle, see docs/known-quirks.md) with real margin — a false-
-/// positive lock mid a legitimate self-heal is a worse outcome than staying
-/// unlocked a bit longer than strictly necessary after a genuine disconnect.
+/// Optional extra wait after physical-display restoration. Default is zero:
+/// the reactivation grace and native restoration already precede the lock.
+/// The former 22.5-second extra wait could lock a user who had returned locally.
+/// Reconnect activity remains bounded independently by `lock_activity`.
 /// Tunable via MACRDP_LOCK_ON_DISCONNECT_DELAY_MS / config
 /// LOCK_ON_DISCONNECT_DELAY_MS.
-const LOCK_ON_DISCONNECT_DELAY_DEFAULT_MS: u64 = 22_500; // + 2.5s grace ≈ 25s total
+const LOCK_ON_DISCONNECT_DELAY_DEFAULT_MS: u64 = 0;
 
 fn parse_lock_on_disconnect_delay_ms(env_override: Option<&str>) -> u64 {
     env_override
@@ -1519,6 +1525,9 @@ fn lock_session() -> bool {
         }
     }
 }
+
+/// Serialize final lock requests with password input; re-check reconnect state after taking it.
+static SESSION_LOCK_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Bumped on every disconnect edge that arms a `--lock-on-disconnect` lock, so
 /// a pending lock from an earlier disconnect stands down in favour of the
@@ -1649,8 +1658,9 @@ fn alert_auto_unlock_gave_up() {}
 #[cfg(target_os = "macos")]
 fn attempt_auto_unlock(password: &str) -> AutoUnlockOutcome {
     // Serialize real password submissions, including future alternate callers.
-    static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    let _serial = SERIAL.lock().unwrap_or_else(|error| error.into_inner());
+    let _serial = SESSION_LOCK_SERIAL
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
     use core_graphics::event::{CGEvent, CGEventFlags, CGEventTapLocation, CGEventType};
     use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
 
@@ -1959,8 +1969,8 @@ fn spawn_primary_overlay_watcher<T: Send + 'static>(
     restore_windows: bool,
     physical_main_id: u32,
     // (--lock-on-disconnect) When set, lock the local session on a genuine
-    // last-client-disconnect (after an extra safety buffer beyond the
-    // REACTIVATION_GRACE poll above), holding it while a reconnect is still
+    // last-client-disconnect (after restoration and the REACTIVATION_GRACE
+    // poll above), holding it while a reconnect is still
     // handshaking (see lock_activity). None = feature off.
     lock_on_disconnect: Option<Arc<lock_activity::ConnectionActivity>>,
 ) {
@@ -1996,6 +2006,7 @@ fn spawn_primary_overlay_watcher<T: Send + 'static>(
         const REACTIVATION_GRACE: Duration = Duration::from_millis(2500);
         const REACTIVATION_POLL: Duration = Duration::from_millis(75);
         let mut was_zero = true;
+        let mut observed_connection_epoch = 0;
         let mut installed_at: Option<Instant> = None;
         let mut restore_state = display_transition::RestoreState::default();
         let mut reconcile = false;
@@ -2009,6 +2020,14 @@ fn spawn_primary_overlay_watcher<T: Send + 'static>(
             }
             let count = tracker.count.load(Ordering::SeqCst);
             let now_zero = count == 0;
+            let connection_epoch = tracker.connection_epoch.load(Ordering::SeqCst);
+            // A complete connect/disconnect can fit between watcher polls, or
+            // inside native restoration. It still needs its own disconnect
+            // effects, even when the previous overlay is already gone.
+            if now_zero && connection_epoch != observed_connection_epoch {
+                was_zero = false;
+            }
+            observed_connection_epoch = connection_epoch;
             if restore_state.restart_due(!now_zero) {
                 was_zero = false;
             }
@@ -2021,7 +2040,7 @@ fn spawn_primary_overlay_watcher<T: Send + 'static>(
                             label,
                             "connection flapped during debounce — skipping install"
                         );
-                        (was_zero, reconcile) = restore_state.reconcile(false, false);
+                        (was_zero, reconcile) = (false, true);
                         continue;
                     }
                     let Some(vd_id) = display.lock().unwrap().id_if_active() else {
@@ -2117,6 +2136,17 @@ fn spawn_primary_overlay_watcher<T: Send + 'static>(
                     }
                 }
                 (false, true) => {
+                    // Include reconnect attempts that begin DURING the slow
+                    // native restoration, not only those after it completes.
+                    // Keep the sole virtual surface until the pending lock has
+                    // completed/cancelled; release is independent of physical panels.
+                    let lock_display_lease = lock_on_disconnect
+                        .as_ref()
+                        .and_then(|_| display_session::ManagedDisplay::retain_active(&display));
+                    let disconnected_epoch = tracker.connection_epoch.load(Ordering::SeqCst);
+                    let disconnected_ms = lock_on_disconnect
+                        .as_ref()
+                        .map(|activity| activity.now_ms());
                     // Absorb a transient count→0: a core deactivation–reactivation
                     // (a live resize on maximize, or blank recovery) flaps 1→0→1
                     // as the vendored server rebuilds `CountedUpdates`. Poll for
@@ -2259,6 +2289,7 @@ fn spawn_primary_overlay_watcher<T: Send + 'static>(
                                 file_promise_lazy::shutdown_cleanup();
                                 file_provider::shutdown().await;
                             }
+                            audio::shutdown();
                             rdpdr::shutdown_cleanup();
                             std::process::exit(DETACH_STUCK_EXIT_CODE);
                         } else {
@@ -2310,126 +2341,141 @@ fn spawn_primary_overlay_watcher<T: Send + 'static>(
                                 }
                             });
                         }
-                        // (--lock-on-disconnect) Lock the local session after an
-                        // EXTRA safety buffer on top of the REACTIVATION_GRACE poll
-                        // above. That poll only absorbs a fast in-place flap (a core
-                        // reactivation); it can't distinguish a genuine disconnect
-                        // from blank-recovery's slower fallback (a full connection
-                        // drop + ARC auto-reconnect, documented up to ~12-15s worst
-                        // case) — so this waits longer still and re-checks
-                        // `tracker.count` before actually locking, canceling if the
-                        // session came back. Off-thread so the watcher loop isn't
-                        // blocked; naturally abandoned (never fires) if the process
-                        // exits in the meantime (e.g. the #168 restart-on-stuck
-                        // path) — lock-on-disconnect only ever fires on a genuine
-                        // watcher-observed last-client-disconnect, never on server
-                        // shutdown/kill. Heuristic, not a guarantee — see
-                        // docs/known-quirks.md.
-                        if let Some(activity) = lock_on_disconnect.clone() {
-                            let tracker_for_lock = tracker.clone();
-                            let transitions_for_lock = transitions.clone();
-                            // A later disconnect supersedes this one's pending
-                            // lock (it arms its own, timed from ITS edge).
-                            let generation = LOCK_GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
-                            let disconnect_ms = activity.now_ms();
-                            std::thread::spawn(move || {
-                                let delay = Duration::from_millis(lock_on_disconnect_delay_ms());
-                                std::thread::sleep(delay);
-                                // A client reconnecting late in the buffer only
-                                // counts as live once FULLY connected (~10 s over
-                                // ZeroTier), so hold the lock while a reconnect
-                                // is still handshaking — capped, so a peer that
-                                // merely opens connections can only delay it.
-                                let due_ms = activity.now_ms();
-                                let mut holding = false;
-                                loop {
-                                    if transitions_for_lock.is_stopping() {
-                                        return;
-                                    }
-                                    if LOCK_GENERATION.load(Ordering::SeqCst) != generation {
-                                        tracing::debug!(
+                    }
+                    // Lock after physical restoration. The extra delay is
+                    // opt-in; reactivation grace and bounded reconnect holds
+                    // still prevent locking underneath an active reconnect.
+                    if let Some(activity) = lock_on_disconnect.clone() {
+                        let tracker_for_lock = tracker.clone();
+                        let transitions_for_lock = transitions.clone();
+                        // A later disconnect supersedes this one's pending
+                        // lock (it arms its own, timed from ITS edge).
+                        let generation = LOCK_GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
+                        let disconnect_ms = disconnected_ms.unwrap_or_else(|| activity.now_ms());
+                        std::thread::spawn(move || {
+                            let _display_lease = lock_display_lease;
+                            let delay = Duration::from_millis(lock_on_disconnect_delay_ms());
+                            std::thread::sleep(delay);
+                            // A client reconnecting late in the buffer only
+                            // counts as live once FULLY connected (~10 s over
+                            // ZeroTier), so hold the lock while a reconnect
+                            // is still handshaking — capped, so a peer that
+                            // merely opens connections can only delay it.
+                            let due_ms = activity.now_ms();
+                            let mut holding = false;
+                            let _serial = loop {
+                                if transitions_for_lock.is_stopping() {
+                                    return;
+                                }
+                                if LOCK_GENERATION.load(Ordering::SeqCst) != generation
+                                    || tracker_for_lock.connection_epoch.load(Ordering::SeqCst)
+                                        != disconnected_epoch
+                                {
+                                    tracing::debug!(
+                                        label,
+                                        "lock-on-disconnect: superseded by a later disconnect"
+                                    );
+                                    return;
+                                }
+                                let live = tracker_for_lock.count.load(Ordering::SeqCst) > 0;
+                                match activity.decide(live, disconnect_ms, due_ms) {
+                                    lock_activity::LockDecision::Skip => {
+                                        info!(
                                             label,
-                                            "lock-on-disconnect: superseded by a later disconnect"
+                                            "lock-on-disconnect: session came back during \
+                                                 the safety buffer — skipping lock (treating \
+                                                 as a delayed reconnect/self-heal)"
                                         );
                                         return;
                                     }
-                                    let live = tracker_for_lock.count.load(Ordering::SeqCst) > 0;
-                                    match activity.decide(live, disconnect_ms, due_ms) {
-                                        lock_activity::LockDecision::Skip => {
+                                    lock_activity::LockDecision::Hold => {
+                                        if !holding {
                                             info!(
                                                 label,
-                                                "lock-on-disconnect: session came back during \
-                                                 the safety buffer — skipping lock (treating \
-                                                 as a delayed reconnect/self-heal)"
+                                                "lock-on-disconnect: a client is reconnecting — \
+                                                     holding the lock until it connects (capped)"
                                             );
+                                            holding = true;
+                                        }
+                                        std::thread::sleep(Duration::from_millis(250));
+                                    }
+                                    lock_activity::LockDecision::Lock => {
+                                        let guard = SESSION_LOCK_SERIAL
+                                            .lock()
+                                            .unwrap_or_else(|e| e.into_inner());
+                                        // Auto-unlock may have held the serial gate. Never use
+                                        // the decision made before waiting for it.
+                                        if transitions_for_lock.is_stopping()
+                                            || LOCK_GENERATION.load(Ordering::SeqCst) != generation
+                                            || tracker_for_lock
+                                                .connection_epoch
+                                                .load(Ordering::SeqCst)
+                                                != disconnected_epoch
+                                        {
                                             return;
                                         }
-                                        lock_activity::LockDecision::Hold => {
-                                            if !holding {
-                                                info!(
-                                                    label,
-                                                    "lock-on-disconnect: a client is reconnecting — \
-                                                     holding the lock until it connects (capped)"
-                                                );
-                                                holding = true;
-                                            }
-                                            std::thread::sleep(Duration::from_millis(250));
+                                        let live =
+                                            tracker_for_lock.count.load(Ordering::SeqCst) > 0;
+                                        if activity.decide(live, disconnect_ms, due_ms)
+                                            == lock_activity::LockDecision::Lock
+                                        {
+                                            break guard;
                                         }
-                                        lock_activity::LockDecision::Lock => break,
+                                        drop(guard);
                                     }
                                 }
-                                // Reset the auto-unlock submission budget/alert
-                                // latch HERE, not just on an observed unlock —
-                                // this is a point where the screen is USUALLY
-                                // unlocked (we're about to lock it), and it's
-                                // the fix for a real live-reproduced lockout:
-                                // if a prior auto-unlock attempt actually
-                                // succeeded but a too-tight detection window
-                                // (see RETURN_ATTEMPT_BUDGET above) missed the
-                                // `Some(false)` flip and reported a false
-                                // BudgetExhausted, nothing would otherwise ever
-                                // reset the shared budget — the NEXT lock
-                                // cycle would start pre-exhausted and refuse to
-                                // even attempt an unlock, indefinitely, on a
-                                // Mac nobody is physically at to recover.
-                                //
-                                // GATED on a CONFIRMED `Some(false)` read —
-                                // caught in review: an unconditional reset
-                                // assumed the screen is unlocked here without
-                                // checking, which breaks if it's actually
-                                // already locked (e.g. the account password
-                                // changed while macrdp kept running: RDP still
-                                // accepts the cached old password via NLA, but
-                                // auto-unlock keeps typing that same stale
-                                // password and genuinely fails every time).
-                                // Without the gate, every disconnect/reconnect
-                                // cycle would hand that genuinely-failing
-                                // attempt a fresh budget and burn 2 more real
-                                // PAM submissions against a lock that will
-                                // never clear — exactly the macOS
-                                // escalating-lockout risk the cap exists to
-                                // prevent. `Some(true)` (still locked) or
-                                // `None` (unknown) leaves the budget/latch
-                                // alone, so a persistently-wrong password
-                                // stays given-up rather than retrying forever.
-                                if virtual_display::screen_is_locked() == Some(false) {
-                                    use std::sync::atomic::Ordering as AtomicOrdering;
-                                    AUTO_UNLOCK_SUBMISSIONS.store(0, AtomicOrdering::SeqCst);
-                                    AUTO_UNLOCK_GAVE_UP.store(false, AtomicOrdering::SeqCst);
-                                }
-                                info!(
+                            };
+                            // Reset the auto-unlock submission budget/alert
+                            // latch HERE, not just on an observed unlock —
+                            // this is a point where the screen is USUALLY
+                            // unlocked (we're about to lock it), and it's
+                            // the fix for a real live-reproduced lockout:
+                            // if a prior auto-unlock attempt actually
+                            // succeeded but a too-tight detection window
+                            // (see RETURN_ATTEMPT_BUDGET above) missed the
+                            // `Some(false)` flip and reported a false
+                            // BudgetExhausted, nothing would otherwise ever
+                            // reset the shared budget — the NEXT lock
+                            // cycle would start pre-exhausted and refuse to
+                            // even attempt an unlock, indefinitely, on a
+                            // Mac nobody is physically at to recover.
+                            //
+                            // GATED on a CONFIRMED `Some(false)` read —
+                            // caught in review: an unconditional reset
+                            // assumed the screen is unlocked here without
+                            // checking, which breaks if it's actually
+                            // already locked (e.g. the account password
+                            // changed while macrdp kept running: RDP still
+                            // accepts the cached old password via NLA, but
+                            // auto-unlock keeps typing that same stale
+                            // password and genuinely fails every time).
+                            // Without the gate, every disconnect/reconnect
+                            // cycle would hand that genuinely-failing
+                            // attempt a fresh budget and burn 2 more real
+                            // PAM submissions against a lock that will
+                            // never clear — exactly the macOS
+                            // escalating-lockout risk the cap exists to
+                            // prevent. `Some(true)` (still locked) or
+                            // `None` (unknown) leaves the budget/latch
+                            // alone, so a persistently-wrong password
+                            // stays given-up rather than retrying forever.
+                            if virtual_display::screen_is_locked() == Some(false) {
+                                use std::sync::atomic::Ordering as AtomicOrdering;
+                                AUTO_UNLOCK_SUBMISSIONS.store(0, AtomicOrdering::SeqCst);
+                                AUTO_UNLOCK_GAVE_UP.store(false, AtomicOrdering::SeqCst);
+                            }
+                            info!(
+                                label,
+                                "lock-on-disconnect: requesting immediate session lock"
+                            );
+                            if !lock_session() {
+                                warn!(
                                     label,
-                                    "lock-on-disconnect: requesting immediate session lock"
-                                );
-                                if !lock_session() {
-                                    warn!(
-                                        label,
-                                        "lock-on-disconnect: failed to lock the \
+                                    "lock-on-disconnect: failed to lock the \
                                          session (see warning above)"
-                                    );
-                                }
-                            });
-                        }
+                                );
+                            }
+                        });
                     }
                 }
                 _ => {}
@@ -2746,6 +2792,9 @@ fn args_from_config_values(path: &Path, document: &config::Document) -> Result<A
     }
     if on("ENABLE_H264", false) {
         argv.push("--enable-h264".into());
+    }
+    if on("AUDIO_REMOTE_ONLY", false) {
+        argv.push("--audio-remote-only".into());
     }
     if on("ENABLE_AAC", false) {
         argv.push("--enable-aac".into());
@@ -3109,6 +3158,7 @@ async fn async_main(mut args: Args, document: Option<config::Document>) -> Resul
         shutdown_signal().await;
         info!("shutdown signal received — exiting");
         cleanup_transitions.request_shutdown();
+        audio::shutdown();
         let started = std::time::Instant::now();
         if let Err(error) = cleanup_transitions
             .shutdown(move || {
@@ -3340,17 +3390,8 @@ async fn async_main(mut args: Args, document: Option<config::Document>) -> Resul
             {
                 return false;
             }
-            #[cfg(target_os = "macos")]
-            {
-                core_graphics::display::CGDisplay::active_displays().is_ok_and(|ids| {
-                    ids.iter()
-                        .any(|id| Some(*id) != crate::display_session::active_display_id())
-                })
-            }
-            #[cfg(not(target_os = "macos"))]
-            {
-                true
-            }
+            virtual_display::other_displays(crate::display_session::active_display_id())
+                .is_ok_and(display_transition::OtherDisplays::can_release_virtual)
         };
         info!(
             width,
@@ -3784,6 +3825,7 @@ async fn async_main(mut args: Args, document: Option<config::Document>) -> Resul
     let sound: Box<dyn ironrdp_server::SoundServerFactory> = Box::new(audio::MacRdpsnd::new(
         Some(display_suppressed.clone()),
         !args.no_mute_on_minimize,
+        args.audio_remote_only,
         args.enable_aac,
         args.aac_bitrate,
         // Bind audio to the same display the video captures so --detach-primary
@@ -4200,6 +4242,12 @@ mod lock_on_disconnect_tests {
     }
 
     #[test]
+    fn no_extra_lock_delay_without_an_explicit_override() {
+        assert_eq!(parse_lock_on_disconnect_delay_ms(None), 0);
+        assert_eq!(parse_lock_on_disconnect_delay_ms(Some("invalid")), 0);
+    }
+
+    #[test]
     fn honors_a_valid_override() {
         assert_eq!(parse_lock_on_disconnect_delay_ms(Some("5000")), 5000);
         // Surrounding whitespace tolerated (matches env_u64 elsewhere).
@@ -4362,6 +4410,16 @@ mod config_tests {
             assert!(args_from_config(&path).is_err(), "{name}");
             fs::remove_file(&path).unwrap();
         }
+    }
+
+    #[test]
+    fn remote_only_audio_config_is_independent_of_aac() {
+        let path = std::env::temp_dir().join(format!("macrdp-audio-config-{}", std::process::id()));
+        std::fs::write(&path, "AUDIO_REMOTE_ONLY=1\nENABLE_AAC=0\n").unwrap();
+        let argv = args_from_config(&path).unwrap();
+        assert!(argv.audio_remote_only);
+        assert!(!argv.enable_aac);
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]

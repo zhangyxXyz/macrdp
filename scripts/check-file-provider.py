@@ -7,7 +7,7 @@ ROOT=Path(__file__).resolve().parents[1]
 def main(root,sdk):
     root.mkdir(parents=True,exist_ok=True)
     probe=root/'checks'
-    subprocess.run(['swiftc','-sdk',sdk,'-target','arm64-apple-macos15.0','-swift-version','5','-parse-as-library',str(ROOT/'native/file-provider/Core.swift'),str(ROOT/'native/file-provider/Checks.swift'),'-o',str(probe)],check=True)
+    subprocess.run(['swiftc','-sdk',sdk,'-target','arm64-apple-macos15.0','-swift-version','5','-parse-as-library',str(ROOT/'native/file-provider/Core.swift'),str(ROOT/'native/file-provider/LocalCopies.swift'),str(ROOT/'native/file-provider/Checks.swift'),'-o',str(probe)],check=True)
     token=secrets.token_hex(32);data=bytes(range(256))*65537+b'not-zero-tail';ranges=0;mode='normal'
     snapshot=dict(session='session-A',copy='copy-A',lock=7,index=0,name='same.bin',size=len(data))
     class Handler(BaseHTTPRequestHandler):
@@ -52,6 +52,7 @@ def main(root,sdk):
         assert subprocess.check_output(['/bin/cat',reply['path']])==data
         results.append('>16 MiB streamed through short reads; cat/mmap/hash match source, no 8 MiB prototype cap')
         assert call('catalog')[0]['ok'];results.append('atomic metadata journal restored without identity change')
+        before=ranges;assert call('local-copy')[0]['ok'] and ranges==before;results.append('local cache edits persist across restart, never fetch/upload remote bytes, reject stale writes/reads and advance change anchors')
         mode='duplicate';assert not call('metadata')[0]['ok'];results.append('case-equivalent duplicate names rejected')
         for broken in ['tamper','disconnect','stall']:
             mode=broken;reply,directory=call('cancel' if broken=='stall' else 'fetch');assert not reply['ok'],reply
