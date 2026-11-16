@@ -26,7 +26,7 @@
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 
-use anyhow::Result;
+use anyhow::{Context as _, Result};
 use ironrdp_connector::sspi::generator::NetworkRequest;
 use ironrdp_connector::{ClientConnector, Config, ConnectorResult, Credentials, DesktopSize};
 use ironrdp_pdu::rdp::capability_sets::{BitmapCodecs, Codec, CodecProperty, NsCodec};
@@ -263,6 +263,100 @@ fn init_tracing() {
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .with_test_writer()
         .try_init();
+}
+
+/// Own the actual bound listener for TCP tests. Reserving an ephemeral port,
+/// dropping it and having `run()` bind it again lets parallel tests take that
+/// port in between; a successful TCP connect could then reach the wrong server.
+struct TcpTestServer {
+    addr: SocketAddr,
+    task: tokio::task::JoinHandle<ironrdp_server::ServerResult<()>>,
+}
+
+impl TcpTestServer {
+    async fn start(mut server: RdpServer) -> Result<Self> {
+        let events = server.event_sender().clone();
+        let mut running = Self {
+            addr: SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+            task: tokio::task::spawn_local(async move { server.run().await }),
+        };
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        events
+            .send(ironrdp_server::ServerEvent::GetLocalAddr(tx))
+            .map_err(|_| anyhow::anyhow!("test server event channel closed before startup"))?;
+        running.addr = running
+            .while_running("test server listener startup", async {
+                tokio::time::timeout(std::time::Duration::from_secs(5), rx)
+                    .await
+                    .context("timed out waiting for the bound listener")?
+                    .context("server dropped its listener response")?
+                    .context("server reported no bound listener")
+            })
+            .await?;
+        Ok(running)
+    }
+
+    async fn while_running<T>(
+        &mut self,
+        stage: &str,
+        operation: impl std::future::Future<Output = Result<T>>,
+    ) -> Result<T> {
+        tokio::select! {
+            biased;
+            result = &mut self.task => Err(Self::unexpected_exit(result).context(stage.to_owned())),
+            result = operation => result.with_context(|| stage.to_owned()),
+        }
+    }
+
+    fn unexpected_exit(
+        result: std::result::Result<ironrdp_server::ServerResult<()>, tokio::task::JoinError>,
+    ) -> anyhow::Error {
+        match result {
+            Ok(Ok(())) => anyhow::anyhow!("test server exited before requested shutdown"),
+            Ok(Err(error)) => anyhow::Error::new(error).context("test server run failed"),
+            Err(error) => anyhow::Error::new(error).context("test server task failed"),
+        }
+    }
+
+    async fn stop(&mut self) -> Result<()> {
+        if self.task.is_finished() {
+            return Err(Self::unexpected_exit((&mut self.task).await));
+        }
+        self.task.abort();
+        match (&mut self.task).await {
+            Err(error) if error.is_cancelled() => Ok(()),
+            result => Err(Self::unexpected_exit(result)),
+        }
+    }
+}
+
+impl Drop for TcpTestServer {
+    fn drop(&mut self) {
+        // Also stop on an early handshake error or failed assertion.
+        self.task.abort();
+    }
+}
+
+#[tokio::test]
+async fn tcp_test_server_reports_a_bind_failure() -> Result<()> {
+    let occupied = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+    let port = occupied.local_addr()?.port();
+    tokio::task::LocalSet::new()
+        .run_until(async move {
+            let server = build_test_server_on(port, 1024, 768, false, None, crate::bitmap_codecs());
+            match TcpTestServer::start(server).await {
+                Ok(_) => anyhow::bail!("test server unexpectedly bound an occupied port"),
+                Err(error) => {
+                    let details = format!("{error:#}");
+                    assert!(details.contains("test server run failed"), "{details}");
+                    assert!(details.contains("bind listen address"), "{details}");
+                }
+            }
+            // Keep the occupied listener live through the attempted bind.
+            drop(occupied);
+            Ok(())
+        })
+        .await
 }
 
 /// Build a fresh test server (TLS, test-double display/input, the given bitmap
@@ -684,28 +778,15 @@ async fn server_survives_many_reconnects() -> anyhow::Result<()> {
 async fn second_client_preempts_the_live_session() -> anyhow::Result<()> {
     init_tracing();
 
-    // Claim an ephemeral port, then release it for the server to bind.
-    let probe = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
-    let addr = probe.local_addr()?;
-    drop(probe);
-
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async move {
             // A live session (see `KeepAliveSound`) — otherwise the client loop
             // ends the moment it starts and there's nothing to preempt.
-            let mut server = build_test_server_full(
-                addr.port(),
-                1024,
-                768,
-                true,
-                None,
-                crate::bitmap_codecs(),
-                true,
-            );
-            let server_task = tokio::task::spawn_local(async move {
-                let _ = server.run().await;
-            });
+            let server =
+                build_test_server_full(0, 1024, 768, true, None, crate::bitmap_codecs(), true);
+            let mut server_task = TcpTestServer::start(server).await?;
+            let addr = server_task.addr;
 
             // First client: connect and keep the session open.
             let a = connect_with_retry(addr).await?;
@@ -765,7 +846,7 @@ async fn second_client_preempts_the_live_session() -> anyhow::Result<()> {
                  preempt straight back; instead the connection just closed with {closed:?}"
             );
 
-            server_task.abort();
+            server_task.stop().await?;
             anyhow::Ok(())
         })
         .await
@@ -832,10 +913,6 @@ async fn preemption_does_not_evict_a_session_the_handler_would_reject() -> anyho
 
     init_tracing();
 
-    let probe = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
-    let addr = probe.local_addr()?;
-    drop(probe);
-
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async move {
@@ -847,8 +924,8 @@ async fn preemption_does_not_evict_a_session_the_handler_would_reject() -> anyho
             };
             let sound: Box<dyn ironrdp_server::SoundServerFactory> =
                 Box::new(KeepAliveSound { audio_sender: None });
-            let mut server = RdpServer::builder()
-                .with_addr((Ipv4Addr::LOCALHOST, addr.port()))
+            let server = RdpServer::builder()
+                .with_addr((Ipv4Addr::LOCALHOST, 0))
                 .with_tls(server_tls_acceptor())
                 .with_input_handler(TestInput)
                 .with_display_handler(display)
@@ -861,9 +938,8 @@ async fn preemption_does_not_evict_a_session_the_handler_would_reject() -> anyho
                 .with_connection_policy(ConnectionPolicy::Preempt)
                 .build();
 
-            let server_task = tokio::task::spawn_local(async move {
-                let _ = server.run().await;
-            });
+            let mut server_task = TcpTestServer::start(server).await?;
+            let addr = server_task.addr;
 
             // Client A: the live session under test — a real, completed
             // handshake kept open via `KeepAliveSound`, same as the sibling
@@ -901,7 +977,7 @@ async fn preemption_does_not_evict_a_session_the_handler_would_reject() -> anyho
                 "the live session must survive a preemption attempt the handler rejected, got {client_a_still_alive:?}"
             );
 
-            server_task.abort();
+            server_task.stop().await?;
             anyhow::Ok(())
         })
         .await
@@ -933,10 +1009,6 @@ impl ConnectionHandler for CountingAccepts {
 async fn a_preempting_candidate_clears_on_accept_exactly_once() -> anyhow::Result<()> {
     init_tracing();
 
-    let probe = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
-    let addr = probe.local_addr()?;
-    drop(probe);
-
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async move {
@@ -950,8 +1022,8 @@ async fn a_preempting_candidate_clears_on_accept_exactly_once() -> anyhow::Resul
             };
             let sound: Box<dyn ironrdp_server::SoundServerFactory> =
                 Box::new(KeepAliveSound { audio_sender: None });
-            let mut server = RdpServer::builder()
-                .with_addr((Ipv4Addr::LOCALHOST, addr.port()))
+            let server = RdpServer::builder()
+                .with_addr((Ipv4Addr::LOCALHOST, 0))
                 .with_tls(server_tls_acceptor())
                 .with_input_handler(TestInput)
                 .with_display_handler(display)
@@ -964,13 +1036,19 @@ async fn a_preempting_candidate_clears_on_accept_exactly_once() -> anyhow::Resul
                 .with_connection_policy(ConnectionPolicy::Preempt)
                 .build();
 
-            let server_task = tokio::task::spawn_local(async move {
-                let _ = server.run().await;
-            });
+            let mut server_task = TcpTestServer::start(server).await?;
+            let addr = server_task.addr;
 
-            // Client A: the live session.
-            let a = connect_with_retry(addr).await?;
-            let (_size_a, _framed_a) = connect_client(a, 1280, 800).await?;
+            // Client A: the live session. Surface an early server exit as well
+            // as identifying which client's handshake failed.
+            let (_size_a, _framed_a) = server_task
+                .while_running("client A initial handshake", async {
+                    let a = connect_with_retry(addr)
+                        .await
+                        .context("client A TCP connect")?;
+                    connect_client(a, 1280, 800).await
+                })
+                .await?;
             assert_eq!(
                 accept_count.load(core::sync::atomic::Ordering::SeqCst),
                 1,
@@ -978,13 +1056,19 @@ async fn a_preempting_candidate_clears_on_accept_exactly_once() -> anyhow::Resul
             );
 
             // Client B: preempts client A.
-            let b = connect_with_retry(addr).await?;
-            let (_size_b, _framed_b) = tokio::time::timeout(
-                std::time::Duration::from_secs(10),
-                connect_client(b, 1920, 1080),
-            )
-            .await
-            .map_err(|_| anyhow::anyhow!("second client hung"))??;
+            let (_size_b, _framed_b) = server_task
+                .while_running("client B preemption handshake", async {
+                    let b = connect_with_retry(addr)
+                        .await
+                        .context("client B TCP connect")?;
+                    tokio::time::timeout(
+                        std::time::Duration::from_secs(10),
+                        connect_client(b, 1920, 1080),
+                    )
+                    .await
+                    .context("second client hung")?
+                })
+                .await?;
 
             assert_eq!(
                 accept_count.load(core::sync::atomic::Ordering::SeqCst),
@@ -993,7 +1077,7 @@ async fn a_preempting_candidate_clears_on_accept_exactly_once() -> anyhow::Resul
                  (once during the race, not again when served from `pending`)"
             );
 
-            server_task.abort();
+            server_task.stop().await?;
             anyhow::Ok(())
         })
         .await
@@ -1018,25 +1102,13 @@ async fn a_preempting_candidate_clears_on_accept_exactly_once() -> anyhow::Resul
 async fn a_just_evicted_peer_cannot_immediately_preempt_back() -> anyhow::Result<()> {
     init_tracing();
 
-    let probe = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
-    let addr = probe.local_addr()?;
-    drop(probe);
-
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async move {
-            let mut server = build_test_server_full(
-                addr.port(),
-                1024,
-                768,
-                true,
-                None,
-                crate::bitmap_codecs(),
-                true,
-            );
-            let server_task = tokio::task::spawn_local(async move {
-                let _ = server.run().await;
-            });
+            let server =
+                build_test_server_full(0, 1024, 768, true, None, crate::bitmap_codecs(), true);
+            let mut server_task = TcpTestServer::start(server).await?;
+            let addr = server_task.addr;
 
             // A connects, then B preempts it — the normal takeover.
             let a = connect_with_retry(addr).await?;
@@ -1074,7 +1146,7 @@ async fn a_just_evicted_peer_cannot_immediately_preempt_back() -> anyhow::Result
                 "B's session must survive the evicted peer's reconnect, got {b_still_alive:?}"
             );
 
-            server_task.abort();
+            server_task.stop().await?;
             anyhow::Ok(())
         })
         .await
@@ -1098,15 +1170,11 @@ async fn a_just_evicted_peer_cannot_immediately_preempt_back() -> anyhow::Result
 async fn a_silent_candidate_cannot_wedge_the_accept_loop() -> anyhow::Result<()> {
     init_tracing();
 
-    let probe = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
-    let addr = probe.local_addr()?;
-    drop(probe);
-
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async move {
-            let mut server = build_test_server_full(
-                addr.port(),
+            let server = build_test_server_full(
+                0,
                 1024,
                 768,
                 true,
@@ -1114,9 +1182,8 @@ async fn a_silent_candidate_cannot_wedge_the_accept_loop() -> anyhow::Result<()>
                 crate::bitmap_codecs(),
                 true,
             );
-            let server_task = tokio::task::spawn_local(async move {
-                let _ = server.run().await;
-            });
+            let mut server_task = TcpTestServer::start(server).await?;
+            let addr = server_task.addr;
 
             // A: the live session.
             let a = connect_with_retry(addr).await?;
@@ -1149,7 +1216,7 @@ async fn a_silent_candidate_cannot_wedge_the_accept_loop() -> anyhow::Result<()>
                 "the accept loop was wedged by an unauthenticated silent peer; a later client got {outcome}"
             );
 
-            server_task.abort();
+            server_task.stop().await?;
             anyhow::Ok(())
         })
         .await
@@ -1225,18 +1292,13 @@ async fn wait_for_active_connection(
 async fn a_bare_connect_does_not_replace_the_live_h264_context() -> anyhow::Result<()> {
     init_tracing();
 
-    let probe = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
-    let addr = probe.local_addr()?;
-    drop(probe);
-
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async move {
             let gfx = test_gfx();
-            let mut server = build_test_server_with_gfx(addr.port(), gfx.clone());
-            let server_task = tokio::task::spawn_local(async move {
-                let _ = server.run().await;
-            });
+            let server = build_test_server_with_gfx(0, gfx.clone());
+            let mut server_task = TcpTestServer::start(server).await?;
+            let addr = server_task.addr;
 
             // A: the live session.
             let a = connect_with_retry(addr).await?;
@@ -1269,7 +1331,7 @@ async fn a_bare_connect_does_not_replace_the_live_h264_context() -> anyhow::Resu
             let winner = wait_for_active_connection(&gfx, Some(live)).await?;
             assert_ne!(winner, live);
 
-            server_task.abort();
+            server_task.stop().await?;
             anyhow::Ok(())
         })
         .await
