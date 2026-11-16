@@ -46,6 +46,7 @@ jobs:
           cargo fmt --all -- --check
           cargo clippy --locked --all-targets -- -D warnings
           cargo test --release --locked
+          cargo test --manifest-path vendor/ironrdp-server/Cargo.toml --lib --features egfx
           cargo build --release --locked
           python3 scripts/check-config-cli.py target/release/macrdp
           swift run --package-path gui --scratch-path gui/.build ConfigSupportTests

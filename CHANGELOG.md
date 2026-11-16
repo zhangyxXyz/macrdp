@@ -7,6 +7,8 @@ Only implemented behavior and completed checks are recorded here. Client-side ma
 
 ### English
 
+- Bound event batches to 32, preserve async clipboard priority and retain completion permits until dispatch ends. Add regressions for reply priority, budget lifetime, bounded draining and timed-out OS worker retention. This does not eliminate TCP backpressure; real mstsc verification remains pending.
+- Include upstream #230 (7a2c5fe): bounded initial legacy-frame hold with static-screen/NV12 handling and legacy fallback. Keep existing blank-recovery and display policies.
 - Merge upstream v0.10.6 / 0255a8b (#267): park headless startup on missing/wrong credentials, retry only changed passwords, and surface password correction in the controller. Preserve side-effect-free fork configuration inspection and pre-capture unlock.
 
 - Keep Windows file-copy intent through preparation: clear stale text, prioritize Explorer file streams over previews, refuse filename-as-text fallback and stale replies, and remove automatic Cmd+V after downloads. Preserve screenshot PNG/DIB and system dataless paths.
@@ -18,7 +20,7 @@ Only implemented behavior and completed checks are recorded here. Client-side ma
 - Run opt-in auto-unlock after credential/ARC validation, before display synchronization and capture; wait at most 8s for the requested SCK display after confirmed unlock. Preserve skip-auth gating, serialized real submissions and the shared two-submission budget; report unsafe/budget failures explicitly.
 - Request a true immediate lock via runtime-resolved login.framework and independently confirm the lock flag within 2s. No screen-saver fallback or password-delay policy changes. Preserve display restoration, disconnect grace, safety delay and bounded reconnect hold.
 - Add regression coverage and a manual build-only Actions workflow that verifies packaged apps without publishing releases or uploading artifacts. Live Windows lock/reconnect validation of this rebuild is pending.
-- Rebuild this development release at the user's request without changing version `0.10.6`. Include upstream [#228](https://github.com/clintcan/macrdp/pull/228): Windows 10 mstsc black-screen compatibility for RemoteFX surface commands and H.264 SPS bitstream restrictions, its vendored encoder tests and CI step. Preserve the fork's clipboard maintenance/leases and use the local CLIPRDR patch in standalone server checks. Win10 client rendering still requires a post-update manual check; upstream's separate frozen-start issue #230 is not included.
+- Rebuild this development release at the user's request without changing version `0.10.6`. Include upstream [#228](https://github.com/clintcan/macrdp/pull/228): Windows 10 mstsc black-screen compatibility for RemoteFX surface commands and H.264 SPS bitstream restrictions, its vendored encoder tests and CI step. Preserve the fork's clipboard maintenance/leases and use the local CLIPRDR patch in standalone server checks. Win10 client rendering still requires a post-update manual check; upstream's separate frozen-start fix #230 is now included (7a2c5fe).
 - Add a bundled sandboxed File Provider host/extension for macOS 15+, using system dataless file URLs for flat file copies of any type. Preserve screenshot PNG/DIB handling. Unavailable providers, folders and eager mode download complete files before publication; remove the sparse NSFilePresenter path.
 - Stream file contents to private staging, persist immutable metadata and incremental enumeration anchors, pin every SIZE/RANGE to its original clipboard lock, retain concurrent readers across local copies, and isolate cleanup by connection. Reject unknown locks instead of falling back to current clipboard data; drive timeout maintenance in the serving connection.
 - Use per-process authenticated loopback IPC and documented domain configuration without App Group entitlements. Local ad-hoc host/extension loading and real dataless reads were verified; Developer ID/notarization remains unverified. Report file clipboard startup readiness, request counters and last helper error through existing stats.
@@ -27,6 +29,8 @@ Only implemented behavior and completed checks are recorded here. Client-side ma
 
 ### 简体中文
 
+- 每批事件限制为 32 项，恢复异步剪贴板回复的优先级，直到分发结束才释放并发名额；补齐优先级、预算生命周期、批次上限和超时后读取线程保留测试。TCP 背压仍可能延迟传输，mstsc 实测待完成。
+- 纳入上游 #230（7a2c5fe）：首次协商期间有限暂存传统首帧，覆盖静止桌面、NV12 和位图回退；保留已有黑屏恢复与显示策略。
 - 合入上游 v0.10.6／0255a8b（#267）：无头启动凭证缺失或错误时等待，仅验证变化后的密码，控制器提供修正入口；保留本 fork 无副作用配置检查及捕获前解锁。
 
 - 保留 Windows 文件复制意图：准备期间清除旧文本，Explorer 文件流优先于预览，拒绝文件名降级成文本及过期回复，取消下载后的自动 Cmd+V；保留截图 PNG／DIB 和系统 dataless 路径。
@@ -38,7 +42,7 @@ Only implemented behavior and completed checks are recorded here. Client-side ma
 - 主动开启的自动解锁改在凭证／ARC 校验后、显示调整与捕获前执行；确认解锁后最多等待 8 秒 SCK 显示器就绪。保留 skip-auth 限制、串行真实提交和共享两次密码预算，明确报告不安全／预算耗尽错误。
 - 运行时解析 login.framework 请求真正立即锁定，并在 2 秒内独立确认锁定标志；不回退屏保、不修改密码延迟策略。保留实体屏恢复、断线宽限、安全等待和有上限的重连保护。
 - 补充回归及只验证打包的 Actions，不发布 Release、不上传归档。此次重构建的 Windows 锁屏重连实测待验证。
-- 按用户要求保留 `0.10.6` 版本号，重新构建本开发版。包含上游 [#228](https://github.com/clintcan/macrdp/pull/228)：修复 Win10 mstsc 在 RemoteFX 指令及 H.264 参数上的黑屏兼容问题，并纳入独立编码器测试和 CI 检查；保留本 fork 的剪贴板维护和租约，独立 server 检查使用本地 CLIPRDR。更新后的 Win10 实际显示仍需客户端验证；上游独立的启动画面冻结问题 #230 尚未包含。
+- 按用户要求保留 `0.10.6` 版本号，重新构建本开发版。包含上游 [#228](https://github.com/clintcan/macrdp/pull/228)：修复 Win10 mstsc 在 RemoteFX 指令及 H.264 参数上的黑屏兼容问题，并纳入独立编码器测试和 CI 检查；保留本 fork 的剪贴板维护和租约，独立 server 检查使用本地 CLIPRDR。更新后的 Win10 实际显示仍需客户端验证；另已纳入上游启动画面冻结修复 #230（7a2c5fe）。
 - 打包 macOS 15+ 沙箱 File Provider host／扩展，普通顶层文件不分类型均可使用系统 dataless URL；保留截图 PNG／DIB 路径。扩展不可用、文件夹和主动关闭按需时先完整下载再发布，移除稀疏 NSFilePresenter 占位路径。
 - 流式写入私有临时文件，持久化不可变元数据与增量枚举锚点；每个 SIZE／RANGE 携带原始锁，保留本机复制前已有的远端读取者，按连接隔离清理。未知锁不再回退到当前剪贴板，服务循环驱动超时维护。
 - 使用每进程鉴权的 loopback IPC 和文档化域配置，不申请 App Group entitlement。已验证本机临时签名 host／扩展加载和真实 dataless 读取；Developer ID／公证分发仍未验证。现有 stats 新增文件剪贴板启动就绪状态、请求计数和最近 helper 错误。

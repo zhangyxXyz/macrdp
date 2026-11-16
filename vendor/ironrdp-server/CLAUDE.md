@@ -255,3 +255,10 @@ The standalone test retires an event after enqueue and checks dispatch rejection
   `UrbdrcDeviceServerMessage::IoReq::tx`, also upstream's.
 - Upstream's in-file `#[cfg(test)]` module never compiles here (`test = false`); its
   one `NegotiationContext` literal was kept in step with our added field anyway.
+
+Fork follow-up (2026-11-17): `SessionClipboard` participates in the same stable
+CLIPRDR priority tier as ordinary clipboard messages. Normalization returns its
+permit to the dispatch scope, retaining producer backpressure across network
+writes. `receive_event_batch` takes at most 32 events per server-lock turn; no
+unbounded `try_recv` tail. Tests in `clipboard_completion_tests` cover these
+contracts. This bounds event count, not the time of an individual TCP write.

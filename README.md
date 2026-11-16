@@ -22,8 +22,7 @@ its release, verification, and support claims belong to upstream, not this fork.
 Upstream Windows 10 mstsc black-screen fix [#228](https://github.com/clintcan/macrdp/pull/228)
 is included in the same-version `v0.10.6-dev` rebuild. The version stays `0.10.6`;
 use `SOURCE_COMMIT` in the download to distinguish builds. Win10 client rendering
-requires a post-update manual check; upstream's separate frozen-start fix #230
-is not included. See [changes](CHANGELOG.md#v0106-dev).
+requires a post-update manual check; upstream's frozen-start fix #230 is included. See [changes](CHANGELOG.md#v0106-dev).
 
 ## Changes on dev
 
@@ -157,6 +156,18 @@ queue time; slow or stalled reads fail rather than blocking the connection.
 Uncancellable OS reads retain their worker slot until they finish. Format replies
 remain ordered; file requests retain their original locked path snapshot and
 late completions from disconnected sessions cannot enter a new connection.
+Completed replies retain their budget through dispatch and keep clipboard priority
+ahead of video in each batch; batches are capped at 32 events so inbound protocol
+work gets another lock turn. This is not a socket-write deadline: TCP congestion
+can still delay a large reply. Automated checks do not establish that the reported
+mstsc freeze is resolved; the new build still needs a real-client copy test.
+See the [clipboard investigation and upstream review](docs/clipboard-followup.md).
+
+Upstream [#230](https://github.com/clintcan/macrdp/pull/230) is included: during
+initial H.264 negotiation, hold the first legacy picture for up to 3 seconds and
+submit it when EGFX becomes ready, including a static desktop. If EGFX does not
+start, fall back to legacy rendering. `MACRDP_EGFX_LEGACY_HOLD_MS=0` disables this
+hold. Upstream Windows 10 results are not a local verification of this fork.
 
 Bundled macOS 15+ builds now include a sandboxed **macrdp Files** helper and
 File Provider extension. Enable it in **System Settings → General → Login Items

@@ -1041,14 +1041,27 @@ impl AutoReconnectCookieHandle {
 
 // A completion from a retired backend must not reach its replacement even
 // when it arrived after the old global queue was drained.
-fn live_clipboard_event(event: ServerEvent) -> Option<ServerEvent> {
+fn live_clipboard_event(event: ServerEvent) -> Option<(ServerEvent, Option<tokio::sync::OwnedSemaphorePermit>)> {
     match event {
-        ServerEvent::SessionClipboard { active, message, .. } if active.load(std::sync::atomic::Ordering::Acquire) => {
-            Some(ServerEvent::Clipboard(message))
-        }
+        ServerEvent::SessionClipboard {
+            active,
+            message,
+            permit,
+        } if active.load(std::sync::atomic::Ordering::Acquire) => Some((ServerEvent::Clipboard(message), permit)),
         ServerEvent::SessionClipboard { .. } => None,
-        event => Some(event),
+        event => Some((event, None)),
     }
+}
+
+// Bound each lock acquisition even while producers keep completing I/O. The
+// receiver leaves the rest queued so inbound X224 dispatch can take its turn.
+const MAX_EVENT_BATCH: usize = 32;
+
+async fn receive_event_batch(
+    receiver: &mut mpsc::UnboundedReceiver<ServerEvent>,
+    events: &mut Vec<ServerEvent>,
+) -> usize {
+    receiver.recv_many(events, MAX_EVENT_BATCH).await
 }
 
 /// Cloneable handle for gracefully disconnecting the active client with a
@@ -3301,7 +3314,7 @@ impl RdpServer {
         #[cfg(feature = "egfx")]
         prioritize_batch(events);
         for event in events.drain(..) {
-            let Some(event) = live_clipboard_event(event) else {
+            let Some((event, _completion_permit)) = live_clipboard_event(event) else {
                 continue;
             };
             trace!(?event, "Dispatching");
@@ -4399,19 +4412,15 @@ impl RdpServer {
         let this = Rc::clone(&s);
         let mut ev_receiver = ev_receiver.lock().await;
         let dispatch_events = async move {
-            let mut events = Vec::with_capacity(100);
+            let mut events = Vec::with_capacity(MAX_EVENT_BATCH);
             loop {
-                let nevents = ev_receiver.recv_many(&mut events, 100).await;
+                let nevents = receive_event_batch(&mut ev_receiver, &mut events).await;
                 if nevents == 0 {
                     debug!("No sever events.. stopping");
                     break Ok(RunState::Disconnect);
                 }
-                while let Ok(ev) = ev_receiver.try_recv() {
-                    events.push(ev);
-                }
-
                 // D7: per-batch dispatch_events timing. The events Vec can
-                // grow up to 100+ entries; dispatch_server_events holds the
+                // contain at most MAX_EVENT_BATCH entries; dispatch_server_events holds the
                 // `this` mutex AND the SharedWriter mutex for the full
                 // batch. Log batch size + total dispatch time so operators
                 // can see when an event batch ties up both locks.
@@ -5639,7 +5648,7 @@ async fn deactivate_all(io_channel_id: u16, user_channel_id: u16, writer: &mut i
 fn prioritize_batch(events: &mut [ServerEvent]) {
     fn tier(event: &ServerEvent) -> u8 {
         match event {
-            ServerEvent::Clipboard(_) => 0,
+            ServerEvent::Clipboard(_) | ServerEvent::SessionClipboard { .. } => 0,
             ServerEvent::Rdpdr(_) | ServerEvent::RdpdrDrive(_) => 2,
             _ => 1,
         }
@@ -6895,6 +6904,61 @@ mod clipboard_completion_tests {
             permit: None,
             message: ClipboardMessage::SendInitiatePaste(ironrdp_cliprdr::pdu::ClipboardFormatId::CF_UNICODETEXT),
         };
-        assert!(matches!(live_clipboard_event(event), Some(ServerEvent::Clipboard(_))));
+        assert!(matches!(
+            live_clipboard_event(event),
+            Some((ServerEvent::Clipboard(_), _))
+        ));
+    }
+    #[tokio::test]
+    async fn completion_budget_is_held_until_dispatch_finishes() {
+        let budget = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
+        let event = ServerEvent::SessionClipboard {
+            active: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            permit: Some(budget.clone().acquire_owned().await.unwrap()),
+            message: ClipboardMessage::SendInitiatePaste(ironrdp_cliprdr::pdu::ClipboardFormatId::CF_UNICODETEXT),
+        };
+        let (event, permit) = live_clipboard_event(event).unwrap();
+        assert_eq!(budget.available_permits(), 0, "normalizing must not admit another read");
+        drop(event);
+        assert_eq!(budget.available_permits(), 0);
+        drop(permit);
+        assert_eq!(budget.available_permits(), 1);
+    }
+
+    #[tokio::test]
+    async fn event_batch_leaves_backlog_for_the_next_lock_turn() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        for _ in 0..MAX_EVENT_BATCH + 1 {
+            tx.send(ServerEvent::GetLocalAddr(oneshot::channel().0)).unwrap();
+        }
+        let mut events = Vec::new();
+        assert_eq!(receive_event_batch(&mut rx, &mut events).await, MAX_EVENT_BATCH);
+        assert_eq!(events.len(), MAX_EVENT_BATCH);
+        assert_eq!(
+            rx.len(),
+            1,
+            "do not drain an unbounded producer backlog under one server lock"
+        );
+    }
+
+    #[cfg(feature = "egfx")]
+    #[test]
+    fn session_completions_keep_clipboard_priority_and_order() {
+        fn message(id: u32) -> ClipboardMessage {
+            ClipboardMessage::SendFileContentsResponse(ironrdp_cliprdr::pdu::FileContentsResponse::new_error(id))
+        }
+        let mut events = vec![
+            ServerEvent::Egfx(EgfxServerMessage::SendMessages { messages: Vec::new() }),
+            ServerEvent::SessionClipboard {
+                active: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+                permit: None,
+                message: message(1),
+            },
+            ServerEvent::Clipboard(message(2)),
+        ];
+        prioritize_batch(&mut events);
+        assert!(matches!(events[0], ServerEvent::SessionClipboard { .. }));
+        assert!(matches!(events[1], ServerEvent::Clipboard(_)));
+        assert!(matches!(events[2], ServerEvent::Egfx(_)));
     }
 }

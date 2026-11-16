@@ -162,4 +162,64 @@ mod tests {
         };
         assert!(!active.load(Ordering::Acquire));
     }
+    #[tokio::test]
+    async fn timed_out_os_read_keeps_worker_slot_and_cannot_reply_twice() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let sender = Arc::new(Mutex::new(Some(tx)));
+        let active = Arc::new(AtomicBool::new(true));
+        let budget = Arc::new(Budget {
+            queued: Arc::new(Semaphore::new(2)),
+            workers: Arc::new(Semaphore::new(1)),
+        });
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        schedule_with(
+            budget.clone(),
+            sender.clone(),
+            active.clone(),
+            error(),
+            Duration::from_millis(100),
+            move || {
+                let _ = entered_tx.send(());
+                let _ = release_rx.recv_timeout(Duration::from_secs(5));
+                error()
+            },
+        );
+        entered_rx.await.unwrap();
+        let timed_out = rx.recv().await.unwrap();
+        assert_eq!(budget.workers.available_permits(), 0);
+        assert_eq!(budget.queued.available_permits(), 1);
+        drop(timed_out);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let called = calls.clone();
+        schedule_with(
+            budget.clone(),
+            sender.clone(),
+            active,
+            error(),
+            Duration::from_millis(20),
+            move || {
+                called.fetch_add(1, Ordering::SeqCst);
+                error()
+            },
+        );
+        drop(rx.recv().await.unwrap());
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "timeout must not free a still-blocked OS worker"
+        );
+        release_tx.send(()).unwrap();
+        let worker = tokio::time::timeout(Duration::from_secs(2), budget.workers.acquire())
+            .await
+            .unwrap()
+            .unwrap();
+        drop(worker);
+        drop(sender);
+        assert!(
+            rx.recv().await.is_none(),
+            "the late OS result must not send a second reply"
+        );
+        assert_eq!(budget.queued.available_permits(), 2);
+    }
 }
