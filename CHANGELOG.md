@@ -5,13 +5,23 @@ Only implemented behavior and completed checks are recorded here. Client-side ma
 
 ## v0.10.6-dev
 
+### 2026-11-18 dependency audit / 依赖安全检查
+
+- Update the development lockfile from `libz-sys 1.1.31` to `1.1.33` for RUSTSEC-2026-0544, which failed the scheduled `security` workflow. No other dependency versions or application settings change. Local root/standalone audits passed under the existing policy; native Rust tests: 528 passed, 8 ignored. This source update has not replaced the installed release.
+- 定时 `security` 检查发现 RUSTSEC-2026-0544，将开发分支锁定的 `libz-sys` 从 `1.1.31` 更新为 `1.1.33`；其他依赖版本及应用设置不变。根依赖树／独立库在现有策略下审计通过，原生 Rust 测试 528 通过、8 跳过。这次源码更新尚未替换已安装版本。
+
+### 2026-11-18 installed-build feedback / 安装版实测反馈
+
+- The user confirmed Directory Opus file copying and normal screen locking/unlocking on the installed build from `3bea2b7`. This supersedes the earlier Opus failure report for `31ee2fb`; it does not establish every file-transfer case, monitor-free/hot-plug behavior or rapid reconnect/resize correctness. Relocking after abandoned pre-capture preparation or capture failure remains unguaranteed.
+- 用户确认安装来源为 `3bea2b7` 的版本中，Directory Opus 文件复制及常规锁屏／解锁正常；这更新了此前 `31ee2fb` 的 Opus 失败记录，不外推到全部文件传输、无屏／热插拔或快速重连改分辨率场景。捕获前准备取消或解锁后捕获失败时，仍不能保证重新锁定。
+
 ### 2026-11-17 upstream sync and review / 上游同步与复核
 
 - Validation: 528 native release-mode Rust tests passed (8 intentionally ignored), strict all-target Clippy, 55 configuration CLI checks, 13 controller checks, full GUI build, 48 release-script tests, workflow lint, 10 File Provider adapter checks and sanitized native audio-buffer tests passed. FreeRDP loopback CredSSP/audit smoke passed with disposable credentials. Windows paste/playback and hardware disconnect cycles remain separate checks. See the [review record](docs/release-review-2026-11-17.md).
 - 验证：528 项原生发布模式 Rust 测试通过（8 项按设计跳过）、全部目标严格 Clippy、55 项配置 CLI、13 项控制器检查、完整 GUI 编译、48 项发布脚本测试、workflow 检查、10 项 File Provider 适配及原生音频缓冲检查通过；临时凭证 FreeRDP 回环认证／审计冒烟通过。Windows 粘贴／播放及硬件断开周期另行验证，详见[审查记录](docs/release-review-2026-11-17.md)。
 
-- Announce local file descriptors and their immutable source paths in the same protocol dispatch. Reject an invalid descriptor list as a whole instead of filtering and shifting file indices; scope queued file requests and lease releases to their original session. This addresses wrong-generation file data and disconnect races, not Directory Opus clients that cannot supply standard file streams.
-- 本地文件描述符与不可变源路径在同一次协议分发中更新；整轮拒绝非法文件列表，避免过滤后索引错位。已排队文件请求与租约释放绑定原会话，防止断线后串入新连接。这修复数据代次和断线竞态，不代表已解决 Directory Opus 客户端无法提供标准文件流的问题。
+- Announce local file descriptors and their immutable source paths in the same protocol dispatch. Reject an invalid descriptor list as a whole instead of filtering and shifting file indices; scope queued file requests and lease releases to their original session. This addresses wrong-generation file data and disconnect races; incoming file copies still require a valid standard file stream. Later Opus client verification is recorded above.
+- 本地文件描述符与不可变源路径在同一次协议分发中更新；整轮拒绝非法文件列表，避免过滤后索引错位。已排队文件请求与租约释放绑定原会话，防止断线后串入新连接。这修复数据代次和断线竞态，传入文件仍需有效的标准文件流；后续 Opus 客户端实测见上文。
 - Always request immediate disconnect locking and confirm both the screen-lock flag and the elapsed password-requirement deadline. An active screen saver alone cannot confirm an authentication-required lock; missing or malformed private state remains unknown.
 - 断开锁屏始终发起立即锁定，同时确认锁屏标志与已到期的密码要求时间；屏保活动本身不能证明必须认证，私有状态缺失或格式异常仍视为未知。
 - Share the remote-only audio recovery budget across open and read failures. Successful opens alone cannot reset it; valid stereo samples, including silence, can. Stop after five retries and report recovery/error state.

@@ -50,12 +50,16 @@ the new process; newly installed LaunchAgents allow 60 seconds for cleanup.
 See the [review and verification record](docs/release-review-2026-11-17.md) for
 source references, completed tests and remaining manual checks.
 
-Manual feedback on build `31ee2fb`: remote audio and file copies from the Windows
-desktop work; Directory Opus file copies still fail. The follow-up gives a failed
+On 2026-11-18, the user confirmed Directory Opus file copying and normal screen
+locking/unlocking with the installed build from `3bea2b7`. This covers those tested
+paths; monitor-free operation, rapid reconnect/resize and relocking after abandoned
+pre-capture preparation remain separate verification boundaries.
+
+Earlier feedback on build `31ee2fb` reported working remote audio and Windows
+desktop file copies, but failing Directory Opus copies. The follow-up gives a failed
 `FileGroupDescriptorW` request one retry and reports a second failure explicitly,
-without substituting text or old images. This fixes an error-handling gap, not a
-verified Directory Opus compatibility fix; Explorer is the comparison path for
-client testing.
+without substituting text or old images. The later `3bea2b7` test confirms the user's
+Opus copy path works; clients must still supply a valid standard file stream.
 
 Detach restoration now retains every display the server disabled, even if it
 disappears from CoreGraphics' online list. A successful transaction alone no
@@ -68,8 +72,9 @@ lock; the desktop was visible before that lock. The correction locks Detach
 sessions before restoration and holds the auto-unlock gate through the native
 transition. Capture/Shield retain their existing restore-first ordering. The
 completed transition must not schedule a second, delayed lock. A live probe
-confirmed locking with only the virtual display active in 102ms; the complete
-reordered disconnect path still needs verification after installation.
+confirmed locking with only the virtual display active in 102ms; full timing
+measurements and edge-case coverage are separate from the user's 2026-11-18 confirmation
+that normal locking/unlocking works on `3bea2b7`.
 In the reported failure, restarting the old server did not restore either output;
 reconnecting a display cable restored both. Process restart is a recovery attempt,
 not a guarantee that a stuck display link will recover.
@@ -93,9 +98,11 @@ File Provider files now expose owner-writable local copies rather than locked
 read-only items. Local edits are persisted with version checks and are never
 uploaded to the Windows source. Ten adapter checks and eight synthetic system
 checks cover on-demand reads, editable exported copies, offline cache eviction/
-rehydration and reconnect isolation. This is not a real mstsc test of the new build.
+rehydration and reconnect isolation. Those automated checks alone do not establish
+real mstsc behavior; the `3bea2b7` Opus copy result above is a separate client test.
 The menu-bar status tooltip is removed; status remains in the menu and Status tab.
-Use `SOURCE_COMMIT` to identify this rebuild; real-client regression testing remains necessary.
+Use `SOURCE_COMMIT` to identify this rebuild; remaining client checks are recorded
+in the [review record](docs/release-review-2026-11-17.md).
 
 The default-off experimental **Audio → Remote-only playback** option
 (`AUDIO_REMOTE_ONLY=1`) uses a private Core Audio tap on macOS 14.2+. It suppresses
@@ -154,9 +161,10 @@ as the requested display appears; this is a fixed maximum, not an 8-second delay
 If an online physical display fails to become active, retain the virtual display.
 When no other display is online, it may be released after the disconnect lock
 completes; a locked headless reconnect prepares a new virtual surface before unlock. Configuration (including
-fixed 4K/200%) remains saved for the next connection. Real mstsc lock/reconnect,
-bidirectional paste and physical-screen restoration of this rebuild are pending
-manual testing; no installed app or local configuration is replaced by publishing.
+fixed 4K/200%) remains saved for the next connection. Normal locking/unlocking was
+confirmed on `3bea2b7` on 2026-11-18; monitor-free reconnects, hot-plug and rapid
+resolution changes still need hardware/client coverage. Publishing alone does not
+replace an installed app or local configuration.
 
 ## Modifier positions and Ctrl shortcut compatibility
 
@@ -242,7 +250,10 @@ reconnect hold remain; the extra safety delay defaults to zero; **disconnect loc
 Auto-unlock affects the physical desktop, and these private macOS APIs may change.
 
 Regression tests cover preparation ordering/failure, serialization, display
-selection, lock confirmation and existing reconnect/budget policy. **Live Windows locked-session testing of this rebuild is pending.**
+selection, lock confirmation and existing reconnect/budget policy. **The user
+confirmed normal locking/unlocking on installed source `3bea2b7` on 2026-11-18.**
+This does not verify monitor-free reconnects or guarantee relocking when preparation
+is cancelled or capture fails before the session is counted.
 Build verification does not grant TCC permissions or change the running app.
 
 ## Windows clipboard images and files
@@ -306,8 +317,9 @@ Automated checks include the Rust suite, nine adapter/IPC checks (including a
 >16 MiB streamed file), and six real File Provider checks with synthetic bytes:
 zero-range dataless metadata, direct hydration, offline reads, disconnected reads,
 same-domain/same-name reconnect, and stale URL rejection. The user reported successful
-testing of the previously installed `92f4c8c` build; manual validation of the
-same-version rebuild after the Win10 merge is separate. See
+testing of the previously installed `92f4c8c` build. On 2026-11-18, the user also
+confirmed Directory Opus file copying on installed source `3bea2b7`; this does not
+cover every file type, folder size or disconnect-during-transfer case. See
 [implementation and checks](native/file-provider/README.md) and
 [changelog](CHANGELOG.md#v0106-dev).
 

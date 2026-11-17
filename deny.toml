@@ -31,23 +31,27 @@ yanked = "deny"
 # review, not by blocking unrelated work. Flip to "all" if you want the
 # maintenance signal to gate too.
 unmaintained = "none"
-# Suppress a specific advisory ONLY with a written justification here (why it's
-# not fixable now AND why it's assessed as not-exploitable in macrdp's usage).
+# Suppress a specific advisory ONLY with a written justification here covering
+# the upgrade constraints, assessed exposure, and conditions for removing it.
 # Format: "RUSTSEC-XXXX-NNNN". cargo-deny still prints an ignored advisory as a
 # note, so it stays visible; ignoring keeps the daily gate GREEN so it still
 # fires on every OTHER (new) advisory instead of being permanently red on a
 # known-and-triaged one. Re-review these whenever the IronRDP pin is bumped.
 ignore = [
-  # RUSTSEC-2023-0071 — "Marvin Attack": RSA PKCS#1 v1.5 decryption in the `rsa`
-  # crate is not constant-time, leaking key bits via network-observable timing.
-  # Reached transitively through picky -> ironrdp-connector / sspi / winscard
-  # (the CredSSP/NLA + smart-card auth stack), shared by ALL of IronRDP and every
-  # downstream server. Accepted risk because: (1) NO fix exists upstream — the
-  # advisory states "no safe upgrade is available" pending a constant-time
-  # rewrite; (2) it's not droppable without dropping CredSSP/NLA; (3) macrdp's
-  # documented posture is VPN / trusted-LAN only (never a public IP), and TLS is
-  # rustls/aws-lc-rs — unaffected — so an attacker is not positioned to time the
-  # server's RSA private-key operations. Revisit on each IronRDP pin bump.
+  # RUSTSEC-2023-0071 — "Marvin Attack": potential RSA private-key recovery
+  # through timing sidechannels. Reviewed 2026-11-18: upstream released the
+  # fixed stable rsa 0.10.0 on 2026-11-08; RustSec lists patched >=0.10.0.
+  # https://rustsec.org/advisories/RUSTSEC-2023-0071.html
+  # Our picky 7.0.0-rc.25, sspi 0.21.3 and winscard 0.3.3 each require exactly
+  # rsa =0.10.0-rc.18. That prerelease does not meet the patched range, and a
+  # lockfile-only rsa update cannot satisfy those pins. Temporarily retain this
+  # exception pending a coordinated dependency upgrade and auth regression tests.
+  # The inspected server path uses CredSSP/NTLM, with TLS handled by rustls;
+  # no reachable rsa-crate private-key decryption was identified on that path.
+  # This is an exposure assessment, not proof of non-exploitability across all
+  # auth/smart-card paths. VPN/trusted-LAN access limits exposure but does not
+  # prevent a reachable peer from measuring timing. Revisit on each auth-stack
+  # or IronRDP update; remove this exception once the resolved rsa is patched.
   "RUSTSEC-2023-0071",
 ]
 

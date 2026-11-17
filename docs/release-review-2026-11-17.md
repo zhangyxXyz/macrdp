@@ -50,10 +50,60 @@ launchd 探针仅注册、移除临时任务，没有重启现用服务。旧 La
 
 ## Verification boundaries / 验证边界
 
-- Directory Opus still needs a real client retest. Existing feedback says Explorer/Windows desktop copies work and Opus copies fail; missing/failed standard file streams must fail visibly rather than paste stale data. / Opus 仍需客户端复测，不能用旧内容掩盖失败。
+- Updated 2026-11-18: the user confirmed Directory Opus file copying and normal screen locking/unlocking on installed source `3bea2b7`. The earlier Opus failure applied to `31ee2fb`; it is no longer the current result for that tested path. This is user-reported client verification, not a complete file-transfer or display test matrix. Missing/failed standard file streams must still fail visibly rather than paste stale data. / 2026-11-18 更新：用户确认安装来源 `3bea2b7` 的 Directory Opus 文件复制、常规锁屏／解锁正常。此前 Opus 失败对应 `31ee2fb`，不再代表此次已测路径的当前结果；这是用户客户端反馈，不是完整文件传输或显示场景矩阵，标准文件流缺失／失败仍须明确报错，不能粘贴旧内容。
 - Protocol and File Provider adapter tests do not prove actual mstsc/Finder behavior. The existing system dataless tests used synthetic sources; signing, TCC and current service readiness are checked separately during installation. / 协议及适配测试不等于真实客户端；安装另查签名、权限与运行状态。
 - The slow-enumeration guard drops changes observed before enqueue; an OS clipboard change after that check can still race dispatch. Reading NSPasteboard inside the RDP dispatch loop would reintroduce blocking. Closing this remaining ownership window requires a separate publication-ticket design. / 慢枚举复检只覆盖入队前已观察到的变化，之后到分发间仍有所有权竞争窗口；不能在协议循环读系统剪贴板来阻塞主路径。
-- The full reordered dual-monitor disconnect cycle, a Mac with all physical displays unplugged, and rapid reconnects with resolution changes require hardware/client coverage. Creation/release/overlay transitions are serialized; this does not assert that every resize/reanchor transaction shares that gate. / 双屏锁屏顺序、无屏及快速重连改分辨率仍需实机覆盖，不宣称全部显示事务共用同一互斥。
+- Normal locking/unlocking now has the `3bea2b7` user confirmation above. Detailed dual-monitor transition timing, a Mac with all physical displays unplugged, hot-plug, and rapid reconnects with resolution changes still require hardware/client coverage. Creation/release/overlay transitions are serialized; this does not assert that every resize/reanchor transaction shares that gate. / 常规锁屏／解锁已有上述 `3bea2b7` 用户确认；双屏切换的完整时序、无屏、热插拔及快速重连改分辨率仍需实机覆盖，不宣称全部显示事务共用同一互斥。
 - If a connection is cancelled during pre-capture auto-unlock, or capture fails after unlocking, relocking is not currently guaranteed: the capture session may never enter the counted lifecycle. A delayed unconditional lock would risk locking a newer session. / 捕获前解锁时取消或解锁后捕获失败，目前不能保证重锁；不能用无代次保护的延时锁补救。
 - Audio route switches, reconnects, crashes and long silence require listening tests. The 250ms read-check interval is not a strict timeout on synchronous HAL open/close. / 音频设备切换等仍需听测，异步读取轮询间隔不是 HAL 同步调用的硬超时。
 - No FileVault or pre-login remote desktop support is added. / 不新增 FileVault 或首次登录前远程能力。
+
+## 2026-11-18 security workflow follow-up / 安全工作流跟进
+
+[Security run 44130778125](https://github.com/zhangyxXyz/macrdp/actions/runs/44130778125)
+failed its dependency audit because the lockfile selected `libz-sys 1.1.31`, which
+matches [RUSTSEC-2026-0544](https://rustsec.org/advisories/RUSTSEC-2026-0544.html)
+(CVE-2026-85091). The advisory describes a heap overflow in zlib 1.3.1.2–1.3.2
+when a stalled non-blocking `gzwrite()` is followed by `gzprintf()`/`gzvprintf()`;
+it lists `libz-sys >= 1.1.33` as patched. The lockfile now selects `1.1.33` without
+changing other dependency versions or adding an advisory exception. Local
+`cargo-deny 0.19.9` checks of the root and standalone RDPEUDP trees passed under
+the existing policy; the native Rust suite passed **528 tests, with 8 ignored**.
+These checks do not publish a release or replace the installed `3bea2b7` build.
+
+本次 [security 运行 44130778125](https://github.com/zhangyxXyz/macrdp/actions/runs/44130778125)
+因锁文件中的 `libz-sys 1.1.31` 命中
+[RUSTSEC-2026-0544](https://rustsec.org/advisories/RUSTSEC-2026-0544.html)
+（CVE-2026-85091）而未通过依赖审计。公告描述 zlib 1.3.1.2–1.3.2 中，非阻塞
+`gzwrite()` 写入停滞后调用 `gzprintf()`／`gzvprintf()` 可导致堆溢出；修复版本为
+`libz-sys >= 1.1.33`。锁文件已更新为 `1.1.33`，未变更其他依赖版本，也未新增漏洞
+忽略项。本地 `cargo-deny 0.19.9` 在现有策略下对根依赖树及独立 RDPEUDP 库的检查均
+通过；原生 Rust 测试 **528 通过、8 跳过**。这些检查不会发布或替换本机 `3bea2b7`。
+
+The installed macOS build was checked separately: it uses system zlib 1.2.12,
+and no `gzwrite`/`gzprintf` calls were found in that check. Those observations do
+not match this advisory's affected zlib versions and call path; they do not make
+the lockfile audit pass or establish that the application or system zlib is free
+of other vulnerabilities. Other build targets must not inherit this local conclusion.
+
+本机已安装版本另行核对为使用系统 zlib 1.2.12，检查中未发现 `gzwrite`／`gzprintf`
+调用。这两项证据不符合本次公告列出的受影响版本及调用路径，但不会令锁文件审计自动
+通过，也不代表应用或系统 zlib 没有其他漏洞；其他构建目标不能直接套用本机结论。
+
+The existing RUSTSEC-2023-0071 exception remains separate: RustSec now lists
+stable `rsa >= 0.10.0` as patched, while the current picky/sspi/winscard versions
+pin `=0.10.0-rc.18`. The outdated "no fix exists" justification in `deny.toml`
+was corrected. Removing this exception needs a coordinated authentication-stack
+upgrade and regression checks; a passing policy scan is not a claim of zero
+advisories. A diagnostic scan with only this exception removed failed on
+RUSTSEC-2023-0071, confirming the retained exception is active in the root tree.
+No reachable rsa-crate private-key decryption was identified in the
+inspected CredSSP/NTLM server path; other authentication/smart-card paths are not
+proven safe by that observation.
+
+现有 RUSTSEC-2023-0071 例外仍单独保留：RustSec 已列出稳定版 `rsa >= 0.10.0`
+为修复版本，而当前 picky／sspi／winscard 精确依赖 `=0.10.0-rc.18`。
+已修正 `deny.toml` 里“没有修复版”的过期说明；移除此例外需要协调认证依赖升级及回归，
+策略检查通过不等于零漏洞公告。仅临时移除此例外的诊断扫描确实因 RUSTSEC-2023-0071
+失败，确认根依赖树仍依赖此例外。已检查的 CredSSP／NTLM 服务端路径未发现可达的
+rsa crate 私钥解密调用，这不构成其他认证／智能卡路径安全的证明。
