@@ -17,6 +17,20 @@ The initial development base is upstream commit
 The upstream README is retained as [README_UPSTREAM.md](README_UPSTREAM.md);
 its release, verification, and support claims belong to upstream, not this fork.
 
+## Unreleased dev updates
+
+Upstream sync through [`fb1facf`](https://github.com/clintcan/macrdp/commit/fb1facf2d0666c8779a92b943221a4270432734d)
+adds [#262](https://github.com/clintcan/macrdp/pull/262): optional TCP H.264 frame-ack
+backpressure (`H264_MAX_UNACKED_FRAMES`, default `0`, disabled). It drops captures
+when the client falls behind, retaining a 10 fps trickle; trailing flush frames
+are exempt on TCP so the final change can appear. This is a pacing threshold,
+not a strict maximum queue size. Upstream reports Windows App and mstsc testing;
+this fork has not yet measured the enabled setting with its 4K/200% client.
+Configuration inspection reports both requested and effective values; the option
+has no effect without H.264. The sync also includes #268's late-S_OK lossy-audio
+regression test and records #230's already-integrated startup fix in the merge
+history. Existing fork lock/display/clipboard policies remain in place.
+
 ## Current development release
 
 Upstream Windows 10 mstsc black-screen fix [#228](https://github.com/clintcan/macrdp/pull/228)

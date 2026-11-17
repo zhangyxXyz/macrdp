@@ -67,6 +67,17 @@ final class ConfigDocumentTests {
         checkEqual(count, 1)
         checkEqual(try Data(contentsOf: url.appendingPathExtension("previous")), old)
     }
+    func testUneditedH264AckLimitSurvivesConfigurationApply() throws {
+        let line = "H264_MAX_UNACKED_FRAMES='4'"
+        let (url, old) = try fixture("# Advanced video setting, not managed by the GUI\n\(line)\nENABLE_H264=1\n")
+        try ConfigTransaction.apply(url: url, expected: old, changes: ["MAP_CTRL_TO_CMD":"0"], validate: { candidate in
+            let document = try ConfigDocument(data: Data(contentsOf: candidate))
+            checkEqual(document.values["H264_MAX_UNACKED_FRAMES"], "4")
+        }, activate: {})
+        let saved = try Data(contentsOf: url)
+        check(String(decoding: saved, as: UTF8.self).contains(line + "\n"))
+        checkEqual(try ConfigDocument(data: saved).values["MAP_CTRL_TO_CMD"], "0")
+    }
     func testPrivatePermissionsAndRollbackExternalChange() throws {
         let (url, old) = try fixture()
         try FileManager.default.setAttributes([.posixPermissions: 0o640], ofItemAtPath: url.path)
@@ -128,10 +139,11 @@ private func checkThrows<T>(_ expression: @autoclosure () throws -> T, file: Sta
         try tests.testExternalChangeDuringValidationIsNotOverwritten()
         try tests.testActivationFailureRestoresExactOriginalBytes()
         try tests.testSuccessfulTransactionWritesAllKeysAndActivatesOnce()
+        try tests.testUneditedH264AckLimitSurvivesConfigurationApply()
         try tests.testPrivatePermissionsAndRollbackExternalChange()
         try tests.testProtocolVersionsAndUnknownDisplayFields()
         try tests.testConcurrentControllerCannotReplaceCandidate()
         try tests.testExtraFlagsGroupingMatchesServerGrammar()
-        print("ConfigSupport: 10 tests passed (no server or user configuration touched)")
+        print("ConfigSupport: 11 tests passed (no server or user configuration touched)")
     }
 }

@@ -15,6 +15,17 @@
 [`29d01ed`](https://github.com/clintcan/macrdp/commit/29d01ed72946ebde25ca08c924429b5fc37de7c5)。
 [README_UPSTREAM.md](README_UPSTREAM.md) 保留上游原文，其中的发布、验证和支持声明属于上游，不能视为本 fork 的验证结果。
 
+## dev 未发布更新
+
+同步上游至 [`fb1facf`](https://github.com/clintcan/macrdp/commit/fb1facf2d0666c8779a92b943221a4270432734d)，
+纳入 [#262](https://github.com/clintcan/macrdp/pull/262)：可选 TCP H.264 帧确认积压限制
+（`H264_MAX_UNACKED_FRAMES`，默认 `0`，关闭）。客户端落后时丢弃部分捕获帧，保留约
+10 fps 的低速发送；TCP 末尾补帧不受此限制，避免最后一次画面变化迟迟不显示。
+这是发送节奏阈值，并非严格的队列长度上限。上游报告已测试 Windows App 和 mstsc；
+本 fork 尚未在自己的 4K／200% 客户端测量开启后的效果。配置检查同时报告请求值与
+有效值，未启用 H.264 时不生效。此次还纳入 #268 的迟到 S_OK 有损音频回归测试，
+并在合并历史中统一此前已移植的 #230 启动画面修复。保留本 fork 的锁屏、显示和剪贴板策略。
+
 ## 当前开发版
 
 上游 Windows 10 mstsc 黑屏修复 [#228](https://github.com/clintcan/macrdp/pull/228)

@@ -29,7 +29,7 @@ def invoke(*args, expected=0):
 caps = invoke("--capabilities")
 assert caps["schema_version"] == 1
 assert {"config_validation", "display_state_v2"} <= set(caps["features"])
-assert {"RESOLUTION_POLICY", "LIVE_RESIZE", "VD_HIDPI", "CAPTURE_NV12", "AUDIO_REMOTE_ONLY"} <= set(caps["supported_config_keys"])
+assert {"RESOLUTION_POLICY", "LIVE_RESIZE", "VD_HIDPI", "CAPTURE_NV12", "AUDIO_REMOTE_ONLY", "H264_MAX_UNACKED_FRAMES"} <= set(caps["supported_config_keys"])
 
 with tempfile.TemporaryDirectory(prefix="macrdp-config-smoke-") as temporary:
     directory = Path(temporary)
@@ -79,6 +79,29 @@ with tempfile.TemporaryDirectory(prefix="macrdp-config-smoke-") as temporary:
     assert mixed["effective"]["modifier_layout"] == "swap-left-win-alt"
     assert mixed["effective"]["map_ctrl_to_cmd"] is False
     assert mixed["effective"]["vd_width"] == 3840 and mixed["effective"]["vd_hidpi"] == "1"
+
+    # The upstream TCP ack-lag limit is opt-in. Preserve absent/empty defaults,
+    # the entire CLI u32 range, and the distinction between configured and active.
+    for setting, requested in [("", 0), ("H264_MAX_UNACKED_FRAMES=\n", 0),
+                               ("H264_MAX_UNACKED_FRAMES=0\n", 0),
+                               ("H264_MAX_UNACKED_FRAMES=4\n", 4),
+                               ("H264_MAX_UNACKED_FRAMES=4294967295\n", 4294967295)]:
+        for codec in [0, 1]:
+            report = validate(f"ENABLE_H264={codec}\n" + setting)
+            assert not report["warnings"], report["warnings"]
+            assert report["effective"]["h264_max_unacked_frames_requested"] == requested
+            assert report["effective"]["h264_max_unacked_frames"] == (requested if codec else 0)
+    for value in ["-1", "1.5", "4294967296", "false"]:
+        invalid = validate(f"H264_MAX_UNACKED_FRAMES={value}\n", valid=False)
+        assert any("H264_MAX_UNACKED_FRAMES" in error for error in invalid["errors"])
+    for flag in ["--h264-max-unacked-frames 4", "--h264-max-unacked-frames=4"]:
+        for prefix in ["", "H264_MAX_UNACKED_FRAMES=\n"]:
+            report = validate(f"ENABLE_H264=1\n{prefix}EXTRA_FLAGS='{flag}'\n")
+            assert not report["warnings"], report["warnings"]
+            assert report["effective"]["h264_max_unacked_frames"] == 4
+        for value in ["0", "4"]:
+            invalid = validate(f"H264_MAX_UNACKED_FRAMES={value}\nEXTRA_FLAGS='{flag}'\n", valid=False)
+            assert any("conflicts with EXTRA_FLAGS" in error for error in invalid["errors"])
 
     follow = validate("export\t VIRTUAL_DISPLAY='1'\nVD_WIDTH=3840\nVD_HEIGHT=2160\n"
                       'VD_HIDPI="auto"\nRESOLUTION_POLICY=client\nUNKNOWN_FUTURE_KEY=keep\n')

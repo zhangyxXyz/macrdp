@@ -5,6 +5,14 @@
 
 **Fork lifecycle/clipboard correction:** virtual displays are created for authenticated capture and released after reactivation grace plus physical restoration; reconnect generations protect new sessions. Stale text is cleared on incoming file intent, filenames never become text clippings, and eager completion never generates Cmd+V. Outgoing reads run outside the RDP loop (4 workers / 32 operations / 30s); ordered format replies, locked path snapshots and session-scoped completions protect concurrent copies/reconnects. These new behaviors await real Windows validation. See the bilingual README for limits.
 
+**Unreleased upstream sync (2026-11-17):** `H264_MAX_UNACKED_FRAMES` optionally
+paces TCP H.264 captures against client frame acknowledgements. Default `0` keeps
+it off. Over the threshold, captures are dropped with a 10 fps trickle; TCP flush
+re-sends remain exempt, and the UDP threshold is unchanged. This is not a hard
+queue-size bound. It is independent of the fork's default-off QoE blank recovery.
+Upstream reports Windows App and mstsc checks; enabled 4K/200% behavior in this
+fork remains unverified. See [CLI options](cli.md).
+
 Functional v0. RDP clients (mstsc, Microsoft Remote Desktop, FreeRDP) can:
 - Connect over TLS to the Mac on port 3390 with a local Mac username/password.
 - See the primary display at native resolution with incremental damage-region updates.

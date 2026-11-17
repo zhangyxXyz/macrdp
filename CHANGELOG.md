@@ -3,6 +3,16 @@
 Only implemented behavior and completed checks are recorded here. Client-side manual checks are identified separately.
 这里只记录已实现的行为和已完成的检查；客户端实测另行注明。
 
+## Unreleased / 未发布
+
+- Validation: 515 Rust tests passed (8 ignored), strict all-target Clippy and formatting checks passed, 55 configuration CLI checks and 11 controller configuration tests passed. These checks do not measure enabled real-client latency.
+- 验证：515 项 Rust 测试通过（8 项跳过），全部目标严格 Clippy 和格式检查通过，55 项配置 CLI 检查、11 项控制器配置测试通过；不等同真实客户端开启后的延迟测量。
+
+- Merge upstream through `fb1facf` (#262): opt-in TCP H.264 ack-lag pacing, default off, with TCP trailing-flush exemption. Preserve the fork's default-off QoE blank recovery and display/lock/clipboard behavior. Advertise and validate `H264_MAX_UNACKED_FRAMES`, reject duplicate escape-hatch flags, and report requested/effective values. Upstream client results are not a local 4K/200% verification.
+- 同步上游至 `fb1facf`（#262）：可选 TCP H.264 帧确认积压控制，默认关闭，TCP 末尾补帧豁免。保留本 fork 默认关闭的 QoE 黑屏恢复及显示／锁屏／剪贴板行为；补齐新配置键的能力声明、校验、重复参数拒绝及请求／有效值报告。上游客户端结果不等同本机 4K／200% 验证。
+- Include #268's regression for lossy-audio Soft-Sync after mstsc's late S_OK, and consolidate #230's already-ported startup-frame hold into upstream ancestry.
+- 纳入 #268 的 mstsc 迟到 S_OK 后有损音频 Soft-Sync 回归测试；统一已移植 #230 启动帧等待修复的上游合并历史。
+
 ## v0.10.6-dev
 
 ### 2026-11-17 rebuild / 同版本重构建

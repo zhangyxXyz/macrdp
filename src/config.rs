@@ -171,6 +171,15 @@ impl Document {
                     .push("STATS_PORT must be an integer in 1..=65535".into());
             }
         }
+        if let Some(value) = self.values.get("H264_MAX_UNACKED_FRAMES") {
+            // Empty retains the CLI default (off), like an omitted setting.
+            // Keep the accepted range identical to the upstream u32 argument.
+            if !value.is_empty() && value.parse::<u32>().is_err() {
+                self.errors.push(
+                    "H264_MAX_UNACKED_FRAMES must be an integer in 0..=4294967295 (0 disables the TCP acknowledgement cap)".into(),
+                );
+            }
+        }
         let has_flag = |flag: &str| {
             self.extra_flags
                 .iter()
@@ -184,10 +193,11 @@ impl Document {
         {
             self.errors.push("RESOLUTION_POLICY=client conflicts with EXTRA_FLAGS --no-client-resolution; remove the legacy flag or select fixed".into());
         }
-        // A dedicated display field and an escape-hatch flag must never silently
+        // A dedicated setting and an escape-hatch flag must never silently
         // disagree. Even equal duplicates are rejected: clap rejects them too.
         for (key, flag) in [
             ("CAPTURE_NV12", "--capture-nv12"),
+            ("H264_MAX_UNACKED_FRAMES", "--h264-max-unacked-frames"),
             ("MODIFIER_LAYOUT", "--modifier-layout"),
             ("MAP_CTRL_TO_CMD", "--map-ctrl-to-cmd"),
             ("RESOLUTION_POLICY", "--resolution-policy"),
@@ -382,6 +392,7 @@ pub const SUPPORTED_KEYS: &[&str] = &[
     "GUARD_FAIL_THRESHOLD",
     "GUARD_RL_MAX",
     "GUARD_RL_WINDOW_SECS",
+    "H264_MAX_UNACKED_FRAMES",
     "HEALTHCHECK_FAILURES",
     "HEALTHCHECK_INTERVAL_SECS",
     "HEALTHCHECK_TIMEOUT_SECS",
@@ -631,6 +642,46 @@ mod tests {
         assert!(!Document::parse("EXTRA_FLAGS=--config nested.env")
             .errors
             .is_empty());
+    }
+
+    #[test]
+    fn h264_ack_limit_accepts_the_cli_u32_range_and_empty_default() {
+        assert!(SUPPORTED_KEYS.contains(&"H264_MAX_UNACKED_FRAMES"));
+        for value in ["", "0", "4", "4294967295"] {
+            let doc = Document::parse(&format!("H264_MAX_UNACKED_FRAMES={value}\n"));
+            assert!(doc.errors.is_empty(), "{value}: {:?}", doc.errors);
+            assert!(doc.warnings.is_empty(), "{value}: {:?}", doc.warnings);
+        }
+        for value in ["-1", "1.5", "4294967296", "false"] {
+            let doc = Document::parse(&format!("H264_MAX_UNACKED_FRAMES={value}\n"));
+            assert!(
+                doc.errors
+                    .iter()
+                    .any(|error| error.contains("H264_MAX_UNACKED_FRAMES")),
+                "{value} must not be silently ignored"
+            );
+        }
+    }
+
+    #[test]
+    fn h264_ack_limit_rejects_dedicated_extra_flag_duplicates() {
+        for flag in ["--h264-max-unacked-frames 4", "--h264-max-unacked-frames=4"] {
+            for value in ["0", "4"] {
+                let doc = Document::parse(&format!(
+                    "H264_MAX_UNACKED_FRAMES={value}\nEXTRA_FLAGS='{flag}'\n"
+                ));
+                assert!(doc
+                    .errors
+                    .iter()
+                    .any(|error| error.contains("conflicts with EXTRA_FLAGS")));
+            }
+            let empty =
+                Document::parse(&format!("H264_MAX_UNACKED_FRAMES=\nEXTRA_FLAGS='{flag}'\n"));
+            assert!(
+                empty.errors.is_empty(),
+                "empty dedicated value must leave EXTRA_FLAGS usable"
+            );
+        }
     }
 
     #[test]
