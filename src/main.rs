@@ -433,6 +433,10 @@ struct Args {
     #[arg(long)]
     lock_on_disconnect: bool,
 
+    /// Maximum time to confirm display wake during authenticated auto-unlock preparation.
+    #[arg(long, default_value_t = 3, value_parser = clap::value_parser!(u64).range(1..=15))]
+    display_wake_timeout_secs: u64,
+
     /// EXPERIMENTAL, opt-in. Type the account password into the lock screen
     /// after RDP credential/ARC validation, before capture, when locked — any
     /// lock, any cause (a --lock-on-disconnect lock, one set manually, or
@@ -2864,6 +2868,7 @@ fn effective_config(args: &Args, document: &config::Document) -> serde_json::Val
         "capture_nv12": args.capture_nv12 && args.enable_h264,
         "max_client_size": args.max_client_size.map(|(w,h)| format!("{w}x{h}")),
         "stats_endpoint": args.stats_endpoint,
+        "display_wake_timeout_secs": args.display_wake_timeout_secs,
         "stats_port": document.values.get("STATS_PORT").and_then(|v| v.parse::<u16>().ok()).unwrap_or(40245),
     })
 }
@@ -3011,6 +3016,13 @@ fn args_from_config_values(path: &Path, document: &config::Document) -> Result<A
     }
     if on("LOCK_ON_DISCONNECT", false) {
         argv.push("--lock-on-disconnect".into());
+    }
+    if let Some(value) = cfg
+        .get("DISPLAY_WAKE_TIMEOUT_SECS")
+        .filter(|v| !v.is_empty())
+    {
+        argv.push("--display-wake-timeout-secs".into());
+        argv.push(value.clone());
     }
     if on("AUTO_UNLOCK", false) {
         argv.push("--auto-unlock".into());
@@ -3938,6 +3950,7 @@ async fn async_main(mut args: Args, document: Option<config::Document>) -> Resul
     });
     let display = CaptureDisplay {
         preparation,
+        display_wake_timeout: std::time::Duration::from_secs(args.display_wake_timeout_secs),
         desktop_size: desktop_size.clone(),
         auto_size,
         live_resize: args.live_resize.unwrap_or(true),

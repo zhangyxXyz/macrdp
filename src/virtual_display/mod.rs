@@ -536,14 +536,25 @@ mod macos {
             // is what we add to mouse coords so CGEventPost lands events
             // on the vdisplay, not on the user's main screen.
             let id = handle.display_id();
-            let bounds = CGDisplay::new(id).bounds();
-            if bounds.size.width <= 0.0 || bounds.size.height <= 0.0 {
-                return Err(anyhow!(
-                    "virtual display registered (id={id}) but CGDisplayBounds \
-                     returned a zero-size rect — the system hasn't finished \
-                     activating it yet"
-                ));
-            }
+            // WindowServer may publish bounds after applySettings has returned,
+            // especially when this is the first display after lock-screen sleep.
+            // Keep the handle alive on the display coordinator's blocking worker.
+            let deadline = std::time::Instant::now() + Duration::from_secs(8);
+            let bounds = loop {
+                let bounds = CGDisplay::new(id).bounds();
+                if bounds.size.width.is_finite()
+                    && bounds.size.width > 0.0
+                    && bounds.size.height.is_finite()
+                    && bounds.size.height > 0.0
+                {
+                    break bounds;
+                }
+                anyhow::ensure!(
+                    std::time::Instant::now() < deadline,
+                    "virtual display {id} has no usable bounds after 8 seconds"
+                );
+                std::thread::sleep(Duration::from_millis(100));
+            };
 
             let mut vd = Self {
                 _handle: handle,

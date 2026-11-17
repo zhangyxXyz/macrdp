@@ -50,6 +50,17 @@ with tempfile.TemporaryDirectory(prefix="macrdp-config-smoke-") as temporary:
     assert fixed["effective"]["vd_width"] == 3840
     assert fixed["effective"]["vd_hidpi"] == "1"
 
+    assert "DISPLAY_WAKE_TIMEOUT_SECS" in caps["supported_config_keys"]
+    assert fixed["effective"]["display_wake_timeout_secs"] == 3
+    for value in [1, 3, 15]:
+        wake = validate(f"DISPLAY_WAKE_TIMEOUT_SECS={value}\n")
+        assert wake["effective"]["display_wake_timeout_secs"] == value
+    for value in ["0", "16", "3.5", "never"]:
+        validate(f"DISPLAY_WAKE_TIMEOUT_SECS={value}\n", valid=False)
+    via_flag = validate('DISPLAY_WAKE_TIMEOUT_SECS=\nEXTRA_FLAGS="--display-wake-timeout-secs=9"\n')
+    assert via_flag["effective"]["display_wake_timeout_secs"] == 9
+    validate('DISPLAY_WAKE_TIMEOUT_SECS=5\nEXTRA_FLAGS="--display-wake-timeout-secs=7"\n', valid=False)
+
     for layout in ["standard", "swap-left-win-alt", "swap-win-alt"]:
         for compatible in [0, 1]:
             report = validate(base + f"MODIFIER_LAYOUT={layout}\nMAP_CTRL_TO_CMD={compatible}\n")

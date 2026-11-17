@@ -3,6 +3,7 @@
 //! login.framework symbols are resolved at runtime, never linked or assumed.
 use anyhow::Result;
 use std::sync::Arc;
+use std::time::Duration;
 
 #[cfg(target_os = "macos")]
 static SCREENS_ASLEEP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -54,17 +55,35 @@ pub fn display_asleep(display_id: Option<u32>) -> bool {
 /// The power request never submits a password or holds displays awake for
 /// the lifetime of the connection.
 #[cfg(target_os = "macos")]
-pub async fn wake_for_capture() -> Result<()> {
-    wake_if_sleeping(
+pub async fn wake_for_capture(timeout: Duration, virtual_configured: bool) -> Result<bool> {
+    use core_graphics::display::CGDisplay;
+    wake_for_surface(
+        timeout,
+        virtual_configured,
         || display_asleep(None),
-        || async { tokio::task::spawn_blocking(declare_display_activity).await? },
+        || {
+            if virtual_configured {
+                let id = crate::display_session::active_display_id();
+                if crate::virtual_display::other_displays(id)?
+                    == crate::display_transition::OtherDisplays::None
+                {
+                    let drawable = id.is_some_and(|id| {
+                        let display = CGDisplay::new(id);
+                        display.is_active() && !display.is_asleep()
+                    });
+                    return Ok(WakeSurface::Virtual { drawable });
+                }
+            }
+            Ok(WakeSurface::Other)
+        },
+        async || tokio::task::spawn_blocking(declare_display_activity).await?,
     )
     .await
 }
 
 #[cfg(not(target_os = "macos"))]
-pub async fn wake_for_capture() -> Result<()> {
-    Ok(())
+pub async fn wake_for_capture(_: Duration, _: bool) -> Result<bool> {
+    Ok(false)
 }
 
 #[cfg(target_os = "macos")]
@@ -99,27 +118,67 @@ fn declare_display_activity() -> Result<()> {
 }
 
 #[cfg(any(target_os = "macos", test))]
-async fn wake_if_sleeping(
+enum WakeSurface {
+    Other,
+    Virtual { drawable: bool },
+}
+
+/// Returns true when the caller must acquire a virtual login surface before
+/// running auto-unlock. A CG query error cannot silently become "no displays".
+#[cfg(any(target_os = "macos", test))]
+async fn wake_for_surface(
+    timeout: Duration,
+    virtual_configured: bool,
     mut asleep: impl FnMut() -> bool,
-    request_wake: impl AsyncFnOnce() -> Result<()>,
-) -> Result<()> {
+    mut surface: impl FnMut() -> Result<WakeSurface>,
+    mut request_wake: impl AsyncFnMut() -> Result<()>,
+) -> Result<bool> {
     use anyhow::Context;
-    use std::time::Duration;
-    if !asleep() {
-        return Ok(());
-    }
-    tracing::info!("display asleep at authenticated capture startup; requesting wake");
-    tokio::time::timeout(Duration::from_secs(3), async {
-        request_wake().await?;
-        while asleep() {
-            tokio::time::sleep(Duration::from_millis(100)).await;
+    let mut requested = false;
+    let result = tokio::time::timeout(timeout, async {
+        loop {
+            let sleeping = asleep();
+            if sleeping && !requested {
+                // A previous CG restore may itself need a wake. Signal before
+                // enumerating displays or queuing for the coordinator.
+                tracing::info!("display asleep at authenticated capture startup; requesting wake");
+                request_wake().await?;
+                requested = true;
+            }
+            match surface()? {
+                WakeSurface::Virtual { drawable } => {
+                    if !requested && !drawable {
+                        // After a restart we may have missed the sleep notification.
+                        // A Mac with no registered display has no main ID to query.
+                        request_wake().await?;
+                    }
+                    tracing::debug!("preparing the virtual login surface without waiting for a physical display");
+                    return Ok(true);
+                }
+                WakeSurface::Other if !sleeping => {
+                    if requested {
+                        tracing::info!("display woke before authenticated capture preparation");
+                    }
+                    return Ok(false);
+                }
+                WakeSurface::Other => tokio::time::sleep(Duration::from_millis(100)).await,
+            }
         }
-        Ok::<(), anyhow::Error>(())
     })
-    .await
-    .context("display did not wake within 3 seconds before capture preparation")??;
-    tracing::info!("display woke before authenticated capture preparation");
-    Ok(())
+    .await;
+    if result.is_err() && requested && virtual_configured {
+        tracing::info!(
+            timeout_secs = timeout.as_secs(),
+            "display wake unconfirmed; checking the authenticated virtual login surface"
+        );
+        return Ok(true);
+    }
+    result.with_context(|| {
+        format!(
+            "display wake exceeded {} seconds before capture preparation",
+            timeout.as_secs()
+        )
+    })?
 }
 
 /// No physical desktop effect unless explicitly requested, PAM validated and
@@ -173,7 +232,9 @@ pub async fn wait_for_unlock_surface(id: u32) -> Result<()> {
         loop {
             let active = CGDisplay::active_displays().unwrap_or_default();
             let bounds = CGDisplay::new(id).bounds();
-            if unlock_surface_ready(&active, id, bounds.size.width, bounds.size.height) {
+            if !CGDisplay::new(id).is_asleep()
+                && unlock_surface_ready(&active, id, bounds.size.width, bounds.size.height)
+            {
                 return;
             }
             tokio::time::sleep(Duration::from_millis(200)).await;
@@ -316,40 +377,138 @@ mod tests {
 
     #[tokio::test]
     async fn awake_display_needs_no_wake_request() {
-        wake_if_sleeping(|| false, async || panic!("display was already awake"))
-            .await
-            .unwrap();
+        assert!(!wake_for_surface(
+            Duration::from_secs(3),
+            false,
+            || false,
+            || Ok(WakeSurface::Other),
+            async || panic!("already awake")
+        )
+        .await
+        .unwrap());
     }
 
     #[tokio::test(start_paused = true)]
     async fn sleeping_display_must_wake_before_capture_can_prepare() {
         let started = tokio::time::Instant::now();
         let requests = AtomicUsize::new(0);
-        wake_if_sleeping(
-            || started.elapsed() < std::time::Duration::from_millis(300),
+        assert!(!wake_for_surface(
+            Duration::from_secs(3),
+            false,
+            || started.elapsed() < Duration::from_millis(300),
+            || Ok(WakeSurface::Other),
             async || {
                 requests.fetch_add(1, Ordering::SeqCst);
                 Ok(())
             },
         )
         .await
-        .unwrap();
+        .unwrap());
         assert_eq!(requests.load(Ordering::SeqCst), 1);
-        assert!(started.elapsed() >= std::time::Duration::from_millis(300));
+        assert!(started.elapsed() >= Duration::from_millis(300));
     }
 
     #[tokio::test(start_paused = true)]
-    async fn display_wake_has_a_deadline_and_propagates_request_errors() {
-        let started = tokio::time::Instant::now();
-        let error = wake_if_sleeping(|| true, async || Ok(()))
+    async fn no_monitor_bootstraps_even_if_sleep_notification_is_missing_or_stale() {
+        for (asleep, drawable, expected_requests) in [
+            (true, false, 1),
+            (false, false, 1),
+            (true, true, 1),
+            (false, true, 0),
+        ] {
+            let started = tokio::time::Instant::now();
+            let requests = AtomicUsize::new(0);
+            assert!(wake_for_surface(
+                Duration::from_secs(1),
+                true,
+                || asleep,
+                || {
+                    if asleep {
+                        assert_eq!(requests.load(Ordering::SeqCst), 1);
+                    }
+                    Ok(WakeSurface::Virtual { drawable })
+                },
+                async || {
+                    requests.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                }
+            )
+            .await
+            .unwrap());
+            assert_eq!(requests.load(Ordering::SeqCst), expected_requests);
+            assert_eq!(started.elapsed(), Duration::ZERO);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn display_wake_uses_configured_deadline_and_propagates_errors() {
+        for seconds in [1, 3, 10] {
+            let started = tokio::time::Instant::now();
+            let timeout = Duration::from_secs(seconds);
+            let error = wake_for_surface(
+                timeout,
+                false,
+                || true,
+                || Ok(WakeSurface::Other),
+                async || Ok(()),
+            )
             .await
             .unwrap_err();
-        assert!(error.to_string().contains("did not wake"));
-        assert_eq!(started.elapsed(), std::time::Duration::from_secs(3));
-        let error = wake_if_sleeping(|| true, async || anyhow::bail!("IOKit failed"))
-            .await
-            .unwrap_err();
+            assert!(error.to_string().contains(&format!("{seconds} seconds")));
+            assert_eq!(started.elapsed(), timeout);
+        }
+        let error = wake_for_surface(
+            Duration::from_secs(3),
+            false,
+            || true,
+            || Ok(WakeSurface::Other),
+            async || anyhow::bail!("IOKit failed"),
+        )
+        .await
+        .unwrap_err();
         assert_eq!(error.to_string(), "IOKit failed");
+        let error = wake_for_surface(
+            Duration::from_secs(3),
+            false,
+            || false,
+            || anyhow::bail!("CG enumeration failed"),
+            async || panic!("unknown topology"),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.to_string(), "CG enumeration failed");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn virtual_fallback_requires_a_completed_wake_request() {
+        let timeout = Duration::from_secs(2);
+        assert!(wake_for_surface(
+            timeout,
+            true,
+            || true,
+            || Ok(WakeSurface::Other),
+            async || Ok(())
+        )
+        .await
+        .unwrap());
+        assert!(wake_for_surface(
+            timeout,
+            true,
+            || true,
+            || Ok(WakeSurface::Other),
+            async || std::future::pending().await
+        )
+        .await
+        .is_err());
+        assert!(wake_for_surface(
+            timeout,
+            true,
+            || true,
+            || Ok(WakeSurface::Other),
+            async || anyhow::bail!("IOKit rejected wake")
+        )
+        .await
+        .is_err());
     }
 
     #[test]

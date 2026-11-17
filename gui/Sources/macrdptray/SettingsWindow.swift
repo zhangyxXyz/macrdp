@@ -435,6 +435,31 @@ private struct DisplayTab: View {
                 Toggle("Unlock it automatically when a client reconnects",
                        isOn: model.boolBinding("AUTO_UNLOCK"))
                     .disabled(!headless)
+                if model.capabilities?.keys.contains("DISPLAY_WAKE_TIMEOUT_SECS") == true {
+                    let seconds = 1...15
+                    let timeout = model.displayWakeTimeout
+                    Picker("Display wake timeout", selection: Binding(
+                        get: { model.displayWakeTimeout.selection },
+                        set: { model.setString("DISPLAY_WAKE_TIMEOUT_SECS", $0) })) {
+                        ForEach(seconds, id: \.self) { time in
+                            Text(time == 3 ? "3 s (default)" : "\(time) s").tag(String(time))
+                        }
+                        if !seconds.contains(Int(timeout.selection) ?? 0) {
+                            Text("Invalid setting").tag(timeout.selection)
+                        }
+                    }
+                    .disabled(!headless || !model.bool("AUTO_UNLOCK") || timeout.suppliedByExtraFlags)
+                    if timeout.suppliedByExtraFlags {
+                        Text("Remove --display-wake-timeout-secs from Advanced → Extra flags to edit the timeout here.")
+                            .font(.caption).foregroundColor(.secondary)
+                    } else {
+                        Text("Maximum wait for a sleeping display to wake after a client authenticates. Auto-unlock continues as soon as the display is ready.")
+                            .font(.caption).foregroundColor(.secondary)
+                    }
+                } else if headless && model.bool("AUTO_UNLOCK") && model.capabilities != nil {
+                    Text("Update the server to configure the display wake timeout.")
+                        .font(.caption).foregroundColor(.secondary)
+                }
                 if !headless {
                     Text("Needs one of the Detach/Blank modes above.")
                         .font(.caption).foregroundColor(.secondary)
@@ -445,11 +470,8 @@ private struct DisplayTab: View {
                         .font(.caption).foregroundColor(.orange)
                         .lineLimit(nil).fixedSize(horizontal: false, vertical: true)
                 }
-                Text("Locking waits for physical-display restoration and the disconnect safety delay "
-                    + "(2.5 s reactivation grace plus restoration time; reconnects may hold longer), then requests a password-required lock. "
-                    + "The screen-saver password delay is unchanged; failures are recorded in the log. "
-                    + "Automatic unlock runs after authentication, before capture, and types your account "
-                    + "password — while unlocked, anyone at the Mac has your desktop.")
+                Text("Disconnect locking waits briefly for a reconnect. Detach mode confirms the lock before restoring the physical displays. "
+                    + "Auto-unlock uses your account password. Anyone at the Mac can use the desktop while it is unlocked.")
                     .font(.caption).foregroundColor(.secondary)
                         .lineLimit(nil).fixedSize(horizontal: false, vertical: true)
             }

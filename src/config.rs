@@ -196,6 +196,7 @@ impl Document {
         // A dedicated setting and an escape-hatch flag must never silently
         // disagree. Even equal duplicates are rejected: clap rejects them too.
         for (key, flag) in [
+            ("DISPLAY_WAKE_TIMEOUT_SECS", "--display-wake-timeout-secs"),
             ("CAPTURE_NV12", "--capture-nv12"),
             ("H264_MAX_UNACKED_FRAMES", "--h264-max-unacked-frames"),
             ("MODIFIER_LAYOUT", "--modifier-layout"),
@@ -375,6 +376,7 @@ pub const SUPPORTED_KEYS: &[&str] = &[
     "CAPTURE_PRIMARY",
     "CONN_GUARD",
     "DETACH_RESTART_ON_STUCK",
+    "DISPLAY_WAKE_TIMEOUT_SECS",
     "ENABLE_AAC",
     "AUDIO_REMOTE_ONLY",
     "ENABLE_CAMERA_REDIRECTION",

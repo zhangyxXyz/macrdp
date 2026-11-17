@@ -35,7 +35,7 @@ history. Existing fork lock/display/clipboard policies remain in place.
 
 **Latest: `v0.10.8`.** Subsequent builds keep this application version and
 release tag. The package's `SOURCE_COMMIT` identifies the build.
-See the [changelog](CHANGELOG.md#v0108) for the security and clipboard fixes.
+See the [changelog](CHANGELOG.md#v0108) for display, clipboard and security updates.
 
 If a locked Mac's displays go to sleep and ScreenCaptureKit loses its source,
 the server ends that RDP session and runs the normal display cleanup. Other
@@ -252,9 +252,14 @@ With a headless display mode and `AUTO_UNLOCK=1`, the fork prepares the desktop
 **after RDP credential/ARC validation and before ScreenCaptureKit capture**.
 This removes the circular dependency where a locked/display-asleep Mac reported
 `SCK sees: []` and disconnected before the session watcher could unlock it.
-If the displays are asleep when you reconnect, macrdp requests a display wake
-and waits up to 3 seconds before preparing the virtual display or attempting
-auto-unlock.
+Set **Display → Lock while away (experimental) → Display wake timeout** to choose
+how long an authenticated reconnect waits for the display to wake. The default
+is **3 seconds**, adjustable from **1 to 15 seconds** in whole seconds
+(`DISPLAY_WAKE_TIMEOUT_SECS` in `config.env`). An awake display needs no wait.
+When no other display is online, macrdp creates or reuses the virtual display
+and checks that it is active, awake and has valid dimensions before auto-unlock.
+With a virtual display configured, the same check applies when macOS accepts
+the wake request but does not confirm display wake within the selected timeout.
 After a confirmed unlock, capture waits at most 8 seconds for its requested
 display. Unsafe/unknown lock state and exhausted password-submission budget stop
 capture with a diagnostic; the two-submission limit remains shared and serialized.
@@ -269,12 +274,10 @@ physical-display restoration, disconnect grace and bounded
 reconnect hold remain; the extra safety delay defaults to zero; **disconnect locking is delayed, not instantaneous**.
 Auto-unlock affects the physical desktop, and these private macOS APIs may change.
 
-Regression tests cover preparation ordering/failure, serialization, display
-selection, lock confirmation and existing reconnect/budget policy. **The user
-confirmed normal locking/unlocking on installed source `3bea2b7` on 2026-11-18.**
-This does not verify monitor-free reconnects or guarantee relocking when preparation
-is cancelled or capture fails before the session is counted.
-Build verification does not grant TCC permissions or change the running app.
+With two monitors attached, a FreeRDP reconnect to build `e30641f` woke the
+locked Mac and received a 3840×2160 desktop. Reconnecting with every monitor
+physically unplugged still needs hardware verification. If preparation ends
+after auto-unlock and before capture starts, the Mac can remain unlocked.
 
 ## Windows clipboard images and files
 

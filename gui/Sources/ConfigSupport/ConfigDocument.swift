@@ -60,6 +60,22 @@ public struct ConfigDocument {
     }
 }
 
+/// The timeout shown in the controller's unsaved draft. Advanced flags may
+/// supply this option on their own; a dedicated value would conflict on Apply.
+public struct DisplayWakeTimeout {
+    public let selection: String
+    public let suppliedByExtraFlags: Bool
+
+    public init(config: [String: String]) {
+        let flag = "--display-wake-timeout-secs"
+        let flags = try? ExtraFlags(config["EXTRA_FLAGS"] ?? "")
+        suppliedByExtraFlags = flags?.contains(flag) == true
+        let configured = config["DISPLAY_WAKE_TIMEOUT_SECS"] ?? ""
+        let value = configured.isEmpty ? (flags?.value(flag) ?? "3") : configured
+        selection = Int(value).map(String.init) ?? value
+    }
+}
+
 public enum ConfigError: LocalizedError {
     case invalid(String)
     case externalChange

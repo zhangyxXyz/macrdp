@@ -391,6 +391,7 @@ impl RdpServerDisplayUpdates for CountedUpdates {
 pub struct CaptureDisplay {
     /// Opt-in preparation, reached only after RDP authentication/ARC validation.
     pub preparation: Option<crate::session_lock::CapturePreparation>,
+    pub display_wake_timeout: Duration,
     /// Session desktop size — shared with the input handler and the H.264
     /// pipeline so all three stay in sync when `auto_size` adopts the
     /// client's requested resolution.
@@ -929,14 +930,15 @@ impl RdpServerDisplay for CaptureDisplay {
         let result = async {
             // An Esc-sleep reconnect must wake the display before waiting on
             // topology, virtual display acquisition, or the unlock surface.
-            if self.preparation.is_some() {
-                crate::session_lock::wake_for_capture().await?;
-            }
-            let bootstrap = self.preparation.is_some()
-                && self.virtual_display.is_some()
-                && crate::virtual_display::other_displays(
-                    crate::display_session::active_display_id(),
-                )? == crate::display_transition::OtherDisplays::None;
+            let bootstrap = if self.preparation.is_some() {
+                crate::session_lock::wake_for_capture(
+                    self.display_wake_timeout,
+                    self.virtual_display.is_some(),
+                )
+                .await?
+            } else {
+                false
+            };
             let early_lease = if bootstrap {
                 let vd = self
                     .virtual_display
@@ -1400,7 +1402,7 @@ mod macos {
 
     use anyhow::{anyhow, Context};
     use screencapturekit::async_api::AsyncSCShareableContent;
-    use screencapturekit::cm::CMSampleBuffer;
+    use screencapturekit::cm::{CMSampleBuffer, SCFrameStatus};
     use screencapturekit::cv::{CVPixelBuffer, CVPixelBufferLockFlags};
     use screencapturekit::error::SCStreamErrorCode;
     use screencapturekit::prelude::{
@@ -1455,6 +1457,24 @@ mod macos {
     }
 
     impl Samples {
+        fn offer(&self, status: Option<SCFrameStatus>, sample: CMSampleBuffer) {
+            // Idle/blank notifications can follow the only drawable frame of
+            // a static lock screen. Never evict that frame for an empty sample.
+            if status.is_some_and(|s| !s.has_content()) || sample.image_buffer().is_none() {
+                return;
+            }
+            let mut q = self.queue.lock().unwrap();
+            if q.stopped.is_some() {
+                return;
+            }
+            if q.samples.len() >= SAMPLE_BUFFER {
+                q.samples.pop_front();
+            }
+            q.samples.push_back(sample);
+            drop(q);
+            self.ready.notify_one();
+        }
+
         async fn next(&self) -> Result<CMSampleBuffer, CaptureStop> {
             loop {
                 {
@@ -1496,17 +1516,8 @@ mod macos {
             );
             let on_sample = Arc::clone(&samples);
             stream.add_output_handler(
-                move |sample, _| {
-                    let mut q = on_sample.queue.lock().unwrap();
-                    if q.stopped.is_some() {
-                        return;
-                    }
-                    if q.samples.len() >= SAMPLE_BUFFER {
-                        q.samples.pop_front();
-                    }
-                    q.samples.push_back(sample);
-                    drop(q);
-                    on_sample.ready.notify_one();
+                move |sample: CMSampleBuffer, _| {
+                    on_sample.offer(sample.frame_status(), sample);
                 },
                 SCStreamOutputType::Screen,
             );
@@ -1544,6 +1555,27 @@ mod macos {
                 });
             }
         }
+    }
+
+    #[cfg(test)]
+    #[tokio::test]
+    async fn idle_notifications_cannot_evict_the_only_renderable_frame() {
+        let samples = Samples::default();
+        let buffer = CVPixelBuffer::create(16, 16, 0x42475241).unwrap();
+        let frame = |n| {
+            CMSampleBuffer::create_for_image_buffer(&buffer, CMTime::new(n, 60), CMTime::new(1, 60))
+                .unwrap()
+        };
+        samples.offer(Some(SCFrameStatus::Started), frame(0));
+        for i in 1..=SAMPLE_BUFFER as i64 {
+            samples.offer(Some(SCFrameStatus::Idle), frame(i));
+            samples.offer(Some(SCFrameStatus::Blank), frame(i));
+        }
+        assert_eq!(
+            samples.next().await.unwrap().presentation_timestamp().value,
+            0
+        );
+        assert!(samples.queue.lock().unwrap().samples.is_empty());
     }
 
     #[cfg(test)]
@@ -2142,17 +2174,9 @@ mod macos {
                         return Ok(None);
                     }
                 };
-            // A successful start callback does not establish usable capture.
-            loop {
-                let sample = stream.next().await?;
-                if sample
-                    .frame_status()
-                    .is_none_or(|status| status.has_content())
-                    && sample.image_buffer().is_some()
-                {
-                    return Ok(Some((id, stream, sample)));
-                }
-            }
+            // Samples::next returns only renderable frames or an explicit stop.
+            let first = stream.next().await?;
+            Ok(Some((id, stream, first)))
         }
 
         async fn reopen_stream(&mut self, stop: CaptureStop) -> Option<CMSampleBuffer> {
@@ -2655,13 +2679,6 @@ mod macos {
                         None => return Ok(None),
                     },
                 };
-
-                // Skip non-renderable frames (Idle, Blank, Suspended, Stopped).
-                if let Some(status) = sample.frame_status() {
-                    if !status.has_content() {
-                        continue;
-                    }
-                }
 
                 let Some(pixel_buffer) = sample.image_buffer() else {
                     continue;

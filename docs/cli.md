@@ -260,6 +260,11 @@ MACRDP_MODS_RESYNC_IDLE_MS=10000  # env-only: after this many ms with no input,
                           #   keycode events into a secure field and a private
                           #   lock-state check. See the auto-unlock note in
                           #   known-quirks.md. macOS-only.
+--display-wake-timeout-secs N
+                          #   Seconds to wait for display wake during authenticated
+                          #   auto-unlock preparation. Integer 1–15, default 3.
+                          #   Config: DISPLAY_WAKE_TIMEOUT_SECS. The separate
+                          #   post-unlock SCK display wait is capped at 8 seconds.
 --enable-h264             # stream H.264 over EGFX (AVC420) instead of legacy bitmaps
 --h264-max-unacked-frames N # cap how many shipped frames may be awaiting the
                           #   client's FrameAcknowledge on the TCP path; past it,

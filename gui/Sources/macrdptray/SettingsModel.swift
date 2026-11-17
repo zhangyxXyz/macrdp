@@ -241,6 +241,7 @@ final class SettingsModel: ObservableObject {
     var optionKeyHint: String { modifierLayout == "standard" ? "Alt" : (modifierLayout == "swap-left-win-alt" ? "left Windows or right Alt" : "Windows") }
 
     var supportsDisplayPolicy: Bool { capabilities?.canConfigureDisplay == true }
+    var displayWakeTimeout: DisplayWakeTimeout { DisplayWakeTimeout(config: draft) }
     var resolutionPolicy: String {
         if let explicit = draft["RESOLUTION_POLICY"] { return explicit }
         guard let flags = try? ExtraFlags(string("EXTRA_FLAGS")) else { return "unknown" }

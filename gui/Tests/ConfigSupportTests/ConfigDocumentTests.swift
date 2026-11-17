@@ -137,6 +137,19 @@ final class ConfigDocumentTests {
         checkThrows(try ExtraFlags("--width '3840"))
         checkThrows(try ExtraFlags("--width 3840\\"))
     }
+    func testDisplayWakeTimeoutDraftAndRoundTrip() throws {
+        let doc = try ConfigDocument(data: Data("VD_WIDTH=3840\nVD_HEIGHT=2160\nVD_HIDPI=1\nMODIFIER_LAYOUT=swap-left-win-alt\nAUTO_UNLOCK=1\n".utf8))
+        let legacy = DisplayWakeTimeout(config: doc.values)
+        checkEqual(legacy.selection, "3")
+        checkFalse(legacy.suppliedByExtraFlags)
+        let saved = try ConfigDocument(data: doc.replacing(["DISPLAY_WAKE_TIMEOUT_SECS": "15"]))
+        checkEqual(DisplayWakeTimeout(config: saved.values).selection, "15")
+        checkEqual(saved.values.filter { $0.key != "DISPLAY_WAKE_TIMEOUT_SECS" }, doc.values)
+        let advanced = DisplayWakeTimeout(config: ["DISPLAY_WAKE_TIMEOUT_SECS": "", "EXTRA_FLAGS": "--display-wake-timeout-secs=08"])
+        checkEqual(advanced.selection, "8")
+        check(advanced.suppliedByExtraFlags)
+        checkEqual(DisplayWakeTimeout(config: ["DISPLAY_WAKE_TIMEOUT_SECS": "bad"]).selection, "bad")
+    }
 }
 
 private func checkEqual<T: Equatable>(_ lhs: T, _ rhs: T, file: StaticString = #file, line: UInt = #line) { if lhs != rhs { fatalError("Expected \(rhs), got \(lhs)", file: file, line: line) } }
@@ -160,6 +173,7 @@ private func checkThrows<T>(_ expression: @autoclosure () throws -> T, file: Sta
         try tests.testProtocolVersionsAndUnknownDisplayFields()
         try tests.testConcurrentControllerCannotReplaceCandidate()
         try tests.testExtraFlagsGroupingMatchesServerGrammar()
-        print("ConfigSupport: 13 tests passed (no server or user configuration touched)")
+        try tests.testDisplayWakeTimeoutDraftAndRoundTrip()
+        print("ConfigSupport: 14 tests passed (no server or user configuration touched)")
     }
 }
