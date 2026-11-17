@@ -586,6 +586,60 @@ fn pick_reopened_display(old: u32, online: &[OnlineDisplay], size_px: (u32, u32)
         .or_else(|| unique(&|d| !d.builtin && d.size_px == size_px))
 }
 
+#[cfg(any(target_os = "macos", test))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CaptureStop {
+    MissingSource,
+    Other,
+}
+
+#[cfg(any(target_os = "macos", test))]
+const CAPTURE_RECOVERY_WINDOW: Duration = Duration::from_secs(3);
+
+#[cfg(any(target_os = "macos", test))]
+#[derive(Debug, PartialEq, Eq)]
+enum CaptureRecovery<T> {
+    Restored(T),
+    LockedDisplaySleep,
+    TimedOut,
+}
+
+/// Only called after a real stream stop. Idle, blank and suppressed samples
+/// still use the ordinary capture loop and never start this timer.
+#[cfg(any(target_os = "macos", test))]
+async fn recover_capture<T, F>(
+    mut stop: CaptureStop,
+    mut locked_and_asleep: impl FnMut() -> bool,
+    mut reopen: impl FnMut() -> F,
+) -> CaptureRecovery<T>
+where
+    F: std::future::Future<Output = Result<Option<T>, CaptureStop>>,
+{
+    tokio::time::timeout(CAPTURE_RECOVERY_WINDOW, async {
+        loop {
+            if stop == CaptureStop::MissingSource && locked_and_asleep() {
+                return CaptureRecovery::LockedDisplaySleep;
+            }
+            // Let display handoffs settle. A sleep notification can arrive
+            // just after ScreenCaptureKit's stop callback.
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            if stop == CaptureStop::MissingSource && locked_and_asleep() {
+                return CaptureRecovery::LockedDisplaySleep;
+            }
+            match reopen().await {
+                Ok(Some(stream)) => return CaptureRecovery::Restored(stream),
+                Ok(None) => {}
+                Err(next_stop) => stop = next_stop,
+            }
+        }
+    })
+    .await
+    .unwrap_or(CaptureRecovery::TimedOut)
+}
+
+#[cfg(target_os = "macos")]
+pub use macos::observe_display_sleep;
+
 /// Look up the primary display's pixel dimensions via ScreenCaptureKit.
 ///
 /// Returns `None` on non-macOS targets so the caller can fall back to a stub
@@ -1346,6 +1400,7 @@ mod macos {
     use screencapturekit::async_api::AsyncSCShareableContent;
     use screencapturekit::cm::CMSampleBuffer;
     use screencapturekit::cv::{CVPixelBuffer, CVPixelBufferLockFlags};
+    use screencapturekit::error::SCStreamErrorCode;
     use screencapturekit::prelude::{
         CMTime, PixelFormat as SckPixelFormat, SCContentFilter, SCDisplay, SCError, SCStream,
         SCStreamConfiguration, SCStreamOutputType,
@@ -1377,10 +1432,42 @@ mod macos {
     /// Samples kept for a consumer that falls behind; the oldest is dropped.
     const SAMPLE_BUFFER: usize = 4;
 
+    static SCREENS_ASLEEP: AtomicBool = AtomicBool::new(false);
+
+    pub fn observe_display_sleep() {
+        crate::runloop_thread::submit(|| unsafe {
+            use objc2_app_kit::{
+                NSWorkspace, NSWorkspaceScreensDidSleepNotification,
+                NSWorkspaceScreensDidWakeNotification,
+            };
+            use objc2_foundation::NSNotification;
+            use std::ptr::NonNull;
+
+            let workspace = NSWorkspace::sharedWorkspace();
+            let center = workspace.notificationCenter();
+            for (name, asleep) in [
+                (NSWorkspaceScreensDidSleepNotification, true),
+                (NSWorkspaceScreensDidWakeNotification, false),
+            ] {
+                let block = block2::RcBlock::new(move |_: NonNull<NSNotification>| {
+                    SCREENS_ASLEEP.store(asleep, Ordering::SeqCst);
+                });
+                let token = center.addObserverForName_object_queue_usingBlock(
+                    Some(name),
+                    Some(workspace.as_ref()),
+                    None,
+                    &block,
+                );
+                // The workspace observer has the server's lifetime.
+                std::mem::forget(token);
+            }
+        });
+    }
+
     #[derive(Default)]
     struct SampleQueue {
         samples: std::collections::VecDeque<CMSampleBuffer>,
-        stopped: bool,
+        stopped: Option<CaptureStop>,
     }
 
     #[derive(Default)]
@@ -1389,12 +1476,29 @@ mod macos {
         ready: tokio::sync::Notify,
     }
 
-    /// An SCK display capture whose `next()` returns `None` once SCK stops it.
+    /// An SCK display capture whose `next()` reports the delegate's stop reason.
     /// `AsyncSCStream` has no delegate, so a stream SCK stops (its display went
     /// away, as on display sleep) would leave `next()` pending forever.
     struct DisplayStream {
-        stream: SCStream,
+        stream: Option<SCStream>,
         samples: Arc<Samples>,
+    }
+
+    impl Samples {
+        async fn next(&self) -> Result<CMSampleBuffer, CaptureStop> {
+            loop {
+                {
+                    let mut q = self.queue.lock().unwrap();
+                    if let Some(reason) = q.stopped {
+                        return Err(reason);
+                    }
+                    if let Some(sample) = q.samples.pop_front() {
+                        return Ok(sample);
+                    }
+                }
+                self.ready.notified().await;
+            }
+        }
     }
 
     impl DisplayStream {
@@ -1410,7 +1514,13 @@ mod macos {
                 config,
                 ErrorHandler::new(move |error| {
                     tracing::warn!(%error, "SCK stopped the capture");
-                    on_stop.queue.lock().unwrap().stopped = true;
+                    let reason =
+                        if error.stream_error_code() == Some(SCStreamErrorCode::NoCaptureSource) {
+                            CaptureStop::MissingSource
+                        } else {
+                            CaptureStop::Other
+                        };
+                    on_stop.queue.lock().unwrap().stopped.get_or_insert(reason);
                     on_stop.ready.notify_one();
                 }),
             );
@@ -1418,6 +1528,9 @@ mod macos {
             stream.add_output_handler(
                 move |sample, _| {
                     let mut q = on_sample.queue.lock().unwrap();
+                    if q.stopped.is_some() {
+                        return;
+                    }
                     if q.samples.len() >= SAMPLE_BUFFER {
                         q.samples.pop_front();
                     }
@@ -1428,23 +1541,56 @@ mod macos {
                 SCStreamOutputType::Screen,
             );
             stream.start_capture()?;
-            Ok(Self { stream, samples })
+            Ok(Self {
+                stream: Some(stream),
+                samples,
+            })
         }
 
-        async fn next(&self) -> Option<CMSampleBuffer> {
-            loop {
-                {
-                    let mut q = self.samples.queue.lock().unwrap();
-                    if let Some(sample) = q.samples.pop_front() {
-                        return Some(sample);
-                    }
-                    if q.stopped {
-                        return None;
-                    }
-                }
-                self.samples.ready.notified().await;
+        fn take_live_stream(&mut self) -> Option<SCStream> {
+            let stream = self.stream.take();
+            if self.stop_reason().is_some() {
+                return None;
+            }
+            stream
+        }
+
+        fn stop_reason(&self) -> Option<CaptureStop> {
+            self.samples.queue.lock().unwrap().stopped
+        }
+
+        async fn next(&self) -> Result<CMSampleBuffer, CaptureStop> {
+            self.samples.next().await
+        }
+    }
+
+    impl Drop for DisplayStream {
+        fn drop(&mut self) {
+            // A replacement whose start/first frame outlasts the recovery
+            // window is disposed independently of the connection's teardown.
+            if let Some(stream) = self.take_live_stream() {
+                tokio::task::spawn_blocking(move || {
+                    let _ = stream.stop_capture();
+                });
             }
         }
+    }
+
+    #[cfg(test)]
+    #[tokio::test(start_paused = true)]
+    async fn an_empty_sample_queue_is_idle_until_the_delegate_stops_capture() {
+        let samples = Samples::default();
+        assert!(
+            tokio::time::timeout(CAPTURE_RECOVERY_WINDOW * 2, samples.next())
+                .await
+                .is_err()
+        );
+        samples.queue.lock().unwrap().stopped = Some(CaptureStop::MissingSource);
+        samples.ready.notify_one();
+        assert!(matches!(
+            samples.next().await,
+            Err(CaptureStop::MissingSource)
+        ));
     }
 
     pub struct ScreenCaptureUpdates {
@@ -1983,52 +2129,118 @@ mod macos {
             })
         }
 
-        /// Waits for the display of a capture SCK stopped to come back (a
-        /// display sleep removes it until wake), then captures it again.
-        async fn reopen_stream(&mut self) {
-            let started = Instant::now();
+        async fn try_reopen_stream(
+            display_id: u32,
+            follows_virtual_display: bool,
+            size_px: (u32, u32),
+            config: SCStreamConfiguration,
+        ) -> Result<Option<(u32, DisplayStream, CMSampleBuffer)>, CaptureStop> {
+            let Ok(content) = AsyncSCShareableContent::get().await else {
+                return Ok(None);
+            };
+            let displays = content.displays();
+            let id = if follows_virtual_display {
+                let online: Vec<_> = displays
+                    .iter()
+                    .map(|d| online_display(d.display_id()))
+                    .collect();
+                let Some(id) = super::pick_reopened_display(display_id, &online, size_px) else {
+                    return Ok(None);
+                };
+                id
+            } else {
+                display_id
+            };
+            let Some(display) = displays.into_iter().find(|d| d.display_id() == id) else {
+                return Ok(None);
+            };
+
+            // The binding's start_capture is synchronous. Keep the deadline
+            // effective even if its native completion stalls. This worker
+            // owns only the candidate stream, never the session's display lease.
+            let stream =
+                match tokio::task::spawn_blocking(move || DisplayStream::start(&display, &config))
+                    .await
+                {
+                    Ok(Ok(stream)) => stream,
+                    Ok(Err(error)) => {
+                        tracing::debug!(?error, "reopening the SCK capture failed");
+                        return Ok(None);
+                    }
+                    Err(error) => {
+                        tracing::warn!(%error, "SCK capture restart task failed");
+                        return Ok(None);
+                    }
+                };
+            // A successful start callback does not establish usable capture.
             loop {
-                tokio::time::sleep(Duration::from_millis(500)).await;
-                let Ok(content) = AsyncSCShareableContent::get().await else {
-                    continue;
-                };
-                let displays = content.displays();
-                let id = if self.follows_virtual_display {
-                    let online: Vec<_> = displays
-                        .iter()
-                        .map(|d| online_display(d.display_id()))
-                        .collect();
-                    match super::pick_reopened_display(self.display_id, &online, self.size_px) {
-                        Some(id) => id,
-                        None => continue,
-                    }
-                } else {
-                    self.display_id
-                };
-                let Some(display) = displays.iter().find(|d| d.display_id() == id) else {
-                    continue;
-                };
-                if id != self.display_id {
-                    tracing::warn!(
-                        old = self.display_id,
-                        new = id,
-                        "virtual display came back under a new id"
-                    );
-                    self.display_id = id;
+                let sample = stream.next().await?;
+                if sample
+                    .frame_status()
+                    .is_none_or(|status| status.has_content())
+                    && sample.image_buffer().is_some()
+                {
+                    return Ok(Some((id, stream, sample)));
                 }
-                match DisplayStream::start(display, &self.stream_config) {
-                    Ok(stream) => {
-                        self.stream = stream;
-                        // The screen changed while the capture was down.
-                        self.seeded = false;
-                        tracing::info!(
-                            display_id = self.display_id,
-                            after_ms = started.elapsed().as_millis() as u64,
-                            "SCK capture reopened"
+            }
+        }
+
+        async fn reopen_stream(&mut self, stop: CaptureStop) -> Option<CMSampleBuffer> {
+            let started = Instant::now();
+            let display_id = self.display_id;
+            let result = recover_capture(
+                stop,
+                || {
+                    (SCREENS_ASLEEP.load(Ordering::SeqCst)
+                        || core_graphics::display::CGDisplay::new(display_id).is_asleep())
+                        && crate::virtual_display::screen_authentication_is_required() == Some(true)
+                },
+                || {
+                    Self::try_reopen_stream(
+                        display_id,
+                        self.follows_virtual_display,
+                        self.size_px,
+                        self.stream_config.clone(),
+                    )
+                },
+            )
+            .await;
+            let elapsed_ms = started.elapsed().as_millis() as u64;
+            match result {
+                CaptureRecovery::Restored((id, stream, first_frame)) => {
+                    if id != self.display_id {
+                        tracing::warn!(
+                            old = self.display_id,
+                            new = id,
+                            "virtual display came back under a new id"
                         );
-                        return;
+                        self.display_id = id;
                     }
-                    Err(e) => tracing::debug!(error = ?e, "reopening the SCK capture failed"),
+                    self.stream = stream;
+                    self.seeded = false;
+                    self.last_frame = None;
+                    self.held_frame = false;
+                    self.egfx_pending_frame = false;
+                    self.flush_remaining = 0;
+                    tracing::info!(display_id = id, elapsed_ms, "SCK capture reopened");
+                    Some(first_frame)
+                }
+                CaptureRecovery::LockedDisplaySleep => {
+                    tracing::info!(
+                        display_id,
+                        elapsed_ms,
+                        "locked display fell asleep and SCK lost its source; disconnecting RDP"
+                    );
+                    None
+                }
+                CaptureRecovery::TimedOut => {
+                    tracing::warn!(
+                        display_id,
+                        elapsed_ms,
+                        ?stop,
+                        "SCK capture recovery expired; disconnecting RDP"
+                    );
+                    None
                 }
             }
         }
@@ -2206,7 +2418,9 @@ mod macos {
 
     impl Drop for ScreenCaptureUpdates {
         fn drop(&mut self) {
-            let _ = self.stream.stream.stop_capture();
+            if let Some(stream) = self.stream.take_live_stream() {
+                let _ = stream.stop_capture();
+            }
             // On a virtual-display session the cursor was last posted into the
             // virtual display's region of the global coordinate space, which is
             // off every physical panel. The virtual display outlives this
@@ -2395,6 +2609,19 @@ mod macos {
                             if started.elapsed() >= SUPPRESS_DEBOUNCE {
                                 self.was_suppressed = true;
                                 self.flush_remaining = 0;
+                                // A healthy minimized stream needs no frames.
+                                // Still handle an explicit native stop while
+                                // output is suppressed.
+                                if let Some(stop) = self.stream.stop_reason() {
+                                    let Some(first_frame) = self.reopen_stream(stop).await else {
+                                        return Ok(None);
+                                    };
+                                    // Preserve the seed for a static desktop
+                                    // after waking or restoring the window.
+                                    let mut queue = self.stream.samples.queue.lock().unwrap();
+                                    queue.samples.truncate(SAMPLE_BUFFER - 1);
+                                    queue.samples.push_front(first_frame);
+                                }
                                 tokio::time::sleep(Duration::from_millis(100)).await;
                                 continue;
                             }
@@ -2450,9 +2677,14 @@ mod macos {
                         Err(_) => continue,
                     }
                 };
-                let Some(sample) = sample else {
-                    self.reopen_stream().await;
-                    continue;
+                let sample = match sample {
+                    Ok(sample) => sample,
+                    Err(stop) => match self.reopen_stream(stop).await {
+                        Some(sample) => sample,
+                        // The server ends the session on EOF, dropping the
+                        // capture lease and running normal display cleanup.
+                        None => return Ok(None),
+                    },
                 };
 
                 // Skip non-renderable frames (Idle, Blank, Suspended, Stopped).
@@ -2774,6 +3006,64 @@ mod stub {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn locked_display_sleep_with_missing_source_disconnects_without_reopening() {
+        let result = recover_capture(
+            CaptureStop::MissingSource,
+            || true,
+            || -> std::future::Ready<Result<Option<()>, CaptureStop>> {
+                panic!("a locked, sleeping display should not be reopened")
+            },
+        )
+        .await;
+        assert_eq!(result, CaptureRecovery::LockedDisplaySleep);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn awake_lock_screen_can_recover_even_if_sck_lost_its_source() {
+        let mut attempts = 0;
+        let result = recover_capture(
+            CaptureStop::MissingSource,
+            || false,
+            || {
+                attempts += 1;
+                std::future::ready(Ok((attempts == 2).then_some(42)))
+            },
+        )
+        .await;
+        assert_eq!(attempts, 2);
+        assert_eq!(result, CaptureRecovery::Restored(42));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn capture_recovery_deadline_covers_a_native_callback_that_never_arrives() {
+        let now = tokio::time::Instant::now();
+        let result = recover_capture(
+            CaptureStop::Other,
+            || true,
+            std::future::pending::<Result<Option<()>, CaptureStop>>,
+        )
+        .await;
+        assert_eq!(result, CaptureRecovery::TimedOut);
+        assert_eq!(now.elapsed(), CAPTURE_RECOVERY_WINDOW);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn repeating_stream_stops_share_one_recovery_window() {
+        let now = tokio::time::Instant::now();
+        let result = recover_capture(
+            CaptureStop::Other,
+            || false,
+            || async {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                Err::<Option<()>, _>(CaptureStop::Other)
+            },
+        )
+        .await;
+        assert_eq!(result, CaptureRecovery::TimedOut);
+        assert_eq!(now.elapsed(), CAPTURE_RECOVERY_WINDOW);
+    }
 
     fn online(id: u32, vendor: u32, builtin: bool, size_px: (u32, u32)) -> OnlineDisplay {
         OnlineDisplay {

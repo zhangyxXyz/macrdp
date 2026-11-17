@@ -423,6 +423,14 @@ When adding a feature, locate it in one of those modules first; if it spans them
 Monitor-free lifecycle: an authenticated caller may acquire its display lease
 before auto-unlock, using CG active/bounds readiness rather than locked SCK
 visibility. CapturePreparation retains that lease inside its blocking worker.
+An explicit ScreenCaptureKit stop starts a three-second recovery window. A
+missing source with both a password-required lock and display sleep confirmed
+ends capture early. Another stop within that window or a restart without a usable
+frame cannot extend it. Capture EOF ends only that RDP connection through the
+server's existing display update contract. The server sends a best-effort
+intentional-disconnect notification to clients that advertise support, with a
+250 ms write limit. Idle samples and suppressed output alone do not start recovery.
+
 The disconnect watcher retains the existing surface through lock completion;
 that lease uses the saved runtime handle for cleanup from its plain worker
 thread, without adding a second reactivation grace. Topology distinguishes no

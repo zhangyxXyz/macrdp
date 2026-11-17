@@ -4272,6 +4272,7 @@ impl RdpServer {
         user_channel_id: u16,
         message_channel_id: Option<u16>,
         client_supports_heartbeat: bool,
+        client_supports_error_info: bool,
         mut encoder: UpdateEncoder,
         udp_transport: Rc<RefCell<Option<multitransport::UdpTransportHandle>>>,
         pending_udp_accept: Option<task::JoinHandle<Option<multitransport::UdpTransportHandle>>>,
@@ -4405,6 +4406,20 @@ impl RdpServer {
                         }
                     }
                     Ok(None) => {
+                        // (macrdp divergence 36) Capture deliberately ended.
+                        // Distinguish this from a network drop so clients
+                        // don't automatically reconnect to a sleeping display.
+                        if client_supports_error_info {
+                            let info = ErrorInfo::ProtocolIndependentCode(
+                                ProtocolIndependentCode::RpcInitiatedDisconnect,
+                            );
+                            let pdu = rdp::headers::ShareDataPdu::ServerSetErrorInfo(ServerSetErrorInfoPdu(info));
+                            if let Ok(bytes) = encode_share_data_pdu(pdu, 0, io_channel_id, user_channel_id) {
+                                // A stalled transport must not hold the capture lease.
+                                let _ = tokio::time::timeout(Duration::from_millis(250), display_writer.write_all(&bytes))
+                                    .await;
+                            }
+                        }
                         break Ok(RunState::Disconnect);
                     }
                     Err(error) => {
@@ -5034,6 +5049,9 @@ impl RdpServer {
                 result
                     .client_early_capability_flags
                     .contains(ironrdp_pdu::gcc::ClientEarlyCapabilityFlags::SUPPORT_HEART_BEAT_PDU),
+                result
+                    .client_early_capability_flags
+                    .contains(ironrdp_pdu::gcc::ClientEarlyCapabilityFlags::SUPPORT_ERR_INFO_PDU),
                 encoder,
                 udp_transport,
                 pending_udp_accept,

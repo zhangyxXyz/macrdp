@@ -71,6 +71,80 @@ impl RdpServerDisplay for TestDisplay {
     }
 }
 
+#[tokio::test]
+async fn capture_eof_notifies_and_ends_a_session_that_survives_an_idle_display() -> Result<()> {
+    use ironrdp_pdu::rdp::server_error_info::ProtocolIndependentCode;
+
+    struct StopDisplay(tokio::sync::watch::Receiver<bool>);
+    #[async_trait::async_trait]
+    impl RdpServerDisplay for StopDisplay {
+        async fn size(&mut self) -> ServerDesktopSize {
+            ServerDesktopSize {
+                width: 1024,
+                height: 768,
+            }
+        }
+        async fn updates(
+            &mut self,
+        ) -> ironrdp_server::ServerResult<Box<dyn RdpServerDisplayUpdates>> {
+            Ok(Box::new(StopDisplay(self.0.clone())))
+        }
+    }
+    #[async_trait::async_trait]
+    impl RdpServerDisplayUpdates for StopDisplay {
+        async fn next_update(&mut self) -> ironrdp_server::ServerResult<Option<DisplayUpdate>> {
+            self.0
+                .wait_for(|stopped| *stopped)
+                .await
+                .expect("stop sender alive");
+            Ok(None)
+        }
+    }
+
+    let (stop, stopped) = tokio::sync::watch::channel(false);
+    let (client_io, server_io) = tokio::io::duplex(16 * 1024);
+    let mut server = RdpServer::builder()
+        .with_addr((Ipv4Addr::LOCALHOST, 0))
+        .with_tls(server_tls_acceptor())
+        .with_input_handler(TestInput)
+        .with_display_handler(StopDisplay(stopped))
+        .with_sound_factory(Some(Box::new(KeepAliveSound { audio_sender: None })))
+        .with_bitmap_codecs(BitmapCodecs(Vec::new()))
+        .build();
+
+    tokio::task::LocalSet::new()
+        .run_until(async move {
+            let mut serving =
+                tokio::task::spawn_local(async move { server.run_connection(server_io).await });
+            let (_, mut client) = connect_client(client_io, 1024, 768).await?;
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_millis(100), &mut serving)
+                    .await
+                    .is_err(),
+                "an idle capture ended the live connection"
+            );
+            stop.send(true)?;
+            tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                loop {
+                    let (_, bytes) = client.read_pdu().await?;
+                    if has_disconnect_reason(
+                        &bytes,
+                        ProtocolIndependentCode::RpcInitiatedDisconnect,
+                    ) {
+                        return anyhow::Ok(());
+                    }
+                }
+            })
+            .await
+            .context("capture EOF did not send an intentional disconnect notice")??;
+            tokio::time::timeout(std::time::Duration::from_secs(2), serving)
+                .await
+                .context("capture EOF did not end the RDP connection")???;
+            Ok(())
+        })
+        .await
+}
+
 /// A do-nothing sound factory whose only job is to KEEP THE SESSION ALIVE in
 /// the preemption test. With no sound factory the server drops the audio
 /// sender, so `dispatch_audio`'s channel closes and the client loop ends
@@ -858,10 +932,20 @@ async fn second_client_preempts_the_live_session() -> anyhow::Result<()> {
 /// exact PDU (including anything that fails to decode — the session is full of
 /// unrelated traffic) is simply `false`.
 fn is_disconnected_by_other_connection(bytes: &[u8]) -> bool {
+    has_disconnect_reason(
+        bytes,
+        ironrdp_pdu::rdp::server_error_info::ProtocolIndependentCode::DisconnectedByOtherconnection,
+    )
+}
+
+fn has_disconnect_reason(
+    bytes: &[u8],
+    reason: ironrdp_pdu::rdp::server_error_info::ProtocolIndependentCode,
+) -> bool {
     use ironrdp_core::decode;
     use ironrdp_pdu::mcs::McsMessage;
     use ironrdp_pdu::rdp::headers::{ShareControlPdu, ShareDataPdu};
-    use ironrdp_pdu::rdp::server_error_info::{ErrorInfo, ProtocolIndependentCode};
+    use ironrdp_pdu::rdp::server_error_info::ErrorInfo;
     use ironrdp_pdu::x224::X224;
 
     let Ok(x224) = decode::<X224<McsMessage<'_>>>(bytes) else {
@@ -879,10 +963,7 @@ fn is_disconnected_by_other_connection(bytes: &[u8]) -> bool {
     matches!(
         share_data.share_data_pdu,
         ShareDataPdu::ServerSetErrorInfo(pdu)
-            if pdu.0
-                == ErrorInfo::ProtocolIndependentCode(
-                    ProtocolIndependentCode::DisconnectedByOtherconnection
-                )
+            if pdu.0 == ErrorInfo::ProtocolIndependentCode(reason)
     )
 }
 

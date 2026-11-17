@@ -5,6 +5,9 @@ Only implemented behavior and completed checks are recorded here. Client-side ma
 
 ## v0.10.8
 
+- End the current RDP session when ScreenCaptureKit loses its capture source on a locked, sleeping display. The normal disconnect path restores physical displays and releases the virtual display. Other explicit capture stops have up to three seconds to resume with a usable frame. Ordinary locking, an idle picture and a minimized client leave a healthy connection open.
+- 锁屏熄屏且 ScreenCaptureKit 确认丢失采集源时，主动结束当前 RDP 会话，沿用断线流程恢复实体屏并释放虚拟屏。其他明确的采集中断最多尝试恢复三秒，以收到可用画面为准。普通锁屏、画面静止和客户端最小化时，正常连接继续保留。
+
 - Adopt `libz-sys 1.1.33` for RUSTSEC-2026-0544 and official stable `rsa 0.10.0` for RUSTSEC-2023-0071. Remove the RSA audit exception and scan the independent server, acceptor, RDPEUDP and IFD dependency trees alongside the main application.
 - Backport Picky's EC key coordinate fix [#557](https://github.com/Devolutions/picky-rs/pull/557) and JWE decryption error handling [#563](https://github.com/Devolutions/picky-rs/pull/563). Create private clipboard staging directories atomically to prevent concurrent filename collisions.
 - Test the authentication adapters in CI and verify correct and incorrect passwords separately with FreeRDP. The application and release tag stay at `0.10.8` / `v0.10.8` for subsequent rebuilds. Use the packaged `SOURCE_COMMIT` to identify a particular build.

@@ -37,6 +37,11 @@ history. Existing fork lock/display/clipboard policies remain in place.
 release tag. The package's `SOURCE_COMMIT` identifies the build.
 See the [changelog](CHANGELOG.md#v0108) for the security and clipboard fixes.
 
+If a locked Mac's displays go to sleep and ScreenCaptureKit loses its source,
+the server ends that RDP session and runs the normal display cleanup. Other
+explicit capture stops get up to three seconds to recover a usable frame.
+An ordinary lock, idle desktop or minimized client keeps a healthy session open.
+
 Recent releases:
 
 - `v0.10.6-dev` included upstream Windows 10 mstsc display fixes #228 and #230.
