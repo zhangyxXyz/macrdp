@@ -5,6 +5,9 @@ Only implemented behavior and completed checks are recorded here. Client-side ma
 
 ## v0.10.8
 
+- With auto-unlock enabled, an authenticated reconnect wakes sleeping displays before waiting for the virtual display and the login surface. The wake stage has a three-second deadline.
+- 开启自动解锁时，重连通过认证后会先唤醒休眠的显示器，再等待虚拟屏及登录界面就绪。唤醒阶段的上限为三秒。
+
 - End the current RDP session when ScreenCaptureKit loses its capture source on a locked, sleeping display. The normal disconnect path restores physical displays and releases the virtual display. Other explicit capture stops have up to three seconds to resume with a usable frame. Ordinary locking, an idle picture and a minimized client leave a healthy connection open.
 - 锁屏熄屏且 ScreenCaptureKit 确认丢失采集源时，主动结束当前 RDP 会话，沿用断线流程恢复实体屏并释放虚拟屏。其他明确的采集中断最多尝试恢复三秒，以收到可用画面为准。普通锁屏、画面静止和客户端最小化时，正常连接继续保留。
 

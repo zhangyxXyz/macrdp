@@ -196,6 +196,8 @@ CLI 参数为 `--modifier-layout standard|swap-left-win-alt|swap-win-alt`，
 使用无头显示模式并开启 `AUTO_UNLOCK=1` 时，自动解锁现在在 **RDP 凭证／ARC
 校验成功后、ScreenCaptureKit 捕获之前**执行，消除锁屏或锁屏显示器熄灭后
 `SCK sees: []` 导致先断开、会话 watcher 永远无法解锁的循环依赖。
+如果重连时显示器仍在休眠，macrdp 会先请求唤醒并最多等待 3 秒，然后才准备虚拟屏
+和执行自动解锁。
 确认解锁后，最多等待 8 秒让指定显示器出现在 SCK 中。锁定状态未知、不安全或密码
 提交预算耗尽时明确报错；保留每轮锁屏共享的两次提交限制，并串行执行。
 自动解锁仍需主动开启，`--skip-auth` 下禁用。

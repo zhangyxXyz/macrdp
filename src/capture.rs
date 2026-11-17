@@ -637,9 +637,6 @@ where
     .unwrap_or(CaptureRecovery::TimedOut)
 }
 
-#[cfg(target_os = "macos")]
-pub use macos::observe_display_sleep;
-
 /// Look up the primary display's pixel dimensions via ScreenCaptureKit.
 ///
 /// Returns `None` on non-macOS targets so the caller can fall back to a stub
@@ -930,6 +927,11 @@ impl RdpServerDisplay for CaptureDisplay {
         // display for loginwindow before password input, but still starts no
         // screen capture/input-size commit until preparation succeeds.
         let result = async {
+            // An Esc-sleep reconnect must wake the display before waiting on
+            // topology, virtual display acquisition, or the unlock surface.
+            if self.preparation.is_some() {
+                crate::session_lock::wake_for_capture().await?;
+            }
             let bootstrap = self.preparation.is_some()
                 && self.virtual_display.is_some()
                 && crate::virtual_display::other_displays(
@@ -1431,38 +1433,6 @@ mod macos {
 
     /// Samples kept for a consumer that falls behind; the oldest is dropped.
     const SAMPLE_BUFFER: usize = 4;
-
-    static SCREENS_ASLEEP: AtomicBool = AtomicBool::new(false);
-
-    pub fn observe_display_sleep() {
-        crate::runloop_thread::submit(|| unsafe {
-            use objc2_app_kit::{
-                NSWorkspace, NSWorkspaceScreensDidSleepNotification,
-                NSWorkspaceScreensDidWakeNotification,
-            };
-            use objc2_foundation::NSNotification;
-            use std::ptr::NonNull;
-
-            let workspace = NSWorkspace::sharedWorkspace();
-            let center = workspace.notificationCenter();
-            for (name, asleep) in [
-                (NSWorkspaceScreensDidSleepNotification, true),
-                (NSWorkspaceScreensDidWakeNotification, false),
-            ] {
-                let block = block2::RcBlock::new(move |_: NonNull<NSNotification>| {
-                    SCREENS_ASLEEP.store(asleep, Ordering::SeqCst);
-                });
-                let token = center.addObserverForName_object_queue_usingBlock(
-                    Some(name),
-                    Some(workspace.as_ref()),
-                    None,
-                    &block,
-                );
-                // The workspace observer has the server's lifetime.
-                std::mem::forget(token);
-            }
-        });
-    }
 
     #[derive(Default)]
     struct SampleQueue {
@@ -2191,8 +2161,7 @@ mod macos {
             let result = recover_capture(
                 stop,
                 || {
-                    (SCREENS_ASLEEP.load(Ordering::SeqCst)
-                        || core_graphics::display::CGDisplay::new(display_id).is_asleep())
+                    crate::session_lock::display_asleep(Some(display_id))
                         && crate::virtual_display::screen_authentication_is_required() == Some(true)
                 },
                 || {

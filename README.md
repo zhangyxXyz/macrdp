@@ -252,6 +252,9 @@ With a headless display mode and `AUTO_UNLOCK=1`, the fork prepares the desktop
 **after RDP credential/ARC validation and before ScreenCaptureKit capture**.
 This removes the circular dependency where a locked/display-asleep Mac reported
 `SCK sees: []` and disconnected before the session watcher could unlock it.
+If the displays are asleep when you reconnect, macrdp requests a display wake
+and waits up to 3 seconds before preparing the virtual display or attempting
+auto-unlock.
 After a confirmed unlock, capture waits at most 8 seconds for its requested
 display. Unsafe/unknown lock state and exhausted password-submission budget stop
 capture with a diagnostic; the two-submission limit remains shared and serialized.

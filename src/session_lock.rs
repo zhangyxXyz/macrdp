@@ -4,6 +4,124 @@
 use anyhow::Result;
 use std::sync::Arc;
 
+#[cfg(target_os = "macos")]
+static SCREENS_ASLEEP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(target_os = "macos")]
+pub fn observe_display_sleep() {
+    crate::runloop_thread::submit(|| unsafe {
+        use objc2_app_kit::{
+            NSWorkspace, NSWorkspaceScreensDidSleepNotification,
+            NSWorkspaceScreensDidWakeNotification,
+        };
+        use objc2_foundation::NSNotification;
+        use std::ptr::NonNull;
+        use std::sync::atomic::Ordering;
+
+        let workspace = NSWorkspace::sharedWorkspace();
+        let center = workspace.notificationCenter();
+        for (name, asleep) in [
+            (NSWorkspaceScreensDidSleepNotification, true),
+            (NSWorkspaceScreensDidWakeNotification, false),
+        ] {
+            let block = block2::RcBlock::new(move |_: NonNull<NSNotification>| {
+                SCREENS_ASLEEP.store(asleep, Ordering::SeqCst);
+            });
+            let token = center.addObserverForName_object_queue_usingBlock(
+                Some(name),
+                Some(workspace.as_ref()),
+                None,
+                &block,
+            );
+            // The workspace observer has the server's lifetime.
+            std::mem::forget(token);
+        }
+    });
+}
+
+#[cfg(target_os = "macos")]
+pub fn display_asleep(display_id: Option<u32>) -> bool {
+    use core_graphics::display::CGDisplay;
+    use std::sync::atomic::Ordering;
+    SCREENS_ASLEEP.load(Ordering::SeqCst)
+        || display_id
+            .map_or_else(CGDisplay::main, CGDisplay::new)
+            .is_asleep()
+}
+
+/// Wake before acquiring a virtual display or waiting on the display
+/// coordinator. An in-flight CoreGraphics restore can itself need this wake.
+/// The power request never submits a password or holds displays awake for
+/// the lifetime of the connection.
+#[cfg(target_os = "macos")]
+pub async fn wake_for_capture() -> Result<()> {
+    wake_if_sleeping(
+        || display_asleep(None),
+        || async { tokio::task::spawn_blocking(declare_display_activity).await? },
+    )
+    .await
+}
+
+#[cfg(not(target_os = "macos"))]
+pub async fn wake_for_capture() -> Result<()> {
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn declare_display_activity() -> Result<()> {
+    use core_foundation::{base::TCFType, string::CFString};
+    #[link(name = "IOKit", kind = "framework")]
+    extern "C" {
+        fn IOPMAssertionDeclareUserActivity(
+            name: core_foundation::string::CFStringRef,
+            user_type: libc::c_uint,
+            assertion: *mut u32,
+        ) -> libc::c_int;
+    }
+    const IOPM_USER_ACTIVE_LOCAL: libc::c_uint = 0;
+    // Reuse the activity ID across reconnects. Power management expires it;
+    // releasing it here could undo the request before the display wakes.
+    static ASSERTION: std::sync::Mutex<u32> = std::sync::Mutex::new(0);
+    let mut assertion = ASSERTION.lock().unwrap();
+    let name = CFString::new("macrdp authenticated display wake");
+    let status = unsafe {
+        IOPMAssertionDeclareUserActivity(
+            name.as_concrete_TypeRef(),
+            IOPM_USER_ACTIVE_LOCAL,
+            &mut *assertion,
+        )
+    };
+    anyhow::ensure!(
+        status == 0,
+        "display wake request failed (IOReturn {status:#x})"
+    );
+    Ok(())
+}
+
+#[cfg(any(target_os = "macos", test))]
+async fn wake_if_sleeping(
+    mut asleep: impl FnMut() -> bool,
+    request_wake: impl AsyncFnOnce() -> Result<()>,
+) -> Result<()> {
+    use anyhow::Context;
+    use std::time::Duration;
+    if !asleep() {
+        return Ok(());
+    }
+    tracing::info!("display asleep at authenticated capture startup; requesting wake");
+    tokio::time::timeout(Duration::from_secs(3), async {
+        request_wake().await?;
+        while asleep() {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        Ok::<(), anyhow::Error>(())
+    })
+    .await
+    .context("display did not wake within 3 seconds before capture preparation")??;
+    tracing::info!("display woke before authenticated capture preparation");
+    Ok(())
+}
+
 /// No physical desktop effect unless explicitly requested, PAM validated and
 /// paired with a supported headless display policy.
 pub fn auto_unlock_enabled(requested: bool, skip_auth: bool, headless: bool) -> bool {
@@ -195,6 +313,45 @@ pub fn lock_now() -> Result<()> {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[tokio::test]
+    async fn awake_display_needs_no_wake_request() {
+        wake_if_sleeping(|| false, async || panic!("display was already awake"))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn sleeping_display_must_wake_before_capture_can_prepare() {
+        let started = tokio::time::Instant::now();
+        let requests = AtomicUsize::new(0);
+        wake_if_sleeping(
+            || started.elapsed() < std::time::Duration::from_millis(300),
+            async || {
+                requests.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+        assert!(started.elapsed() >= std::time::Duration::from_millis(300));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn display_wake_has_a_deadline_and_propagates_request_errors() {
+        let started = tokio::time::Instant::now();
+        let error = wake_if_sleeping(|| true, async || Ok(()))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("did not wake"));
+        assert_eq!(started.elapsed(), std::time::Duration::from_secs(3));
+        let error = wake_if_sleeping(|| true, async || anyhow::bail!("IOKit failed"))
+            .await
+            .unwrap_err();
+        assert_eq!(error.to_string(), "IOKit failed");
+    }
+
     #[test]
     fn unlock_requires_opt_in_authentication_and_supported_display_policy() {
         for requested in [false, true] {
