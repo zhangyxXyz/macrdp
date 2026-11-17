@@ -2567,15 +2567,11 @@ mod tests {
     /// whose Mac clipboard hasn't changed since the last advertise would
     /// otherwise never receive it. So it must fire, just after a short
     /// deferral past the ack race.
-    // Real (not paused) time: getting a spawned task to observe a manually
-    // advanced paused clock needs runtime-version-sensitive yield dancing,
-    // which is more fragile than it's worth for one 300 ms wait. Costs this
-    // test ~0.3 s of real wall-clock; everything else in the suite is
-    // effectively instant, so that's a non-issue.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     #[cfg(target_os = "macos")]
     async fn on_ready_defers_the_connect_time_advertise_past_the_ack_race() {
         let (mut backend, mut rx) = test_backend();
+        let ready_at = tokio::time::Instant::now();
 
         backend.on_ready();
         assert!(
@@ -2585,12 +2581,15 @@ mod tests {
         assert!(!backend.initial_advertise_pending);
 
         pb::write_string("on_ready_deferred_probe");
-        tokio::time::sleep(CONNECT_ADVERTISE_DELAY + Duration::from_millis(100)).await;
-
-        match rx
-            .try_recv()
-            .expect("the deferred advertise must eventually fire")
-        {
+        // Await the event so the paused clock drives the spawned timer, then
+        // check the send happened after the deferral, regardless of load.
+        let event =
+            tokio::time::timeout(CONNECT_ADVERTISE_DELAY + Duration::from_secs(1), rx.recv())
+                .await
+                .expect("the deferred advertise must eventually fire")
+                .expect("the event channel must remain open");
+        assert!(ready_at.elapsed() >= CONNECT_ADVERTISE_DELAY);
+        match event {
             ServerEvent::Clipboard(ClipboardMessage::SendInitiateCopy(formats)) => {
                 assert!(formats
                     .iter()
