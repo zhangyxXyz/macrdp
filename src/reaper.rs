@@ -6,7 +6,7 @@
 //! unmounts NFS volumes and removes paste temp dirs. But **SIGKILL / panic /
 //! power-loss skip all of it**, stranding:
 //!   - RDPDR NFS mounts + `$TMPDIR/macrdp-rdpdr-<pid>/<label>` mountpoints,
-//!   - eager-paste `$TMPDIR/macrdp-paste-<pid>-<nanos>` dirs,
+//!   - eager-paste `$TMPDIR/macrdp-paste-<pid>-<suffix>` dirs,
 //!   - lazy-paste `$TMPDIR/macrdp-lazy-paste-<pid>-<nanos>` dirs.
 //!
 //! These are all named with the owning **pid** and live under
@@ -52,8 +52,8 @@ pub fn process_is_alive(_pid: i32) -> bool {
 ///
 /// `pid_is_last` distinguishes the two schemes:
 /// - RDPDR `macrdp-rdpdr-<pid>` → `true` (pid is the whole remainder),
-/// - paste `macrdp-{paste,lazy-paste}-<pid>-<nanos>` → `false` (pid is the first
-///   `-`-separated field of the remainder).
+/// - paste `macrdp-{paste,lazy-paste}-<pid>-<suffix>` → `false` (pid is the first
+///   `-`-separated field; random and legacy timestamp suffixes are both accepted).
 ///
 /// Prefixes are distinct (`macrdp-paste-` is not a prefix of
 /// `macrdp-lazy-paste-`), so a `strip_prefix` match never cross-classifies.

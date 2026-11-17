@@ -17,7 +17,6 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use ironrdp_cliprdr::backend::ClipboardMessage;
 use ironrdp_cliprdr::pdu::{FileContentsFlags, FileContentsRequest, FileContentsResponse};
@@ -524,19 +523,25 @@ fn play_glass() {
 }
 
 fn make_temp_dir() -> std::io::Result<PathBuf> {
-    // Pid + nanos is unique enough for a single-process tool; we don't
-    // need /dev/urandom for collision avoidance.
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let dir = std::env::temp_dir().join(format!("macrdp-paste-{}-{nanos}", std::process::id()));
-    use std::os::unix::fs::DirBuilderExt;
-    std::fs::DirBuilder::new().mode(0o700).create(&dir)?;
-    Ok(dir)
+    use std::ffi::{CString, OsString};
+    use std::os::unix::ffi::OsStringExt;
+
+    // Atomically choose and create a private directory. Wall-clock timestamps
+    // can repeat across concurrent copies even within the same process.
+    let template = std::env::temp_dir().join(format!("macrdp-paste-{}-XXXXXX", std::process::id()));
+    let mut template = CString::new(template.into_os_string().into_vec())
+        .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidInput, err))?
+        .into_bytes_with_nul();
+    // SAFETY: mkdtemp receives an owned, writable, NUL-terminated buffer ending
+    // in six Xs. It changes only that suffix and creates the directory as 0700.
+    if unsafe { libc::mkdtemp(template.as_mut_ptr().cast()) }.is_null() {
+        return Err(std::io::Error::last_os_error());
+    }
+    let _ = template.pop(); // Remove the unchanged trailing NUL, preserving path bytes.
+    Ok(PathBuf::from(OsString::from_vec(template)))
 }
 
-/// Reap eager-paste temp dirs (`$TMPDIR/macrdp-paste-<pid>-<nanos>`) left by a
+/// Reap eager-paste temp dirs (`$TMPDIR/macrdp-paste-<pid>-<suffix>`) left by a
 /// PRIOR macrdp process that died uncleanly (SIGKILL/panic skip the backend's
 /// Drop + the signal handler's cleanup). Dead-pid-gated, never our own, so it's
 /// safe with another instance live. Best-effort; called once at startup.
@@ -904,6 +909,60 @@ fn push_request(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn concurrent_temp_dirs_are_unique_private_writable_and_pid_tagged() {
+        use std::collections::HashSet;
+        use std::os::unix::fs::PermissionsExt;
+        use std::sync::Barrier;
+
+        struct TestDir(PathBuf);
+        impl Drop for TestDir {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+
+        const WORKERS: usize = 8;
+        const PER_WORKER: usize = 32;
+        let barrier = Arc::new(Barrier::new(WORKERS));
+        let workers: Vec<_> = (0..WORKERS)
+            .map(|_| {
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    (0..PER_WORKER)
+                        .map(|_| {
+                            TestDir(make_temp_dir().expect("create private staging directory"))
+                        })
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect();
+        let dirs: Vec<_> = workers
+            .into_iter()
+            .flat_map(|worker| worker.join().expect("directory worker"))
+            .collect();
+        let unique: HashSet<_> = dirs.iter().map(|dir| &dir.0).collect();
+        assert_eq!(unique.len(), WORKERS * PER_WORKER);
+
+        for (index, dir) in dirs.iter().enumerate() {
+            let metadata = std::fs::symlink_metadata(&dir.0).unwrap();
+            assert!(metadata.is_dir());
+            assert_eq!(metadata.permissions().mode() & 0o777, 0o700);
+            assert_eq!(
+                crate::reaper::pid_from_tagged(
+                    dir.0.file_name().unwrap().to_str().unwrap(),
+                    "macrdp-paste-",
+                    false,
+                ),
+                Some(std::process::id() as i32)
+            );
+            let probe = dir.0.join("probe");
+            std::fs::write(&probe, index.to_be_bytes()).unwrap();
+            assert_eq!(std::fs::read(probe).unwrap(), index.to_be_bytes());
+        }
+    }
 
     fn entry(name: &str, rp: Option<&str>) -> RemoteEntry {
         RemoteEntry {
