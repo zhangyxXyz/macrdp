@@ -17,6 +17,7 @@
 #
 # Usage:  scripts/test-audit-log.sh            # port 3399
 #         MACRDP_TEST_PORT=4000 scripts/test-audit-log.sh
+#         MACRDP_TEST_BINARY=target/debug/macrdp scripts/test-audit-log.sh
 set -u
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -34,10 +35,14 @@ FRDP="$(command -v sdl-freerdp || command -v sdl3-freerdp || true)"
 # Pick an existing build that actually supports --audit-file (a stale binary
 # from before the feature would fail); otherwise build debug.
 supports_audit() { "$1" --help 2>/dev/null | grep -q -- '--audit-file'; }
-BIN=""
-for cand in "$REPO/target/release/macrdp" "$REPO/target/debug/macrdp"; do
-  [[ -x "$cand" ]] && supports_audit "$cand" && { BIN="$cand"; break; }
-done
+BIN="${MACRDP_TEST_BINARY:-}"
+if [[ -n "$BIN" ]]; then
+  [[ -x "$BIN" ]] && supports_audit "$BIN" || { echo "!! explicit test binary does not support audit logging"; exit 2; }
+else
+  for cand in "$REPO/target/release/macrdp" "$REPO/target/debug/macrdp"; do
+    [[ -x "$cand" ]] && supports_audit "$cand" && { BIN="$cand"; break; }
+  done
+fi
 [[ -z "$BIN" ]] && { echo "== building macrdp (debug) =="; (cd "$REPO" && cargo build) || exit 2; BIN="$REPO/target/debug/macrdp"; }
 
 cleanup() { [[ -n "${SRV_PID:-}" ]] && kill "$SRV_PID" 2>/dev/null; wait 2>/dev/null; rm -rf "$WORK"; }

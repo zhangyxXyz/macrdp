@@ -330,6 +330,8 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
             "ProgramArguments": [bin, "--config", configURL.path],
             "RunAtLoad": true,
             "KeepAlive": true,
+            // Native display restoration may take several transactions before exit.
+            "ExitTimeOut": ServiceTiming.agentExitTimeout,
             // No StandardOutPath: the server writes + rotates macrdp.log itself
             // (a second writer would corrupt it / strand launchd on a rotated
             // inode). StandardErrorPath keeps panics + pre-logging stderr.

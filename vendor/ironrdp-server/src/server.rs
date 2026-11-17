@@ -1049,6 +1049,8 @@ fn live_clipboard_event(event: ServerEvent) -> Option<(ServerEvent, Option<tokio
             permit,
         } if active.load(std::sync::atomic::Ordering::Acquire) => Some((ServerEvent::Clipboard(message), permit)),
         ServerEvent::SessionClipboard { .. } => None,
+        ServerEvent::ClipboardLease { ref active, .. }
+            if !active.load(std::sync::atomic::Ordering::Acquire) => None,
         event => Some((event, None)),
     }
 }
@@ -1114,7 +1116,7 @@ pub enum ServerEvent {
     /// the given reason. See [`ErrorInfoDisconnectHandle::disconnect`].
     Disconnect(ErrorInfo),
     Clipboard(ClipboardMessage),
-    /// (macrdp) Async clipboard I/O completion, scoped to its serving backend.
+    /// (macrdp) Async clipboard requests/completions, scoped to their serving backend.
     SessionClipboard {
         active: std::sync::Arc<std::sync::atomic::AtomicBool>,
         message: ClipboardMessage,
@@ -1122,6 +1124,7 @@ pub enum ServerEvent {
         permit: Option<tokio::sync::OwnedSemaphorePermit>,
     },
     ClipboardLease {
+        active: std::sync::Arc<std::sync::atomic::AtomicBool>,
         id: u32,
         retain: bool,
     },
@@ -3590,7 +3593,7 @@ impl RdpServer {
                         .await
                         .map_err(|e| ServerError::io("write_all", e))?;
                 }
-                ServerEvent::ClipboardLease { id, retain } => {
+                ServerEvent::ClipboardLease { id, retain, .. } => {
                     if let Some(clipboard) = self.get_svc_processor::<CliprdrServer>() {
                         if retain {
                             clipboard.retain_remote_lock(id);
@@ -3608,6 +3611,8 @@ impl RdpServer {
                     let msgs = match c {
                         ClipboardMessage::SendInitiateCopy(formats) => cliprdr.initiate_copy(&formats),
                         ClipboardMessage::SendInitiateFileCopy(files) => cliprdr.initiate_file_copy(files),
+                        ClipboardMessage::SendInitiateFileCopyWithSnapshot { files, snapshot } =>
+                            cliprdr.initiate_file_copy_with_snapshot(files, snapshot),
                         ClipboardMessage::SendFormatData(data) => cliprdr.submit_format_data(data),
                         ClipboardMessage::SendInitiatePaste(format) => cliprdr.initiate_paste(format),
                         ClipboardMessage::SendFileContentsRequest(request) => cliprdr.request_file_contents(request),
@@ -6908,6 +6913,13 @@ mod clipboard_completion_tests {
             live_clipboard_event(event),
             Some((ServerEvent::Clipboard(_), _))
         ));
+    }
+    #[test]
+    fn lease_queued_before_retirement_cannot_release_a_replacement_sessions_lock() {
+        let active = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let event = ServerEvent::ClipboardLease { active: active.clone(), id: 7, retain: false };
+        active.store(false, std::sync::atomic::Ordering::Release);
+        assert!(live_clipboard_event(event).is_none());
     }
     #[tokio::test]
     async fn completion_budget_is_held_until_dispatch_finishes() {

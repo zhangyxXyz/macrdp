@@ -91,6 +91,13 @@ failed locks retain the overlay, and successful restores never schedule a second
 lock. The 2.5s reactivation grace and capped handshake holds still apply; no
 local-input takeover detection is added.
 
+The 2026-11-17 review strengthens confirmation: the screen/saver flag must be
+active and the password-requirement timestamp must have elapsed. The immediate
+lock request is still sent when the screen flag is already set; private-state
+shape changes cannot silently count as a secure lock. Audio tap open and read
+failures share five recovery retries, reset only after valid stereo samples.
+See [review evidence and remaining checks](release-review-2026-11-17.md).
+
 **Monitor-free sessions (pending live hardware verification):** authenticated
 virtual-display bootstrap precedes auto-unlock when no other display is online.
 Capture still begins only after successful preparation. Display leases survive

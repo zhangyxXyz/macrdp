@@ -563,8 +563,10 @@ mod tests {
             let bridge = bridge.clone();
             tokio::spawn(async move { bridge.range(&request).await })
         };
-        let ServerEvent::Clipboard(ClipboardMessage::SendFileContentsRequest(request)) =
-            rx.recv().await.unwrap()
+        let ServerEvent::SessionClipboard {
+            message: ClipboardMessage::SendFileContentsRequest(request),
+            ..
+        } = rx.recv().await.unwrap()
         else {
             panic!("unexpected event")
         };
@@ -630,8 +632,10 @@ mod tests {
         let payload = bytes.clone();
         let remote = tokio::spawn(async move {
             while let Some(event) = rx.recv().await {
-                if let ServerEvent::Clipboard(ClipboardMessage::SendFileContentsRequest(request)) =
-                    event
+                if let ServerEvent::SessionClipboard {
+                    message: ClipboardMessage::SendFileContentsRequest(request),
+                    ..
+                } = event
                 {
                     assert_eq!(request.data_id, Some(17));
                     let start = request.position as usize;

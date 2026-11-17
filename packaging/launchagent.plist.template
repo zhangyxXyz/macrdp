@@ -35,6 +35,10 @@
     <key>KeepAlive</key>
     <true/>
 
+    <!-- Allow bounded native display restoration before launchd escalates to SIGKILL. -->
+    <key>ExitTimeOut</key>
+    <integer>60</integer>
+
     <!-- No StandardOutPath: the binary writes (and rotates) macrdp.log itself.
          StandardErrorPath keeps panics + pre-logging-init stderr in a small file. -->
     <key>StandardErrorPath</key>

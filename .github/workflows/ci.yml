@@ -1,8 +1,8 @@
 name: ci
 
-# Shared regression gate for changes, releases and manual package checks.
-# Linux and macOS checks run together; callers build packages only after both
-# jobs pass. Linux covers platform-independent code; macOS covers native paths.
+# Shared regression gate for changes and manual package checks. Release packaging
+# is independent; maintainers run regressions before tagging. Linux covers
+# platform-independent code; macOS covers native paths.
 on:
   push:
     branches:
@@ -179,4 +179,5 @@ jobs:
       - name: Run audit-log integration test
         env:
           SDL_VIDEODRIVER: dummy
+          MACRDP_TEST_BINARY: target/debug/macrdp
         run: ./scripts/test-audit-log.sh

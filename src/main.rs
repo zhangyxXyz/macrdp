@@ -2075,7 +2075,12 @@ impl DisconnectLock {
                     return true;
                 }
                 let state = virtual_display::screen_is_locked();
-                display_transition::confirm_disconnect_lock(verify_only, state, || {
+                let confirmation_state = if verify_only {
+                    virtual_display::screen_authentication_is_required()
+                } else {
+                    state
+                };
+                display_transition::confirm_disconnect_lock(verify_only, confirmation_state, || {
                     // Only a CONFIRMED unlocked desktop starts a new submission
                     // budget. Unknown/still-locked must not replenish a failing
                     // password's attempts on every disconnect/reconnect cycle.

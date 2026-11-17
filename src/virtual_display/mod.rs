@@ -14,15 +14,16 @@ mod private_api;
 
 #[cfg(target_os = "macos")]
 pub use macos::{
-    is_hidpi_virtual_display, run_select_mode_helper, screen_is_locked, shield_keeps_physical_main,
-    take_detach_reenable_failed, CapturedPrimary, DetachedPrimary, PrimaryOverride,
-    ShieldedPrimary, VirtualDisplay, SELECT_MODE_ARG,
+    is_hidpi_virtual_display, run_select_mode_helper, screen_authentication_is_required,
+    screen_is_locked, shield_keeps_physical_main, take_detach_reenable_failed, CapturedPrimary,
+    DetachedPrimary, PrimaryOverride, ShieldedPrimary, VirtualDisplay, SELECT_MODE_ARG,
 };
 
 #[cfg(not(target_os = "macos"))]
 pub use stub::{
-    is_hidpi_virtual_display, screen_is_locked, take_detach_reenable_failed, CapturedPrimary,
-    DetachedPrimary, PrimaryOverride, ShieldedPrimary, VirtualDisplay,
+    is_hidpi_virtual_display, screen_authentication_is_required, screen_is_locked,
+    take_detach_reenable_failed, CapturedPrimary, DetachedPrimary, PrimaryOverride,
+    ShieldedPrimary, VirtualDisplay,
 };
 
 #[cfg(any(target_os = "macos", test))]
@@ -353,6 +354,12 @@ mod macos {
     /// mechanism and its maintenance/fallback notes.
     pub fn screen_is_locked() -> Option<bool> {
         private_api::screen_is_locked()
+    }
+
+    /// True only when the active lock UI's password deadline has elapsed.
+    /// The screen-saver flag alone cannot confirm a password-required lock.
+    pub fn screen_authentication_is_required() -> Option<bool> {
+        private_api::screen_authentication_is_required()
     }
 
     // CGGetOnlineDisplayList is a public CoreGraphics symbol but isn't in the
@@ -2295,6 +2302,10 @@ mod stub {
     /// No screen-lock concept off macOS — definitively not locked, not
     /// "unknown" (there's nothing to fail to look up).
     pub fn screen_is_locked() -> Option<bool> {
+        Some(false)
+    }
+
+    pub fn screen_authentication_is_required() -> Option<bool> {
         Some(false)
     }
 

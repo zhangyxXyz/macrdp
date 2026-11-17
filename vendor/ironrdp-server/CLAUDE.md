@@ -64,7 +64,7 @@ clashing names were renamed for this (11): `RdpdrDriveServerFactory`,
 | (32) | The serving path's pre-finalize phase (X.224, TLS, CredSSP) is bounded by `SERVE_NEGOTIATION_TIMEOUT` (60 s), so an unauthenticated peer that goes silent can't hold the serving connection. **Upstream as #2432 (`e482e340`); drops at the next pin bump** | `run_connection_inner`, around `negotiate_and_authenticate` | — |
 | (33) | The client's desktop and device scale factors on `ConnectionInfo`, **harvested early** from upstream #2107 (merged 2026-10-30, after this pin) | `ConnectionInfo` fields + `new()`, the `on_connection_info` call in `client_accepted`; pairs with acceptor divergence (6) | `ConnectionInfo::{desktop,device}_scale_factor` |
 | (34) | RemoteFX (codec GUID REMOTEFX) goes out in a Stream Surface Bits command when the client sets `STREAM_SURFACE_BITS`; ImageRemoteFX (GUID IMAGE_REMOTEFX) and every other codec keep Set Surface Bits. RemoteFX wins over ImageRemoteFX whatever the client's list order. Windows 10 mstsc shows a black session for RemoteFX in Set. **Port of upstream #2229 (`e20a2147`); drops at the next pin bump** | `encoder/mod.rs` `RemoteFxCodec`, `SurfaceBitsCommand`, `surface_bits`, `UpdateEncoderCodecs::set_remotefx_codec`, `RemoteFxHandler`; `server.rs` `pick_remotefx_codec` and the `BitmapCodecs` arm | — |
-| (35) | Drive CLIPRDR timeout maintenance every five seconds and retain/release explicit remote-file consumers; standalone tests use the local CLIPRDR patch too | `client_loop`, `dispatch_events`, `ServerEvent::ClipboardLease`, `Cargo.toml` | `ClipboardLease { id, retain }` |
+| (35) | Drive CLIPRDR timeout maintenance every five seconds and retain/release explicit remote-file consumers; standalone tests use the local CLIPRDR patch too | `client_loop`, `dispatch_events`, `ServerEvent::ClipboardLease`, `Cargo.toml` | `ClipboardLease { active, id, retain }` |
 
 Notes on the port:
 - **(26)** Ported from main (#222) on 2026-10-27. Upstream's per-PDU lock-wait
@@ -262,3 +262,10 @@ permit to the dispatch scope, retaining producer backpressure across network
 writes. `receive_event_batch` takes at most 32 events per server-lock turn; no
 unbounded `try_recv` tail. Tests in `clipboard_completion_tests` cover these
 contracts. This bounds event count, not the time of an individual TCP write.
+
+Clipboard review follow-up: incoming download RANGE/SIZE requests use the same
+`SessionClipboard` lifetime guard as completions; `ClipboardLease` now also
+carries that guard. Enqueue-time liveness alone cannot prevent old events reaching
+a new connection after disconnect. File advertisements dispatch the descriptor
+array and its immutable OS snapshot together with `initiate_file_copy_with_snapshot`.
+中文：文件请求及租约释放都在消费时再次校验会话，公告同步安装原子文件路径快照。

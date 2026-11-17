@@ -78,6 +78,20 @@ final class ConfigDocumentTests {
         check(String(decoding: saved, as: UTF8.self).contains(line + "\n"))
         checkEqual(try ConfigDocument(data: saved).values["MAP_CTRL_TO_CMD"], "0")
     }
+    func testRestartCommandAllowsSlowCleanupAndInspectionStillTimesOut() throws {
+        // Normal dual-display restoration measured 10.5s. The old generic 8s
+        // command limit would falsely roll back this successful restart.
+        let (code, output) = try ConfigurationCommand.run("/bin/sleep", ["10.5"], timeout: ServiceTiming.restartCommandTimeout)
+        checkEqual(code, 0)
+        check(output.isEmpty)
+        checkThrows(try ConfigurationCommand.run("/bin/sleep", ["2"], timeout: 0.05))
+    }
+    func testConfigurationCommandKeepsBoundedTailWithoutPipeDeadlock() throws {
+        let (code, output) = try ConfigurationCommand.run("/usr/bin/head", ["-c", "131072", "/dev/zero"])
+        checkEqual(code, 0)
+        checkEqual(output.count, 65536)
+        check(output.allSatisfy { $0 == 0 })
+    }
     func testPrivatePermissionsAndRollbackExternalChange() throws {
         let (url, old) = try fixture()
         try FileManager.default.setAttributes([.posixPermissions: 0o640], ofItemAtPath: url.path)
@@ -140,10 +154,12 @@ private func checkThrows<T>(_ expression: @autoclosure () throws -> T, file: Sta
         try tests.testActivationFailureRestoresExactOriginalBytes()
         try tests.testSuccessfulTransactionWritesAllKeysAndActivatesOnce()
         try tests.testUneditedH264AckLimitSurvivesConfigurationApply()
+        try tests.testRestartCommandAllowsSlowCleanupAndInspectionStillTimesOut()
+        try tests.testConfigurationCommandKeepsBoundedTailWithoutPipeDeadlock()
         try tests.testPrivatePermissionsAndRollbackExternalChange()
         try tests.testProtocolVersionsAndUnknownDisplayFields()
         try tests.testConcurrentControllerCannotReplaceCandidate()
         try tests.testExtraFlagsGroupingMatchesServerGrammar()
-        print("ConfigSupport: 11 tests passed (no server or user configuration touched)")
+        print("ConfigSupport: 13 tests passed (no server or user configuration touched)")
     }
 }

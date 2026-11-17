@@ -8,7 +8,8 @@ pub mod pdu;
 
 use std::collections::{HashMap, VecDeque};
 
-use backend::CliprdrBackend;
+use backend::{ClipboardFileSnapshot, CliprdrBackend};
+use std::sync::Arc;
 use ironrdp_core::{AsAny, EncodeResult, IntoOwned as _, decode};
 use ironrdp_pdu::gcc::ChannelName;
 use ironrdp_pdu::{PduResult, decode_err, encode_err};
@@ -443,7 +444,8 @@ pub struct Cliprdr<R: Role> {
     // Responses have no format ID: serialize async backend requests and
     // inline file descriptors/drop effects in their original wire order.
     local_format_pending: bool,
-    local_format_queue: VecDeque<FormatDataRequest>,
+    local_format_queue: VecDeque<(u64, FormatDataRequest)>,
+    local_copy_generation: u64,
 
     /// Stores the local file list when initiating a file copy operation.
     /// Set by initiate_file_copy(), used to respond to FormatDataRequest.
@@ -615,6 +617,7 @@ impl<R: Role> Cliprdr<R> {
             pending_format_data_requests: VecDeque::new(),
             local_format_pending: false,
             local_format_queue: VecDeque::new(),
+            local_copy_generation: 0,
             local_file_list: None,
             local_file_list_format_id: None,
             local_drop_effect_format_id: None,
@@ -720,6 +723,8 @@ impl<R: Role> Cliprdr<R> {
                 warn!("Remote rejected our format list, clearing local clipboard state");
 
                 self.local_file_list = None;
+                self.backend.on_local_file_snapshot(None);
+                self.local_copy_generation = self.local_copy_generation.wrapping_add(1);
                 self.local_file_list_format_id = None;
                 self.local_drop_effect_format_id = None;
 
@@ -866,9 +871,17 @@ impl<R: Role> Cliprdr<R> {
             response,
         ))];
         while !self.local_format_pending {
-            let Some(request) = self.local_format_queue.pop_front() else {
+            let Some((generation, request)) = self.local_format_queue.pop_front() else {
                 break;
             };
+            if generation != self.local_copy_generation {
+                // In particular, never return copy B's descriptor array for a
+                // queued request made while the peer still held copy A's lock.
+                messages.push(into_cliprdr_message(ClipboardPdu::FormatDataResponse(
+                    OwnedFormatDataResponse::new_error(),
+                )));
+                continue;
+            }
             messages.extend(self.respond_local_format(request)?);
         }
         Ok(messages.into())
@@ -956,6 +969,8 @@ impl<R: Role> Cliprdr<R> {
         // A text/image copy ends file visibility to the remote, which may interrupt an
         // in-progress file download - acceptable since the user explicitly chose new content.
         self.local_file_list = None;
+        self.backend.on_local_file_snapshot(None);
+        self.local_copy_generation = self.local_copy_generation.wrapping_add(1);
         self.local_file_list_format_id = None;
         self.local_drop_effect_format_id = None;
 
@@ -1598,8 +1613,8 @@ impl<R: Role> Cliprdr<R> {
     /// - Maximum length: 259 characters (leaving room for null terminator in 260-character field)
     /// - File name must not be empty
     ///
-    /// Invalid file descriptors are logged and skipped; if all descriptors are invalid,
-    /// an empty file list is sent.
+    /// An invalid descriptor rejects the entire copy and sends an empty format
+    /// list. Descriptor indexes must stay aligned with the backend source snapshot.
     ///
     /// [2.2.5.2]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpeclip/9c01c966-e09b-438d-9391-ce31f3caddc3
     pub fn initiate_file_copy(&mut self, files: Vec<FileDescriptor>) -> PduResult<CliprdrSvcMessages<R>> {
@@ -1627,62 +1642,29 @@ impl<R: Role> Cliprdr<R> {
             .flags()
             .contains(ClipboardGeneralCapabilityFlags::FILECLIP_NO_FILE_PATHS);
 
-        let original_count = files.len();
-        let validated_files: Vec<FileDescriptor> = files
-            .into_iter()
-            .filter(|file| {
-                // Compute wire name length without allocating: the wire name is
-                // "relative_path\name" (or just "name" when there is no path).
-                let wire_len = match &file.relative_path {
-                    Some(path) if !path.is_empty() => {
-                        path.chars().count() + 1 /* backslash */ + file.name.chars().count()
-                    }
-                    _ => file.name.chars().count(),
-                };
-
-                // The wire name's absolute-path prefix comes from the first
-                // component, so check the relative_path (if present) or the
-                // name directly - no allocation needed.
-                let wire_is_absolute = match &file.relative_path {
-                    Some(path) if !path.is_empty() => is_absolute_path(path),
-                    _ => is_absolute_path(&file.name),
-                };
-
-                if file.name.is_empty() {
-                    warn!(name = %file.name, "Skipping file with empty name");
-                    false
-                } else if MAX_FILENAME_LEN < wire_len {
-                    warn!(
-                        name = %file.name,
-                        path = ?file.relative_path,
-                        wire_length = wire_len,
-                        max_length = MAX_FILENAME_LEN,
-                        "Skipping file with wire name exceeding maximum length"
-                    );
-                    false
-                } else if file_clip_no_file_paths && wire_is_absolute {
-                    warn!(
-                        name = %file.name,
-                        path = ?file.relative_path,
-                        "Skipping file with absolute path (CB_FILECLIP_NO_FILE_PATHS is set)"
-                    );
-                    false
-                } else {
-                    true
-                }
-            })
-            .collect();
-
-        if validated_files.len() < original_count {
-            debug!(
-                total = original_count,
-                valid = validated_files.len(),
-                "File list validation completed with warnings"
-            );
+        // lindex refers to this exact descriptor array. Filtering one entry
+        // would renumber the descriptors without renumbering the OS snapshot.
+        // Reject the entire copy and clear the remote clipboard instead.
+        let invalid = files.iter().any(|file| {
+            let wire_len = file.name.encode_utf16().count()
+                + file.relative_path.as_ref().filter(|p| !p.is_empty())
+                    .map_or(0, |path| path.encode_utf16().count() + 1);
+            let first = file.relative_path.as_deref().filter(|p| !p.is_empty())
+                .unwrap_or(&file.name);
+            file.name.is_empty()
+                || file.name.contains('\0')
+                || file.relative_path.as_ref().is_some_and(|p| p.contains('\0'))
+                || wire_len > MAX_FILENAME_LEN
+                || (file_clip_no_file_paths && is_absolute_path(first))
+        });
+        if invalid {
+            warn!("Rejecting entire local file copy with invalid descriptor; preserving index alignment");
+            return self.initiate_copy(&[]);
         }
 
-        // Store the validated file list so we can send it when requested
-        self.local_file_list = Some(PackedFileList { files: validated_files });
+        self.local_file_list = Some(PackedFileList { files });
+        self.backend.on_local_file_snapshot(None);
+        self.local_copy_generation = self.local_copy_generation.wrapping_add(1);
 
         // Build a format list with FileGroupDescriptorW format.
         // Per MS-RDPECLIP 1.3.1.2, the format name "FileGroupDescriptorW" is constant across all
@@ -1733,6 +1715,19 @@ impl<R: Role> Cliprdr<R> {
 
         Ok(messages.into())
     }
+    /// Pair a local OS snapshot with its exact advertised descriptor array.
+    /// The caller dispatches this method under the same channel lock as Lock PDUs.
+    pub fn initiate_file_copy_with_snapshot(
+        &mut self,
+        files: Vec<FileDescriptor>,
+        snapshot: Arc<dyn ClipboardFileSnapshot>,
+    ) -> PduResult<CliprdrSvcMessages<R>> {
+        let messages = self.initiate_file_copy(files)?;
+        if self.local_file_list.is_some() {
+            self.backend.on_local_file_snapshot(Some(snapshot));
+        }
+        Ok(messages)
+    }
 }
 
 impl<R: Role> SvcProcessor for Cliprdr<R> {
@@ -1764,6 +1759,13 @@ impl<R: Role> SvcProcessor for Cliprdr<R> {
                 // [MS-RDPECLIP] 3.1.5.3.2 - Processing a Lock Clipboard Data PDU
                 // Store a snapshot of the current file list so we can service
                 // FileContentsRequest PDUs with this clipDataId even after clipboard changes.
+
+                // Reusing a live clipDataId must not replace only the protocol
+                // half of a snapshot while the backend keeps its original paths.
+                if self.locked_file_lists.contains_key(&id.0) {
+                    warn!(clip_data_id = id.0, "Ignoring duplicate live clipboard lock");
+                    return Ok(Vec::new());
+                }
 
                 // Defense-in-depth: Limit number of locked file lists to prevent memory exhaustion
                 // from malicious remotes sending unlimited Lock PDUs
@@ -1819,7 +1821,7 @@ impl<R: Role> SvcProcessor for Cliprdr<R> {
                             },
                         ));
                     }
-                    self.local_format_queue.push_back(request);
+                    self.local_format_queue.push_back((self.local_copy_generation, request));
                     Ok(Vec::new())
                 } else {
                     self.respond_local_format(request)

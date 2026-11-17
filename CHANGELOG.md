@@ -3,17 +3,26 @@
 Only implemented behavior and completed checks are recorded here. Client-side manual checks are identified separately.
 这里只记录已实现的行为和已完成的检查；客户端实测另行注明。
 
-## Unreleased / 未发布
+## v0.10.6-dev
 
-- Validation: 515 Rust tests passed (8 ignored), strict all-target Clippy and formatting checks passed, 55 configuration CLI checks and 11 controller configuration tests passed. These checks do not measure enabled real-client latency.
-- 验证：515 项 Rust 测试通过（8 项跳过），全部目标严格 Clippy 和格式检查通过，55 项配置 CLI 检查、11 项控制器配置测试通过；不等同真实客户端开启后的延迟测量。
+### 2026-11-17 upstream sync and review / 上游同步与复核
+
+- Validation: 528 native release-mode Rust tests passed (8 intentionally ignored), strict all-target Clippy, 55 configuration CLI checks, 13 controller checks, full GUI build, 48 release-script tests, workflow lint, 10 File Provider adapter checks and sanitized native audio-buffer tests passed. FreeRDP loopback CredSSP/audit smoke passed with disposable credentials. Windows paste/playback and hardware disconnect cycles remain separate checks. See the [review record](docs/release-review-2026-11-17.md).
+- 验证：528 项原生发布模式 Rust 测试通过（8 项按设计跳过）、全部目标严格 Clippy、55 项配置 CLI、13 项控制器检查、完整 GUI 编译、48 项发布脚本测试、workflow 检查、10 项 File Provider 适配及原生音频缓冲检查通过；临时凭证 FreeRDP 回环认证／审计冒烟通过。Windows 粘贴／播放及硬件断开周期另行验证，详见[审查记录](docs/release-review-2026-11-17.md)。
+
+- Announce local file descriptors and their immutable source paths in the same protocol dispatch. Reject an invalid descriptor list as a whole instead of filtering and shifting file indices; scope queued file requests and lease releases to their original session. This addresses wrong-generation file data and disconnect races, not Directory Opus clients that cannot supply standard file streams.
+- 本地文件描述符与不可变源路径在同一次协议分发中更新；整轮拒绝非法文件列表，避免过滤后索引错位。已排队文件请求与租约释放绑定原会话，防止断线后串入新连接。这修复数据代次和断线竞态，不代表已解决 Directory Opus 客户端无法提供标准文件流的问题。
+- Always request immediate disconnect locking and confirm both the screen-lock flag and the elapsed password-requirement deadline. An active screen saver alone cannot confirm an authentication-required lock; missing or malformed private state remains unknown.
+- 断开锁屏始终发起立即锁定，同时确认锁屏标志与已到期的密码要求时间；屏保活动本身不能证明必须认证，私有状态缺失或格式异常仍视为未知。
+- Share the remote-only audio recovery budget across open and read failures. Successful opens alone cannot reset it; valid stereo samples, including silence, can. Stop after five retries and report recovery/error state.
+- 仅远端音频的打开／读取失败共用五次恢复预算；仅打开成功不重置，收到有效双声道样本（含静音）后才重置，耗尽后停止并报告错误。
+- Give new LaunchAgents a 60-second shutdown allowance and settings-triggered restart commands a separate 75-second limit, followed by 12 seconds of startup verification. A local launchd probe confirmed that kickstart waits for SIGTERM cleanup; the old 8-second settings limit was shorter than the observed 10.5-second monitor restoration.
+- 新建 LaunchAgent 允许 60 秒退出清理，设置重启命令单独限时 75 秒，随后再检查新进程启动 12 秒。本机 launchd 探针确认 kickstart 等待 SIGTERM 清理；原设置页 8 秒限时短于已观察到的 10.5 秒显示恢复。
 
 - Merge upstream through `fb1facf` (#262): opt-in TCP H.264 ack-lag pacing, default off, with TCP trailing-flush exemption. Preserve the fork's default-off QoE blank recovery and display/lock/clipboard behavior. Advertise and validate `H264_MAX_UNACKED_FRAMES`, reject duplicate escape-hatch flags, and report requested/effective values. Upstream client results are not a local 4K/200% verification.
 - 同步上游至 `fb1facf`（#262）：可选 TCP H.264 帧确认积压控制，默认关闭，TCP 末尾补帧豁免。保留本 fork 默认关闭的 QoE 黑屏恢复及显示／锁屏／剪贴板行为；补齐新配置键的能力声明、校验、重复参数拒绝及请求／有效值报告。上游客户端结果不等同本机 4K／200% 验证。
 - Include #268's regression for lossy-audio Soft-Sync after mstsc's late S_OK, and consolidate #230's already-ported startup-frame hold into upstream ancestry.
 - 纳入 #268 的 mstsc 迟到 S_OK 后有损音频 Soft-Sync 回归测试；统一已移植 #230 启动帧等待修复的上游合并历史。
-
-## v0.10.6-dev
 
 ### 2026-11-17 rebuild / 同版本重构建
 

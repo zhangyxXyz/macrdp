@@ -132,9 +132,8 @@ fn request_and_confirm(
     request: impl FnOnce() -> Result<()>,
     mut wait: impl FnMut(),
 ) -> Result<()> {
-    if state() == Some(true) {
-        return Ok(());
-    }
+    // Always request an immediate lock: the screen saver can already be
+    // active while macOS still allows returning without a password.
     request()?;
     for attempt in 0..=20 {
         if state() == Some(true) {
@@ -150,7 +149,7 @@ fn request_and_confirm(
 #[cfg(target_os = "macos")]
 pub fn lock_now() -> Result<()> {
     request_and_confirm(
-        crate::virtual_display::screen_is_locked,
+        crate::virtual_display::screen_authentication_is_required,
         || {
             // Signature and runtime lookup follow Chromium base/mac/login_util.cc
             // (OSStatus, no arguments) and Hammerspoon's caffeinate implementation.
@@ -238,13 +237,30 @@ mod tests {
         }
     }
     #[test]
-    fn already_locked_does_not_issue_another_request() {
+    fn existing_lock_state_still_gets_an_immediate_request() {
+        let requested = AtomicUsize::new(0);
         assert!(request_and_confirm(
-            || Some(true),
-            || panic!("already locked"),
+            || {
+                assert_eq!(requested.load(Ordering::SeqCst), 1);
+                Some(true)
+            },
+            || {
+                requested.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            },
             || panic!("no wait")
         )
         .is_ok());
+        assert_eq!(requested.load(Ordering::SeqCst), 1);
+    }
+    #[test]
+    fn existing_lock_state_does_not_hide_a_failed_immediate_request() {
+        assert!(request_and_confirm(
+            || Some(true),
+            || anyhow::bail!("request failed"),
+            || panic!("no wait after failed request")
+        )
+        .is_err());
     }
     #[test]
     fn successful_request_without_locked_state_is_failure() {

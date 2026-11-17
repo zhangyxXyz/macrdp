@@ -100,6 +100,7 @@ impl Drop for DownloadLease {
         if self.alive.load(Ordering::Acquire) {
             if let Some(sender) = self.sender.lock().unwrap().as_ref() {
                 let _ = sender.send(ServerEvent::ClipboardLease {
+                    active: self.alive.clone(),
                     id: self.lock,
                     retain: false,
                 });
@@ -807,6 +808,7 @@ pub async fn fetch_size(
     };
     push_request(
         sender,
+        router,
         FileContentsRequest {
             stream_id,
             index,
@@ -852,6 +854,7 @@ pub async fn fetch_range(
     };
     push_request(
         sender,
+        router,
         FileContentsRequest {
             stream_id,
             index,
@@ -876,15 +879,26 @@ pub async fn fetch_range(
     Ok(resp.data().to_vec())
 }
 
-fn push_request(sender: &EventSender, req: FileContentsRequest) -> Result<(), String> {
+fn push_request(
+    sender: &EventSender,
+    router: &DownloadRouter,
+    req: FileContentsRequest,
+) -> Result<(), String> {
     let guard = sender.lock().unwrap();
     let s = guard
         .as_ref()
         .ok_or_else(|| "event sender unavailable (server shutting down?)".to_string())?;
-    s.send(ServerEvent::Clipboard(
-        ClipboardMessage::SendFileContentsRequest(req),
-    ))
-    .map_err(|_| "event channel closed".to_string())
+    let message = ClipboardMessage::SendFileContentsRequest(req);
+    let event = match &router.lease {
+        Some(lease) => ServerEvent::SessionClipboard {
+            active: lease.alive.clone(),
+            message,
+            permit: None,
+        },
+        None => ServerEvent::Clipboard(message),
+    };
+    s.send(event)
+        .map_err(|_| "event channel closed".to_string())
 }
 
 #[cfg(test)]
@@ -1217,7 +1231,8 @@ mod tests {
             rx.try_recv(),
             Ok(ServerEvent::ClipboardLease {
                 id: 7,
-                retain: false
+                retain: false,
+                ..
             })
         ));
         let old = DownloadRouter::default().for_copy(8, alive.clone(), sender);

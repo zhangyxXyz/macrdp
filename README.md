@@ -17,7 +17,7 @@ The initial development base is upstream commit
 The upstream README is retained as [README_UPSTREAM.md](README_UPSTREAM.md);
 its release, verification, and support claims belong to upstream, not this fork.
 
-## Unreleased dev updates
+## Included upstream updates
 
 Upstream sync through [`fb1facf`](https://github.com/clintcan/macrdp/commit/fb1facf2d0666c8779a92b943221a4270432734d)
 adds [#262](https://github.com/clintcan/macrdp/pull/262): optional TCP H.264 frame-ack
@@ -39,6 +39,16 @@ use `SOURCE_COMMIT` in the download to distinguish builds. Win10 client renderin
 requires a post-update manual check; upstream's frozen-start fix #230 is included. See [changes](CHANGELOG.md#v0106-dev).
 
 ## This same-version rebuild
+
+Review fixes in this rebuild keep file descriptors and source paths in one
+announcement snapshot, reject malformed descriptor lists without reindexing,
+and discard retired-session file requests/lease releases. Disconnect lock
+confirmation checks whether authentication is actually required, including the
+screen-saver grace deadline. Remote-only audio open/read failures share a finite
+retry budget. Settings restart allows native shutdown to finish before checking
+the new process; newly installed LaunchAgents allow 60 seconds for cleanup.
+See the [review and verification record](docs/release-review-2026-11-17.md) for
+source references, completed tests and remaining manual checks.
 
 Manual feedback on build `31ee2fb`: remote audio and file copies from the Windows
 desktop work; Directory Opus file copies still fail. The follow-up gives a failed
@@ -92,8 +102,8 @@ The default-off experimental **Audio → Remote-only playback** option
 local playback only while capturing, without changing system volume, mute or the
 default output device. System audio recording permission is required. Initialization
 failure is reported; it does not silently fall back to dual playback. An established
-tap retries a changed/disappearing output device up to five times with bounded
-backoff; initial permission failures require correction. The existing
+tap shares up to five bounded retries across open and read failures; only valid
+stereo samples reset that budget; initial permission failures require correction. The existing
 minimize policy still pauses forwarded audio; disconnect destroys the tap to restore
 local playback. Status reports capture state/errors, not confirmed client audibility.
 An isolated local probe captured a nonzero 48 kHz test tone and destroyed the tap
@@ -114,8 +124,9 @@ Shield still requires helper acknowledgement with zero targets, retaining hot-pl
 protection. Automated regression coverage is added; actual unplug/replug and
 monitor-free locked reconnect testing with the rebuilt server remain pending.
 This covers logged-in user sessions, not FileVault/pre-login boot screens. An
-attempt cancelled during password input can still finish unlocking; automatic
-re-lock of that pre-existing abandoned-preparation path is not guaranteed.
+attempt cancelled during password input can still finish unlocking. Automatic
+re-lock is not guaranteed if preparation is abandoned or capture fails after
+unlocking, before it enters the counted session lifecycle.
 
 ## Changes on dev
 

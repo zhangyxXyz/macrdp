@@ -1,6 +1,7 @@
 //! This module provides infrastructure for implementing OS-specific clipboard backend.
 
 use ironrdp_core::AsAny;
+use std::sync::Arc;
 
 use crate::pdu::{
     ClipboardFormat, ClipboardFormatId, ClipboardGeneralCapabilityFlags, FileContentsRequest, FileContentsResponse,
@@ -10,6 +11,11 @@ use crate::pdu::{
 pub trait ClipboardError: core::error::Error + Send + Sync + 'static {}
 
 impl<T> ClipboardError for T where T: core::error::Error + Send + Sync + 'static {}
+
+/// Immutable OS data paired with one file descriptor array. The protocol does
+/// not inspect this data; it installs it on the backend in the same dispatch
+/// operation that changes the advertised file list.
+pub trait ClipboardFileSnapshot: AsAny + core::fmt::Debug + Send + Sync {}
 
 /// Message sent by the OS clipboard backend event loop.
 #[derive(Debug)]
@@ -49,6 +55,11 @@ pub enum ClipboardMessage {
     /// received. Unlike [`ClipboardMessage::SendInitiateCopy`], this records the file list so
     /// later `FileContentsRequest`s from the remote can be serviced.
     SendInitiateFileCopy(Vec<FileDescriptor>),
+
+    SendInitiateFileCopyWithSnapshot {
+        files: Vec<FileDescriptor>,
+        snapshot: Arc<dyn ClipboardFileSnapshot>,
+    },
 
     /// Failure received from the OS clipboard event loop.
     ///
@@ -105,6 +116,12 @@ pub trait CliprdrBackend: AsAny + core::fmt::Debug + Send {
     /// already-accepted state and silently break a paste that was about to work.
     fn on_format_list_response(&mut self, ok: bool) {
         let _ = ok;
+    }
+
+    /// Called atomically with local file-list changes, never by an OS poller.
+    /// `None` clears the current source but must preserve previously locked data.
+    fn on_local_file_snapshot(&mut self, snapshot: Option<Arc<dyn ClipboardFileSnapshot>>) {
+        let _ = snapshot;
     }
 
     /// Retain file-list locks before callbacks can enqueue asynchronous work.

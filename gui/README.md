@@ -106,6 +106,12 @@ it explicitly leaves runtime display status unverified. When enabled, startup
 verification requires the new process ID, matching configuration revision and
 startup phase. No RDP login or display session is required to apply settings.
 
+Restart commands have a separate 75-second limit so native shutdown cleanup can
+finish before the 12-second startup check begins. Other configuration commands
+keep their 8-second limit. New LaunchAgents use `ExitTimeOut=60`; reinstalling the
+agent applies that value to an existing setup. Timeouts are finite, and an actual
+failure still offers configuration recovery rather than claiming success.
+
 ## Reliable configuration saving
 
 The controller reads the server's plain `KEY=value` grammar, including `export`

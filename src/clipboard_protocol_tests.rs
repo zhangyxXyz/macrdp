@@ -368,4 +368,96 @@ mod tests {
             .submit_format_data(OwnedFormatDataResponse::new_error())
             .unwrap();
     }
+    #[test]
+    fn invalid_file_descriptor_rejects_whole_copy_without_renumbering_indexes() {
+        let (mut client, _, _) = ready();
+        client
+            .initiate_file_copy(vec![FileDescriptor::new("previous")])
+            .unwrap();
+        let messages = client
+            .initiate_file_copy(vec![
+                FileDescriptor::new("a".repeat(260)),
+                FileDescriptor::new("valid.bin"),
+            ])
+            .unwrap();
+        assert!(
+            client.__test_local_file_list().is_none(),
+            "never expose descriptor 1 as index 0"
+        );
+        let messages: Vec<SvcMessage> = messages.into();
+        let bytes = messages.last().unwrap().encode_unframed_pdu().unwrap();
+        let ClipboardPdu::FormatList(list) =
+            ironrdp_core::decode::<ClipboardPdu<'_>>(&bytes).unwrap()
+        else {
+            panic!("must clear the previous remote clipboard");
+        };
+        assert!(list.get_formats(true).unwrap().is_empty());
+    }
+
+    #[test]
+    fn descriptor_wire_limit_counts_utf16_units_including_relative_paths() {
+        for (name, path, valid) in [
+            ("a".repeat(259), None, true),
+            ("😀".repeat(129) + "x", None, true),
+            ("😀".repeat(130), None, false),
+            ("file".into(), Some("a".repeat(254)), true),
+            ("file".into(), Some("a".repeat(255)), false),
+            ("bad\0name".into(), None, false),
+        ] {
+            let (mut client, _, _) = ready();
+            let mut file = FileDescriptor::new(name);
+            if let Some(path) = path {
+                file = file.with_relative_path(path);
+            }
+            client.initiate_file_copy(vec![file]).unwrap();
+            assert_eq!(client.__test_local_file_list().is_some(), valid);
+        }
+    }
+    #[test]
+    fn queued_descriptor_from_an_older_copy_fails_in_fifo_order() {
+        let (mut client, _, _) = ready();
+        let request = |format| {
+            encoded(ClipboardPdu::FormatDataRequest(FormatDataRequest {
+                format: ClipboardFormatId::new(format),
+            }))
+        };
+        client
+            .initiate_file_copy(vec![FileDescriptor::new("A")])
+            .unwrap();
+        assert!(client.process(&request(13)).unwrap().is_empty());
+        assert!(client.process(&request(0xc0fe)).unwrap().is_empty());
+        client
+            .initiate_file_copy(vec![FileDescriptor::new("B")])
+            .unwrap();
+        let replies: Vec<SvcMessage> = client
+            .submit_format_data(OwnedFormatDataResponse::new_error())
+            .unwrap()
+            .into();
+        assert_eq!(
+            replies.len(),
+            2,
+            "one response per request, no implicit retry"
+        );
+        for message in replies {
+            let bytes = message.encode_unframed_pdu().unwrap();
+            let ClipboardPdu::FormatDataResponse(response) =
+                ironrdp_core::decode::<ClipboardPdu<'_>>(&bytes).unwrap()
+            else {
+                panic!("wrong response type");
+            };
+            assert!(
+                response.is_error(),
+                "A's queued descriptor must not become B"
+            );
+        }
+        let replies = client.process(&request(0xc0fe)).unwrap();
+        assert_eq!(replies.len(), 1);
+        let bytes = replies[0].encode_unframed_pdu().unwrap();
+        let ClipboardPdu::FormatDataResponse(response) =
+            ironrdp_core::decode::<ClipboardPdu<'_>>(&bytes).unwrap()
+        else {
+            panic!("wrong response type");
+        };
+        assert_eq!(response.to_file_list().unwrap().files[0].name, "B");
+    }
 }

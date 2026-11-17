@@ -11,32 +11,8 @@ extension AppController {
         return locateServerApp()?.appendingPathComponent("Contents/MacOS/macrdp")
     }
 
-    /// Bounded subprocess with file-backed output, avoiding a full pipe deadlock.
     func runConfigurationCommand(_ path: String, _ args: [String], timeout: TimeInterval = 8) throws -> (Int32, Data) {
-        let output = FileManager.default.temporaryDirectory.appendingPathComponent("macrdp-command-\(UUID().uuidString)")
-        FileManager.default.createFile(atPath: output.path, contents: nil, attributes: [.posixPermissions: 0o600])
-        defer { try? FileManager.default.removeItem(at: output) }
-        let file = try FileHandle(forWritingTo: output)
-        defer { try? file.close() }
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: path)
-        process.arguments = args
-        process.standardInput = FileHandle.nullDevice
-        process.standardOutput = file
-        process.standardError = file
-        try process.run()
-        let deadline = Date().addingTimeInterval(timeout)
-        while process.isRunning && Date() < deadline { Thread.sleep(forTimeInterval: 0.05) }
-        if process.isRunning {
-            process.terminate()
-            let grace = Date().addingTimeInterval(0.5)
-            while process.isRunning && Date() < grace { Thread.sleep(forTimeInterval: 0.02) }
-            if process.isRunning { kill(process.processIdentifier, SIGKILL) }
-            throw ConfigError.invalid("Timed out while running \(URL(fileURLWithPath: path).lastPathComponent).")
-        }
-        process.waitUntilExit()
-        let data = try Data(contentsOf: output)
-        return (process.terminationStatus, Data(data.suffix(64 * 1024)))
+        try ConfigurationCommand.run(path, args, timeout: timeout)
     }
 
     func serverCapabilities() throws -> ServerCapabilities {
@@ -73,9 +49,10 @@ extension AppController {
         let expected = try validateConfiguration(configURL)
         let cfg = readConfig()
         let oldPID = agentState().pid
-        let (code, output) = try runConfigurationCommand("/bin/launchctl", ["kickstart", "-k", service])
+        let (code, output) = try runConfigurationCommand("/bin/launchctl", ["kickstart", "-k", service], timeout: ServiceTiming.restartCommandTimeout)
         guard code == 0 else { throw ConfigError.invalid("Restart failed: \(String(decoding: output, as: UTF8.self))") }
-        let deadline = Date().addingTimeInterval(12)
+        // kickstart waits for old-process cleanup; only now start the new-process budget.
+        let deadline = Date().addingTimeInterval(ServiceTiming.startupVerificationTimeout)
         var stablePID: Int?
         var stableSince = Date()
         var lastStatus = "Server did not start."

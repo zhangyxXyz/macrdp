@@ -1,13 +1,9 @@
 //! Bidirectional clipboard sync between the Mac and the RDP client.
 //!
-//! Text (CF_UNICODETEXT ↔ NSPasteboardTypeString) and images
-//! (CF_DIB ↔ PNG/TIFF) flow both directions. File copy is **Mac → Windows
-//! only**: copying a file in Finder advertises FileGroupDescriptorW with
-//! the file names + sizes, and Windows can fetch the actual bytes via
-//! FileContentsRequest (SIZE for the per-file size query, RANGE for the
-//! body chunks). The backend snapshots the absolute paths at format-
-//! data-request time so subsequent content requests resolve to the same
-//! files even if the pasteboard changes underneath us.
+//! Text, images and file streams flow in both directions. Each outgoing
+//! FileGroupDescriptorW array travels with its immutable OS path snapshot;
+//! the protocol installs both in one dispatch operation. Lock PDUs retain
+//! that exact source mapping across later local copies.
 //!
 //! The factory owns the event sender and spawns a poller that detects
 //! Mac-side clipboard changes via `NSPasteboard.changeCount` and signals
@@ -20,7 +16,9 @@ use std::time::Duration;
 use std::io::{Cursor, Read, Seek, SeekFrom};
 
 use image::{ImageEncoder, ImageReader};
-use ironrdp_cliprdr::backend::{ClipboardMessage, CliprdrBackend, CliprdrBackendFactory};
+use ironrdp_cliprdr::backend::{
+    ClipboardFileSnapshot, ClipboardMessage, CliprdrBackend, CliprdrBackendFactory,
+};
 use ironrdp_cliprdr::pdu::{
     ClipboardFileAttributes, ClipboardFormat, ClipboardFormatId, ClipboardFormatName,
     ClipboardGeneralCapabilityFlags, FileContentsFlags, FileContentsRequest, FileContentsResponse,
@@ -38,7 +36,17 @@ use tracing::{debug, info, warn};
 const MAX_FILE_RANGE_BYTES: u32 = 4 * 1024 * 1024;
 
 type Sender = Arc<Mutex<Option<mpsc::UnboundedSender<ServerEvent>>>>;
-type Paths = Arc<Mutex<Vec<PathBuf>>>;
+#[derive(Debug)]
+struct FilePathsSnapshot(Vec<PathBuf>);
+impl ironrdp_core::AsAny for FilePathsSnapshot {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+        self
+    }
+}
+impl ClipboardFileSnapshot for FilePathsSnapshot {}
 
 /// Maximum FormatDataResponse payload we'll accept from the client. An
 /// authenticated peer that paste-pumped a multi-gig DIB at us could
@@ -459,16 +467,6 @@ struct AdvertiseState {
 #[derive(Debug)]
 pub struct MacCliprdr {
     sender: Sender,
-    /// Absolute paths corresponding to the FILEGROUPDESCRIPTORW most recently
-    /// pushed to the cliprdr server. Shared with every backend instance so
-    /// that `on_file_contents_request` (which runs on the backend) can map
-    /// `request.index` back to a real path even when the advertise was sent
-    /// from the poller in the factory.
-    file_paths: Paths,
-    /// Windows→Mac file paste routing. Backend's
-    /// `on_file_contents_response` dispatches incoming bytes through this;
-    /// each in-flight download task holds the matching receiver. See
-    /// `src/file_promise.rs`.
     /// Most recently-allocated temp directory holding downloaded remote
     /// files. The download task swaps it on each new remote copy and
     /// removes the previous tree to keep /tmp tidy.
@@ -534,7 +532,6 @@ impl MacCliprdr {
         );
         Self {
             sender: Arc::new(Mutex::new(None)),
-            file_paths: Arc::new(Mutex::new(Vec::new())),
             paste_temp_dir,
             self_change_count,
             remote_write_cc: Arc::new(std::sync::atomic::AtomicI64::new(-1)),
@@ -552,7 +549,6 @@ impl MacCliprdr {
     pub fn new() -> Self {
         Self {
             sender: Arc::new(Mutex::new(None)),
-            file_paths: Arc::new(Mutex::new(Vec::new())),
             advertise_state: Arc::new(AdvertiseState::default()),
             active_backends: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             rich_clipboard: true,
@@ -567,7 +563,6 @@ impl ServerEventSender for MacCliprdr {
         // Spawn a poller that notices Mac-side copies and tells the RDP
         // server to advertise the new content to the remote.
         let sender_arc = self.sender.clone();
-        let paths_arc = self.file_paths.clone();
         let own_writes = self.own_writes();
         let advertise_state = self.advertise_state.clone();
         let active_backends = self.active_backends.clone();
@@ -606,9 +601,7 @@ impl ServerEventSender for MacCliprdr {
                     debug!(current, "skipping pasteboard tick (self-write)");
                     continue;
                 }
-                if !advertise_wave(&sender_arc, &paths_arc, rich, &advertise_state, &own_writes)
-                    .await
-                {
+                if !advertise_wave(&sender_arc, rich, &advertise_state, &own_writes).await {
                     break;
                 }
             }
@@ -691,7 +684,6 @@ const ADVERTISE_RETRY_DELAYS: [Duration; 3] = [
 /// ends it.
 async fn advertise_wave(
     sender: &Sender,
-    paths: &Paths,
     rich: bool,
     state: &AdvertiseState,
     own: &OwnWrites,
@@ -714,7 +706,7 @@ async fn advertise_wave(
             );
             return Advertised::NothingToSend;
         }
-        advertise_pasteboard(sender, paths, rich)
+        advertise_pasteboard(sender, rich, own)
     };
     match attempt() {
         Advertised::SenderGone => return false,
@@ -761,7 +753,7 @@ impl CliprdrBackendFactory for MacCliprdr {
             fetch: RemoteFetch::default(),
             rich_clipboard: self.rich_clipboard,
             active_backends: self.active_backends.clone(),
-            file_paths: self.file_paths.clone(),
+            file_paths: Vec::new(),
             #[cfg(target_os = "macos")]
             download_router: crate::file_promise::DownloadRouter::default(),
             #[cfg(target_os = "macos")]
@@ -805,9 +797,9 @@ struct MacCliprdrBackend {
     // backend was built, decremented in Drop. Parks the pasteboard poller
     // while no client has a clipboard channel. See MacCliprdr::active_backends.
     active_backends: Arc<std::sync::atomic::AtomicUsize>,
-    // Shared with `MacCliprdr` so the poller and the backend agree on which
-    // paths back the currently-advertised FILEGROUPDESCRIPTORW.
-    file_paths: Paths,
+    // Installed only by protocol dispatch together with FILEGROUPDESCRIPTORW.
+    // Background enumeration cannot change the current or locked mapping.
+    file_paths: Vec<PathBuf>,
     // Windows→Mac side: route FileContentsResponses to whichever download
     // task is awaiting the matching stream_id.
     #[cfg(target_os = "macos")]
@@ -1155,7 +1147,24 @@ fn skip_connect_time_fetch(mac: &pb::Snapshot, session_end_cc: i64) -> bool {
 /// server populates its `local_file_list` and accepts subsequent
 /// FileContentsRequests instead of short-circuiting them with
 /// CB_RESPONSE_FAIL.
-fn advertise_pasteboard(sender: &Sender, paths: &Paths, rich: bool) -> Advertised {
+fn advertise_pasteboard(sender: &Sender, rich: bool, own: &OwnWrites) -> Advertised {
+    advertise_pasteboard_with_files(sender, rich, own, pb::read_files)
+}
+
+fn advertise_pasteboard_with_files(
+    sender: &Sender,
+    rich: bool,
+    own: &OwnWrites,
+    read_files: impl FnOnce() -> Vec<pb::FileEntry>,
+) -> Advertised {
+    let start_cc = pb::change_count();
+    let still_current = || {
+        let current = pb::change_count();
+        current == start_cc && !own.is_own(current)
+    };
+    if !still_current() {
+        return Advertised::NothingToSend;
+    }
     if pb::is_remote_clipboard() {
         // A Universal Clipboard promise from another Apple device (the
         // client Mac itself, when its copy comes back that way, or an
@@ -1166,7 +1175,12 @@ fn advertise_pasteboard(sender: &Sender, paths: &Paths, rich: bool) -> Advertise
         return Advertised::NothingToSend;
     }
     if pb::has_files() {
-        let entries = pb::read_files();
+        let entries = read_files();
+        // Walking a directory may outlive a newer local or remote clipboard
+        // copy. Drop a known-obsolete result before it can take ownership back.
+        if !still_current() {
+            return Advertised::NothingToSend;
+        }
         if !entries.is_empty() {
             let mut snapshot = Vec::with_capacity(entries.len());
             let mut files = Vec::with_capacity(entries.len());
@@ -1186,14 +1200,16 @@ fn advertise_pasteboard(sender: &Sender, paths: &Paths, rich: bool) -> Advertise
                 files.push(fd);
                 snapshot.push(e.path);
             }
-            *paths.lock().unwrap() = snapshot;
             debug!(
                 file_count = files.len(),
                 "advertising file copy to client (recursive)"
             );
             return send(
                 sender,
-                ServerEvent::Clipboard(ClipboardMessage::SendInitiateFileCopy(files)),
+                ServerEvent::Clipboard(ClipboardMessage::SendInitiateFileCopyWithSnapshot {
+                    files,
+                    snapshot: Arc::new(FilePathsSnapshot(snapshot)),
+                }),
             );
         }
         // Files claimed but read empty (race) — fall through to format list.
@@ -1224,12 +1240,9 @@ fn advertise_pasteboard(sender: &Sender, paths: &Paths, rich: bool) -> Advertise
     if pb::has_string() {
         formats.push(ClipboardFormat::new(ClipboardFormatId::CF_UNICODETEXT));
     }
-    if formats.is_empty() {
+    if formats.is_empty() || !still_current() {
         return Advertised::NothingToSend;
     }
-    // Clear any stale file-paths snapshot so a leftover index can't be
-    // exploited by a slow follow-up FileContentsRequest.
-    paths.lock().unwrap().clear();
     send(
         sender,
         ServerEvent::Clipboard(ClipboardMessage::SendInitiateCopy(formats)),
@@ -1313,7 +1326,6 @@ impl CliprdrBackend for MacCliprdrBackend {
             // (`skip_connect_time_fetch`), this advertise is the only thing
             // that syncs the two clipboards, and mstsc can reject it.
             let sender = self.sender.clone();
-            let file_paths = self.file_paths.clone();
             let rich = self.rich_clipboard;
             let state = self.advertise_state.clone();
             let own = self.own_writes();
@@ -1327,7 +1339,7 @@ impl CliprdrBackend for MacCliprdrBackend {
                     );
                     return;
                 }
-                advertise_wave(&sender, &file_paths, rich, &state, &own).await;
+                advertise_wave(&sender, rich, &state, &own).await;
             });
             return;
         }
@@ -1731,7 +1743,7 @@ impl CliprdrBackend for MacCliprdrBackend {
                     .get(&id)
                     .and_then(|paths| paths.get(index))
                     .cloned(),
-                None => self.file_paths.lock().unwrap().get(index).cloned(),
+                None => self.file_paths.get(index).cloned(),
             });
         let fallback =
             ClipboardMessage::SendFileContentsResponse(FileContentsResponse::new_error(stream));
@@ -1759,11 +1771,19 @@ impl CliprdrBackend for MacCliprdrBackend {
         #[cfg(not(target_os = "macos"))]
         let _ = response;
     }
+    fn on_local_file_snapshot(&mut self, snapshot: Option<Arc<dyn ClipboardFileSnapshot>>) {
+        self.file_paths = snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.as_any().downcast_ref::<FilePathsSnapshot>())
+            .map(|snapshot| snapshot.0.clone())
+            .unwrap_or_default();
+    }
+
     fn on_lock(&mut self, data_id: LockDataId) {
-        if self.local_file_locks.contains_key(&data_id.0) {
+        if self.file_paths.is_empty() || self.local_file_locks.contains_key(&data_id.0) {
             return;
         }
-        let paths = self.file_paths.lock().unwrap();
+        let paths = &self.file_paths;
         let retained = self.local_file_locks.values().map(Vec::len).sum::<usize>();
         if self.local_file_locks.len() < 128 && retained.saturating_add(paths.len()) <= 20_000 {
             self.local_file_locks.insert(data_id.0, paths.clone());
@@ -2507,11 +2527,11 @@ mod tests {
     fn test_backend() -> (MacCliprdrBackend, mpsc::UnboundedReceiver<ServerEvent>) {
         let (tx, rx) = mpsc::unbounded_channel();
         let backend = MacCliprdrBackend {
+            file_paths: Vec::new(),
             sender: Arc::new(Mutex::new(Some(tx))),
             fetch: RemoteFetch::default(),
             rich_clipboard: true,
             active_backends: Arc::new(std::sync::atomic::AtomicUsize::new(1)),
-            file_paths: Arc::new(Mutex::new(Vec::new())),
             download_router: crate::file_promise::DownloadRouter::default(),
             paste_temp_dir: Arc::new(Mutex::new(None)),
             self_change_count: Arc::new(std::sync::atomic::AtomicI64::new(-1)),
@@ -2599,7 +2619,7 @@ mod tests {
             .swap(false, std::sync::atomic::Ordering::AcqRel));
         assert!(rx.try_recv().is_err());
         // The poller performs this work outside channel dispatch.
-        advertise_pasteboard(&backend.sender, &backend.file_paths, true);
+        advertise_pasteboard(&backend.sender, true, &backend.own_writes());
         match rx
             .try_recv()
             .expect("the requested poller pass advertises the clipboard")
@@ -2706,7 +2726,7 @@ mod tests {
         let (backend, mut rx) = test_backend();
         pb::write_remote_promise("copied on another Apple device");
 
-        let outcome = advertise_pasteboard(&backend.sender, &backend.file_paths, true);
+        let outcome = advertise_pasteboard(&backend.sender, true, &backend.own_writes());
 
         assert_eq!(outcome, Advertised::NothingToSend);
         assert!(rx.try_recv().is_err(), "a promise must not be advertised");
@@ -2772,7 +2792,6 @@ mod tests {
 
         let alive = advertise_wave(
             &backend.sender,
-            &backend.file_paths,
             true,
             &backend.advertise_state,
             &backend.own_writes(),
@@ -3648,9 +3667,9 @@ mod tests {
         let second = directory.join("second");
         std::fs::write(&first, b"first").unwrap();
         std::fs::write(&second, b"other").unwrap();
-        *backend.file_paths.lock().unwrap() = vec![first];
+        backend.file_paths = vec![first];
         backend.on_lock(LockDataId(7));
-        *backend.file_paths.lock().unwrap() = vec![second];
+        backend.file_paths = vec![second];
         for (id, expected) in [
             (Some(7), Some(b"first".as_slice())),
             (None, Some(b"other".as_slice())),
@@ -3763,5 +3782,146 @@ mod tests {
         assert!(rx.try_recv().is_err());
         // Drop the guard before backend teardown reads pasteboard state.
         drop(_busy_pasteboard);
+    }
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn queued_file_advertisement_cannot_change_the_previous_lock_source() {
+        use ironrdp_cliprdr::pdu::{Capabilities, ClipboardPdu, ClipboardProtocolVersion};
+        use ironrdp_cliprdr::{CliprdrServer, CliprdrState};
+        use ironrdp_core::Encode;
+        use ironrdp_svc::SvcProcessor;
+        let (backend, mut rx) = test_backend();
+        let directory = tmpdir("atomic-file-advertisement");
+        let first = directory.0.join("first.bin");
+        let second = directory.0.join("second.bin");
+        std::fs::write(&first, b"old").unwrap();
+        std::fs::write(&second, b"new").unwrap();
+        let mut channel = CliprdrServer::new(Box::new(backend));
+        *channel.__test_state_mut() = CliprdrState::Ready;
+        *channel.__test_capabilities_mut() = Capabilities::new(
+            ClipboardProtocolVersion::V2,
+            ClipboardGeneralCapabilityFlags::CAN_LOCK_CLIPDATA
+                | ClipboardGeneralCapabilityFlags::STREAM_FILECLIP_ENABLED
+                | ClipboardGeneralCapabilityFlags::USE_LONG_FORMAT_NAMES,
+        );
+        channel
+            .initiate_file_copy_with_snapshot(
+                vec![FileDescriptor::new("first.bin").with_file_size(3)],
+                Arc::new(FilePathsSnapshot(vec![first.clone()])),
+            )
+            .unwrap();
+        let ticket = crate::clipboard_image::CopyTicket::new(
+            Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            pb::change_count(),
+        );
+        assert!(crate::file_promise::publish_file_urls(
+            std::slice::from_ref(&second),
+            &Arc::new(std::sync::atomic::AtomicI64::new(-1)),
+            &ticket,
+        ));
+        let backend = channel.downcast_backend::<MacCliprdrBackend>().unwrap();
+        assert_eq!(
+            advertise_pasteboard(&backend.sender, true, &backend.own_writes()),
+            Advertised::Sent
+        );
+        let queued = rx.recv().await.unwrap();
+        let lock = |channel: &mut CliprdrServer, id| {
+            let pdu = ClipboardPdu::LockData(LockDataId(id));
+            let mut bytes = vec![0; pdu.size()];
+            pdu.encode(&mut ironrdp_core::WriteCursor::new(&mut bytes))
+                .unwrap();
+            channel.process(&bytes).unwrap();
+        };
+        // The OS poller prepared B, but only A was announced to this channel.
+        lock(&mut channel, 7);
+        assert_eq!(
+            channel.__test_locked_file_lists()[&7].files[0].name,
+            "first.bin"
+        );
+        assert_eq!(
+            channel
+                .downcast_backend::<MacCliprdrBackend>()
+                .unwrap()
+                .local_file_locks[&7],
+            vec![first.clone()]
+        );
+        let ServerEvent::Clipboard(ClipboardMessage::SendInitiateFileCopyWithSnapshot {
+            files,
+            snapshot,
+        }) = queued
+        else {
+            panic!("expected an immutable file advertisement");
+        };
+        channel
+            .initiate_file_copy_with_snapshot(files, snapshot)
+            .unwrap();
+        lock(&mut channel, 8);
+        assert_eq!(
+            channel.__test_locked_file_lists()[&8].files[0].name,
+            "second.bin"
+        );
+        let backend = channel.downcast_backend::<MacCliprdrBackend>().unwrap();
+        assert_eq!(backend.local_file_locks[&8], vec![second.clone()]);
+        assert_eq!(backend.local_file_locks[&7], vec![first]);
+        lock(&mut channel, 7);
+        assert_eq!(
+            channel.__test_locked_file_lists()[&7].files[0].name,
+            "first.bin"
+        );
+        let pdu = ClipboardPdu::UnlockData(LockDataId(7));
+        let mut bytes = vec![0; pdu.size()];
+        pdu.encode(&mut ironrdp_core::WriteCursor::new(&mut bytes))
+            .unwrap();
+        channel.process(&bytes).unwrap();
+        lock(&mut channel, 7);
+        assert_eq!(
+            channel.__test_locked_file_lists()[&7].files[0].name,
+            "second.bin"
+        );
+        assert_eq!(
+            channel
+                .downcast_backend::<MacCliprdrBackend>()
+                .unwrap()
+                .local_file_locks[&7],
+            vec![second]
+        );
+        // Rejection clears only the current snapshot; prior locked copies remain.
+        let pdu = ClipboardPdu::FormatListResponse(ironrdp_cliprdr::pdu::FormatListResponse::Fail);
+        let mut bytes = vec![0; pdu.size()];
+        pdu.encode(&mut ironrdp_core::WriteCursor::new(&mut bytes))
+            .unwrap();
+        channel.process(&bytes).unwrap();
+        let backend = channel.downcast_backend::<MacCliprdrBackend>().unwrap();
+        assert!(backend.file_paths.is_empty());
+        assert_eq!(backend.local_file_locks.len(), 2);
+    }
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn slow_file_enumeration_cannot_advertise_over_a_new_remote_own_write() {
+        let (backend, mut rx) = test_backend();
+        let directory = tmpdir("superseded-enumeration");
+        let path = directory.0.join("old.bin");
+        std::fs::write(&path, b"old").unwrap();
+        let ticket = crate::clipboard_image::CopyTicket::new(
+            Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            pb::change_count(),
+        );
+        assert!(crate::file_promise::publish_file_urls(
+            &[path],
+            &Arc::new(std::sync::atomic::AtomicI64::new(-1)),
+            &ticket,
+        ));
+        let outcome =
+            advertise_pasteboard_with_files(&backend.sender, true, &backend.own_writes(), || {
+                let entries = pb::read_files();
+                pb::write_string("new remote clipboard");
+                backend
+                    .remote_write_cc
+                    .store(pb::change_count(), std::sync::atomic::Ordering::Relaxed);
+                entries
+            });
+        assert_eq!(outcome, Advertised::NothingToSend);
+        assert!(rx.try_recv().is_err());
+        assert_eq!(pb::read_string().as_deref(), Some("new remote clipboard"));
     }
 }

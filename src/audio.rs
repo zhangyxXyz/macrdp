@@ -45,8 +45,8 @@ fn capture_is_current(generation: &AtomicU64, mine: u64) -> bool {
 
 /// First-use failure can be a TCC denial and must not trigger another prompt.
 /// After capture has started, route changes may temporarily make HAL unavailable.
-/// Limit reopen retries (250/500/1000/2000/4000ms), replenishing the budget only
-/// after receiving samples, not merely after another successful open.
+/// Open and read failures share five retries (250/500/1000/2000/4000ms). Only
+/// valid stereo samples replenish the budget, never a successful open alone.
 #[cfg(any(target_os = "macos", test))]
 #[derive(Default)]
 struct TapRecovery {
@@ -54,19 +54,38 @@ struct TapRecovery {
     reopen_failures: u32,
 }
 #[cfg(any(target_os = "macos", test))]
+#[derive(Debug, PartialEq, Eq)]
+enum TapRecoveryAction {
+    Cancelled,
+    Stop,
+    RetryAfter(u64),
+}
+#[cfg(any(target_os = "macos", test))]
 impl TapRecovery {
     fn opened(&mut self) {
         self.started = true;
     }
-    fn received_samples(&mut self) {
-        self.reopen_failures = 0;
+    fn received_samples(&mut self, left: &[f32], right: &[f32]) {
+        if !left.is_empty()
+            && left.len() == right.len()
+            && left.iter().chain(right).all(|sample| sample.is_finite())
+        {
+            self.reopen_failures = 0;
+        }
     }
-    fn retry_after_open_error(&mut self) -> Option<u64> {
+    fn retry_after_failure(&mut self, current: bool) -> TapRecoveryAction {
+        if !current {
+            return TapRecoveryAction::Cancelled;
+        }
         if !self.started {
-            return None;
+            return TapRecoveryAction::Stop;
         }
         self.reopen_failures = self.reopen_failures.saturating_add(1);
-        (self.reopen_failures <= 5).then(|| 250 << (self.reopen_failures - 1))
+        if self.reopen_failures <= 5 {
+            TapRecoveryAction::RetryAfter(250 << (self.reopen_failures - 1))
+        } else {
+            TapRecoveryAction::Stop
+        }
     }
 }
 
@@ -668,15 +687,20 @@ async fn capture_loop(
                 opened
             }
             Err(e) => {
+                if !capture_is_current(&generation, my_gen) {
+                    break 'reconnect;
+                }
                 consecutive_failures = consecutive_failures.saturating_add(1);
                 let backoff = if remote_only {
                     // No repeated first-use permission prompt, no audible SCK
                     // fallback, and no permanent silence on the first transient
                     // HAL error during an already-running session's route change.
-                    let Some(delay) = tap_recovery.retry_after_open_error() else {
-                        return Err(e);
-                    };
-                    delay
+                    match tap_recovery.retry_after_failure(capture_is_current(&generation, my_gen))
+                    {
+                        TapRecoveryAction::Cancelled => break 'reconnect,
+                        TapRecoveryAction::Stop => return Err(e),
+                        TapRecoveryAction::RetryAfter(delay) => delay,
+                    }
                 } else {
                     backoff_ms(consecutive_failures)
                 };
@@ -748,14 +772,42 @@ async fn capture_loop(
                     Err(_) => continue,
                     Ok(Ok(Some(sample))) => sample,
                     ended => {
-                        warn!(?ended, "audio source ended; rebuilding capture");
+                        let error = match ended {
+                            Ok(Err(error)) => error,
+                            _ => anyhow!("audio capture source ended"),
+                        };
                         stream.stop_capture();
                         drop(stream); // Release local muting BEFORE any backoff.
+                        if !capture_is_current(&generation, my_gen) {
+                            break 'reconnect;
+                        }
                         consecutive_failures = consecutive_failures.saturating_add(1);
-                        tokio::time::sleep(std::time::Duration::from_millis(backoff_ms(
-                            consecutive_failures,
-                        )))
-                        .await;
+                        let backoff = if remote_only {
+                            match tap_recovery
+                                .retry_after_failure(capture_is_current(&generation, my_gen))
+                            {
+                                TapRecoveryAction::Cancelled => break 'reconnect,
+                                TapRecoveryAction::Stop => {
+                                    return Err(
+                                        error.context("remote-only audio recovery exhausted")
+                                    );
+                                }
+                                TapRecoveryAction::RetryAfter(delay) => delay,
+                            }
+                        } else {
+                            backoff_ms(consecutive_failures)
+                        };
+                        update_status(my_gen, |s| {
+                            s.phase = "recovering";
+                            s.last_error = Some(error.to_string());
+                            s.peak = None;
+                        });
+                        warn!(
+                            attempt = consecutive_failures,
+                            backoff_ms = backoff,
+                            "audio source ended; rebuilding capture: {error}"
+                        );
+                        tokio::time::sleep(std::time::Duration::from_millis(backoff)).await;
                         continue 'reconnect;
                     }
                 };
@@ -764,8 +816,8 @@ async fn capture_loop(
             }
             consecutive_failures = 0;
             let (in_left, in_right) = sample;
-            if remote_only && !in_left.is_empty() {
-                tap_recovery.received_samples();
+            if remote_only {
+                tap_recovery.received_samples(&in_left, &in_right);
             }
             for value in in_left.iter().chain(&in_right) {
                 if value.is_finite() {
@@ -1103,26 +1155,104 @@ mod tests {
     #[test]
     fn initial_tap_permission_failure_is_never_retried() {
         let mut recovery = TapRecovery::default();
-        assert_eq!(recovery.retry_after_open_error(), None);
-        assert_eq!(recovery.retry_after_open_error(), None);
+        assert_eq!(recovery.retry_after_failure(true), TapRecoveryAction::Stop);
+        assert_eq!(recovery.retry_after_failure(true), TapRecoveryAction::Stop);
     }
 
     #[test]
     fn temporary_route_failure_retries_but_successful_open_alone_cannot_extend_budget() {
         let mut recovery = TapRecovery::default();
         recovery.opened();
-        recovery.received_samples();
+        recovery.received_samples(&[0.25], &[-0.25]);
         for expected_delay in [250, 500, 1000, 2000, 4000] {
-            assert_eq!(recovery.retry_after_open_error(), Some(expected_delay));
+            assert_eq!(
+                recovery.retry_after_failure(true),
+                TapRecoveryAction::RetryAfter(expected_delay)
+            );
             // A new tap may open but fail before producing any samples.
             recovery.opened();
         }
-        assert_eq!(recovery.retry_after_open_error(), None);
-        assert_eq!(recovery.retry_after_open_error(), None);
-        recovery.received_samples();
-        // Once recovery is actually working, a later device switch gets its
-        // own bounded budget rather than inheriting the earlier outage.
-        assert_eq!(recovery.retry_after_open_error(), Some(250));
+        assert_eq!(recovery.retry_after_failure(true), TapRecoveryAction::Stop);
+        assert_eq!(recovery.retry_after_failure(true), TapRecoveryAction::Stop);
+        // Genuine silence is valid audio. Once recovery is actually working, a
+        // later device switch gets its own budget instead of inheriting the outage.
+        recovery.received_samples(&[0.0], &[0.0]);
+        assert_eq!(
+            recovery.retry_after_failure(true),
+            TapRecoveryAction::RetryAfter(250)
+        );
+    }
+
+    #[test]
+    fn successful_open_followed_by_read_failure_cannot_retry_forever() {
+        let mut recovery = TapRecovery::default();
+        for delay in [250, 500, 1000, 2000, 4000] {
+            recovery.opened(); // HAL start succeeds, but each read rejects its layout.
+            assert_eq!(
+                recovery.retry_after_failure(true),
+                TapRecoveryAction::RetryAfter(delay)
+            );
+        }
+        recovery.opened();
+        assert_eq!(recovery.retry_after_failure(true), TapRecoveryAction::Stop);
+    }
+
+    #[test]
+    fn tap_open_and_read_errors_share_budget_until_valid_samples_arrive() {
+        let mut recovery = TapRecovery::default();
+        recovery.opened();
+        assert_eq!(
+            recovery.retry_after_failure(true),
+            TapRecoveryAction::RetryAfter(250)
+        ); // read
+        assert_eq!(
+            recovery.retry_after_failure(true),
+            TapRecoveryAction::RetryAfter(500)
+        ); // open
+        recovery.opened();
+        for (left, right) in [
+            (&[][..], &[][..]),
+            (&[0.0][..], &[][..]),
+            (&[f32::NAN][..], &[0.0][..]),
+        ] {
+            recovery.received_samples(left, right);
+        }
+        assert_eq!(
+            recovery.retry_after_failure(true),
+            TapRecoveryAction::RetryAfter(1000)
+        );
+        recovery.opened();
+        recovery.received_samples(&[0.0, 0.25], &[0.0, -0.25]);
+        assert_eq!(
+            recovery.retry_after_failure(true),
+            TapRecoveryAction::RetryAfter(250)
+        );
+    }
+
+    #[test]
+    fn retired_tap_does_not_consume_recovery_budget() {
+        let mut recovery = TapRecovery::default();
+        assert_eq!(
+            recovery.retry_after_failure(false),
+            TapRecoveryAction::Cancelled
+        );
+        recovery.opened();
+        assert_eq!(
+            recovery.retry_after_failure(false),
+            TapRecoveryAction::Cancelled
+        );
+        assert_eq!(
+            recovery.retry_after_failure(true),
+            TapRecoveryAction::RetryAfter(250)
+        );
+        assert_eq!(
+            recovery.retry_after_failure(false),
+            TapRecoveryAction::Cancelled
+        );
+        assert_eq!(
+            recovery.retry_after_failure(true),
+            TapRecoveryAction::RetryAfter(500)
+        );
     }
 
     #[cfg(target_os = "macos")]

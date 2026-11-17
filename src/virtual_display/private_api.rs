@@ -34,7 +34,10 @@
 use std::ffi::{c_void, CString};
 
 use anyhow::{anyhow, Result};
-use core_foundation::base::{CFRelease, CFTypeRef, TCFType};
+use core_foundation::base::{CFRelease, CFType, CFTypeRef, TCFType};
+use core_foundation::boolean::CFBoolean;
+use core_foundation::dictionary::{CFDictionary, CFDictionaryRef};
+use core_foundation::number::CFNumber;
 use core_foundation::string::CFString;
 use objc2::msg_send;
 use objc2::runtime::{AnyClass, AnyObject};
@@ -42,17 +45,14 @@ use objc2_foundation::{CGSize, NSString};
 
 type CGDirectDisplayID = u32;
 
-extern "C" {
-    fn CFDictionaryGetValue(dict: CFTypeRef, key: CFTypeRef) -> CFTypeRef;
-    fn CFBooleanGetValue(boolean: CFTypeRef) -> u8;
-}
-
 /// `CGSessionCopyCurrentDictionary()` — undocumented CoreGraphics/SkyLight
 /// symbol, the same "CGS" private-API family as `CGSConfigureDisplayEnabled`
 /// above. Returns a dictionary describing the current login-session state;
 /// the also-undocumented `CGSSessionScreenIsLocked` key reads `1` while the
-/// screen is locked. Used only as a READ gate before the reconnect-time
-/// auto-unlock attempt in main.rs.
+/// lock screen or screen saver is active. This alone does not establish that
+/// a password is required: the screen-saver grace period may still be running.
+/// Retained as the READ gate for the reconnect-time auto-unlock attempt;
+/// disconnect lock confirmation uses `screen_authentication_is_required`.
 ///
 /// Returns `None` when the lookup itself couldn't be completed (missing
 /// symbol, or a null dictionary) — genuinely "unknown," not "not locked."
@@ -73,6 +73,10 @@ extern "C" {
 /// mechanism with a longer track record, not a drop-in replacement for this
 /// function's shape.
 pub(super) fn screen_is_locked() -> Option<bool> {
+    screen_flag(&copy_session_dictionary()?)
+}
+
+fn copy_session_dictionary() -> Option<CFDictionary<CFString, CFType>> {
     unsafe {
         let rtld_default = -2isize as *mut c_void;
         let name = CString::new("CGSessionCopyCurrentDictionary").unwrap();
@@ -80,19 +84,48 @@ pub(super) fn screen_is_locked() -> Option<bool> {
         if sym.is_null() {
             return None;
         }
-        let copy_dict: unsafe extern "C" fn() -> CFTypeRef = std::mem::transmute(sym);
+        let copy_dict: unsafe extern "C" fn() -> CFDictionaryRef = std::mem::transmute(sym);
         let dict = copy_dict();
         if dict.is_null() {
             return None;
         }
-        // CGSessionCopyCurrentDictionary follows the Copy naming convention
-        // (+1 owned reference) — release it once we're done reading it.
-        let key = CFString::new("CGSSessionScreenIsLocked");
-        let value = CFDictionaryGetValue(dict, key.as_concrete_TypeRef() as CFTypeRef);
-        let locked = !value.is_null() && CFBooleanGetValue(value) != 0;
-        CFRelease(dict);
-        Some(locked)
+        // The dictionary follows the CF Copy rule. Typed access checks the
+        // values before interpreting them; a changed private shape is unknown.
+        Some(CFDictionary::wrap_under_create_rule(dict))
     }
+}
+
+fn screen_flag(session: &CFDictionary<CFString, CFType>) -> Option<bool> {
+    match session.find(CFString::new("CGSSessionScreenIsLocked")) {
+        Some(value) => value.downcast::<CFBoolean>().map(bool::from),
+        // loginwindow omits this flag for an unlocked desktop.
+        None => Some(false),
+    }
+}
+
+/// Separate the screen-saver flag from an authentication-required lock.
+/// Primary-source implementation and time boundary:
+/// https://github.com/openai/codex/blob/main/codex-rs/tui/src/session_lock/macos.rs
+/// Both keys are private. A missing/malformed deadline while the flag is true
+/// remains unknown, so callers cannot claim that a password is required.
+pub(super) fn screen_authentication_is_required() -> Option<bool> {
+    let session = copy_session_dictionary()?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_secs();
+    authentication_required(&session, i64::try_from(now).ok()?)
+}
+
+fn authentication_required(session: &CFDictionary<CFString, CFType>, now: i64) -> Option<bool> {
+    if !screen_flag(session)? {
+        return Some(false);
+    }
+    let deadline = session
+        .find(CFString::new("CGSSessionScreenLockedTime"))?
+        .downcast::<CFNumber>()?
+        .to_i64()?;
+    Some((1..=now).contains(&deadline))
 }
 
 /// `CGSConfigureDisplayEnabled(config, display, enabled)` — undocumented
@@ -466,5 +499,67 @@ pub(super) fn create(
             raw: display,
             display_id,
         })
+    }
+}
+
+#[cfg(test)]
+mod lock_state_tests {
+    use super::*;
+
+    fn session(flag: Option<CFType>, deadline: Option<CFType>) -> CFDictionary<CFString, CFType> {
+        let mut fields = Vec::new();
+        if let Some(flag) = flag {
+            fields.push((CFString::new("CGSSessionScreenIsLocked"), flag));
+        }
+        if let Some(deadline) = deadline {
+            fields.push((CFString::new("CGSSessionScreenLockedTime"), deadline));
+        }
+        CFDictionary::from_CFType_pairs(&fields)
+    }
+
+    #[test]
+    fn screen_saver_grace_does_not_count_as_an_authenticated_lock() {
+        let deadline = 1_794_900_000_i64;
+        let session = session(
+            Some(CFBoolean::true_value().as_CFType()),
+            Some(CFNumber::from(deadline).as_CFType()),
+        );
+        // Auto-unlock still sees an active lock UI during the grace period.
+        assert_eq!(screen_flag(&session), Some(true));
+        assert_eq!(authentication_required(&session, deadline - 1), Some(false));
+        assert_eq!(authentication_required(&session, deadline), Some(true));
+        assert_eq!(authentication_required(&session, deadline + 1), Some(true));
+    }
+
+    #[test]
+    fn an_inactive_screen_flag_never_confirms_a_password_lock() {
+        for flag in [None, Some(CFBoolean::false_value().as_CFType())] {
+            let session = session(flag, Some(CFNumber::from(1_i64).as_CFType()));
+            assert_eq!(screen_flag(&session), Some(false));
+            assert_eq!(authentication_required(&session, 10), Some(false));
+        }
+    }
+
+    #[test]
+    fn missing_or_changed_private_values_remain_unknown() {
+        for deadline in [None, Some(CFString::new("not a timestamp").as_CFType())] {
+            let session = session(Some(CFBoolean::true_value().as_CFType()), deadline);
+            assert_eq!(screen_flag(&session), Some(true));
+            assert_eq!(authentication_required(&session, 10), None);
+        }
+        let session = session(Some(CFNumber::from(1_i64).as_CFType()), None);
+        assert_eq!(screen_flag(&session), None);
+        assert_eq!(authentication_required(&session, 10), None);
+    }
+
+    #[test]
+    fn zero_or_negative_deadline_does_not_require_authentication() {
+        for deadline in [0_i64, -1] {
+            let session = session(
+                Some(CFBoolean::true_value().as_CFType()),
+                Some(CFNumber::from(deadline).as_CFType()),
+            );
+            assert_eq!(authentication_required(&session, 10), Some(false));
+        }
     }
 }
