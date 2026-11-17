@@ -4,6 +4,14 @@ What each release delivered, newest first. (This is the narrative version —
 see the [GitHub releases](https://github.com/clintcan/macrdp/releases) for
 tags, dates, and downloadable artifacts.)
 
+## Fork v0.10.8 — dependency security and clipboard staging
+
+The fork adopts patched zlib and stable RSA, removes the RSA audit exception,
+and includes upstream Picky fixes and atomic clipboard staging. See the
+[bilingual changelog](../CHANGELOG.md#v0108) for the exact changes and
+[review record](release-review-2026-11-17.md#stable-rsa-follow-up--rsa-稳定版跟进)
+for the validation of the fixes.
+
 ## v0.10.6 — no restart loop on a wrong password, a HiDPI virtual display, Windows 10 mstsc pictures
 
 A wrong password at setup no longer sends the server into a restart loop, a virtual display can now be a Retina-style 2× display, and Windows 10 mstsc shows a picture. New options are off unless you turn them on.

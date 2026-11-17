@@ -31,12 +31,16 @@ has no effect without H.264. The sync also includes #268's late-S_OK lossy-audio
 regression test and records #230's already-integrated startup fix in the merge
 history. Existing fork lock/display/clipboard policies remain in place.
 
-## Current development release
+## Current release
 
-Upstream Windows 10 mstsc black-screen fix [#228](https://github.com/clintcan/macrdp/pull/228)
-is included in the same-version `v0.10.6-dev` rebuild. The version stays `0.10.6`;
-use `SOURCE_COMMIT` in the download to distinguish builds. Win10 client rendering
-requires a post-update manual check; upstream's frozen-start fix #230 is included. See [changes](CHANGELOG.md#v0106-dev).
+**Latest: `v0.10.8`.** Subsequent builds keep this application version and
+release tag. The package's `SOURCE_COMMIT` identifies the build.
+See the [changelog](CHANGELOG.md#v0108) for the security and clipboard fixes.
+
+Recent releases:
+
+- `v0.10.6-dev` included upstream Windows 10 mstsc display fixes #228 and #230.
+  The update still needs a Windows 10 client retest.
 
 ## This same-version rebuild
 
@@ -53,9 +57,7 @@ source references, completed tests and remaining manual checks.
 The subsequent dependency-security source update selects `libz-sys 1.1.33`
 and official stable `rsa 0.10.0`, removing the old RSA advisory exception.
 Three narrow [authentication adapters](vendor/AUTH-SECURITY.md) preserve the
-current protocol stack while replacing exact prerelease pins. This source update
-has not replaced the installed `3bea2b7` release. Stable RSA rejects public keys
-below 1024 bits; weak-key compatibility is not restored.
+current protocol stack while replacing exact prerelease pins. Stable RSA rejects public keys below 1024 bits.
 Dependency regression tests also caught an upstream EC coordinate-padding bug;
 its fix and upstream JWE error masking are backported. Clipboard fallback staging
 now uses atomic private directories to avoid concurrent timestamp collisions.
@@ -398,7 +400,7 @@ readiness after accept was about 0.73–0.75 seconds on reconnect; this does not
 measure client-visible first-frame latency. Physical-screen transitions still
 took about 10.5 seconds. A 60 Hz mode / 60 fps target is not a sustained-fps guarantee.
 
-For this `v0.10.6-dev` rebuild: 491 Rust tests passed, 8 ignored; strict Clippy,
+During the earlier `v0.10.6-dev` rebuild: 491 Rust tests passed, 8 ignored; strict Clippy,
 10 Foundation configuration checks and 33 configuration CLI process checks passed.
 The native audio-buffer checks passed with AddressSanitizer/UndefinedBehaviorSanitizer. Hardware behavior,
 permissions, and actual client rendering still require manual validation.
@@ -409,7 +411,7 @@ This fork makes no additional soak-test or production-readiness claim.
 ## Actions and maintenance
 
 - `ci.yml`: the reusable regression gate for Linux/macOS tests, strict Clippy, configuration, native adapters, release scripts and audit integration. All macOS checks share one runner; Linux checks run alongside them. It also runs on branch changes/PRs and can be started manually.
-- `release.yml`: only `v*` tag pushes trigger `build/package → draft upload/download verification → publish → cleanup`. CI remains independent and is not a blocking release dependency; run the required review/regressions before tagging. The tagged commit must belong to `dev`. Both apps, source metadata and checksum go directly to a draft Release; there are no intermediate Actions Artifacts. Tags containing `-` are prereleases (for example `v0.10.6-dev`).
+- `release.yml`: only `v*` tag pushes trigger `build/package → draft upload/download verification → publish → cleanup`. CI remains independent and is not a blocking release dependency; run the required review/regressions before tagging. The tagged commit must belong to `dev` and its tag must match the application version, currently `v0.10.8`. Both apps, source metadata and checksum go directly to a draft Release; there are no intermediate Actions Artifacts.
 - `build-check.yml`: manual-only `checks → build/package verification`, without publishing or uploading artifacts. Ordinary dev pushes do not run a packaging job.
 - Same-tag rebuilds use a separate `staging-<tag>-<source>` draft and stable Release/asset IDs. The current download remains available until the replacement passes round-trip verification and ownership checks. Publication replaces only the owned Release, preserving that version tag. GitHub has no atomic Release swap: a final publish failure leaves the verified draft for retry. Tag/source checks reject obsolete runs. Re-run a failed workflow to resume its owned draft.
 - Native jobs default to Apple Silicon `macos-26`. `MACOS_RUNNER` can select another supported macOS runner; `macos-26-intel` is a capacity fallback. Intel runs host regressions plus ARM64 Clippy/compilation; packaging explicitly targets ARM64 for every component and verifies architecture, source identity and nested signatures. Intel cannot execute the packaged ARM64 binary: `BUILD_INFO.json` records the host and the same-source host executable that produced static capabilities. Actual ARM64 execution remains a separate check. Workflow names consistently use lowercase.

@@ -3,6 +3,15 @@
 Only implemented behavior and completed checks are recorded here. Client-side manual checks are identified separately.
 这里只记录已实现的行为和已完成的检查；客户端实测另行注明。
 
+## v0.10.8
+
+- Adopt `libz-sys 1.1.33` for RUSTSEC-2026-0544 and official stable `rsa 0.10.0` for RUSTSEC-2023-0071. Remove the RSA audit exception and scan the independent server, acceptor, RDPEUDP and IFD dependency trees alongside the main application.
+- Backport Picky's EC key coordinate fix [#557](https://github.com/Devolutions/picky-rs/pull/557) and JWE decryption error handling [#563](https://github.com/Devolutions/picky-rs/pull/563). Create private clipboard staging directories atomically to prevent concurrent filename collisions.
+- Test the authentication adapters in CI and verify correct and incorrect passwords separately with FreeRDP. The application and release tag stay at `0.10.8` / `v0.10.8` for subsequent rebuilds. Use the packaged `SOURCE_COMMIT` to identify a particular build.
+- 升级到 `libz-sys 1.1.33` 和官方稳定 `rsa 0.10.0`，修复对应安全公告并移除 RSA 审计例外。审计覆盖主程序及独立 server、acceptor、RDPEUDP、IFD。
+- 回移 Picky 的 EC 坐标修复 #557 和 JWE 解密错误处理 #563。剪贴板私有暂存目录改为原子创建，避免并发撞名。
+- CI 增加认证依赖回归，FreeRDP 分别核对正确密码通过和错误密码拒绝。后续重构建沿用应用版本 `0.10.8` 和标签 `v0.10.8`，以安装包的 `SOURCE_COMMIT` 区分。
+
 ## v0.10.6-dev
 
 ### 2026-11-18 dependency audit / 依赖安全检查
