@@ -24,6 +24,8 @@ on:
       - 'Cargo.lock'
       - 'vendor/**/Cargo.toml'
       - 'vendor/**/Cargo.lock'
+      - 'ifd-handler/Cargo.toml'
+      - 'ifd-handler/Cargo.lock'
       - 'deny.toml'
       - '.github/workflows/security.yml'
   pull_request:
@@ -32,6 +34,8 @@ on:
       - 'Cargo.lock'
       - 'vendor/**/Cargo.toml'
       - 'vendor/**/Cargo.lock'
+      - 'ifd-handler/Cargo.toml'
+      - 'ifd-handler/Cargo.lock'
       - 'deny.toml'
       - '.github/workflows/security.yml'
   schedule:
@@ -89,6 +93,7 @@ jobs:
         uses: actions-rust-lang/setup-rust-toolchain@46268bd060767258de96ed93c1251119784f2ab6 # v1.16.1
         with:
           toolchain: '1.95.0'
+          cache: false
 
       # No rust-cache here on purpose: it wouldn't cache the `cargo install`
       # (that lands in ~/.cargo/bin), only the registry, so the payoff is tiny —
@@ -107,10 +112,10 @@ jobs:
         run: cargo install cargo-deny --version '=0.19.9' --locked
 
       # Root scan: the macrdp package resolves the vendored ironrdp-* forks and
-      # every transitive dep through [patch.crates-io] path deps, so this one
-      # Cargo.lock covers the whole shipped tree.
+      # their transitive dependencies through its top-level patches. Standalone
+      # builds do not inherit those patches or this lockfile; scan them below.
       - name: cargo-deny — root tree
-        run: cargo deny check advisories bans sources
+        run: cargo deny --locked check advisories bans sources
 
       # vendor/macrdp-rdpeudp is a STANDALONE crate (its own Cargo.lock, not a
       # workspace member — see ci.yml). Scan it separately against the same
@@ -120,4 +125,27 @@ jobs:
         run: >
           cargo deny
           --manifest-path vendor/macrdp-rdpeudp/Cargo.toml
+          check --config deny.toml advisories bans sources
+
+      # The separate CI unit-test build resolves its own authentication stack.
+      # A clean root audit must not conceal an old RSA selected here.
+      - name: cargo-deny — standalone ironrdp-server
+        run: >
+          cargo deny
+          --manifest-path vendor/ironrdp-server/Cargo.toml
+          check --config deny.toml advisories bans sources
+
+      - name: cargo-deny — standalone ironrdp-acceptor
+        run: >
+          cargo deny
+          --manifest-path vendor/ironrdp-acceptor/Cargo.toml
+          check --config deny.toml advisories bans sources
+
+      # This separately packaged cdylib is currently std-only. Keep its own
+      # manifest in the scan so a future dependency is not silently omitted.
+      - name: cargo-deny — standalone ifd-handler
+        run: >
+          cargo deny
+          --manifest-path ifd-handler/Cargo.toml
+          --locked
           check --config deny.toml advisories bans sources

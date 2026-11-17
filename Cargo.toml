@@ -110,6 +110,12 @@ screencapturekit = { version = "2.1", features = ["async"] }
 # wave-drop PR merges, drop the vendor block and add `ironrdp-server` to the
 # git pin list below.
 [patch.crates-io]
+# Keep the existing auth stack API while adapting its exact prerelease pins to
+# patched stable RSA. See vendor/AUTH-SECURITY.md; all standalone roots must use
+# the same three adapters. The RSA implementation itself remains from crates.io.
+picky = { path = "vendor/picky" }
+sspi = { path = "vendor/sspi" }
+winscard = { path = "vendor/winscard" }
 ironrdp-server = { path = "vendor/ironrdp-server" }
 # ironrdp-acceptor is vendored (same upstream rev as the git pins below) for two
 # additions: the client fingerprint on AcceptorResult, and choosing which UDP

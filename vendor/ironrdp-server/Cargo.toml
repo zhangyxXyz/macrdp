@@ -109,6 +109,9 @@ tokio = { version = "1", features = ["sync"] }
 # the same rev, + the two-sided ironrdp-dvc patch (the git crates depend on it within
 # the IronRDP workspace). Keep the rev in sync with the root.
 [patch.crates-io]
+picky = { path = "../picky" }
+sspi = { path = "../sspi" }
+winscard = { path = "../winscard" }
 ironrdp-acceptor       = { path = "../ironrdp-acceptor" }
 ironrdp-rdpdr          = { path = "../ironrdp-rdpdr" }
 ironrdp-dvc            = { path = "../ironrdp-dvc" }

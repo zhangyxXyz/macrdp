@@ -269,3 +269,9 @@ carries that guard. Enqueue-time liveness alone cannot prevent old events reachi
 a new connection after disconnect. File advertisements dispatch the descriptor
 array and its immutable OS snapshot together with `initiate_file_copy_with_snapshot`.
 中文：文件请求及租约释放都在消费时再次校验会话，公告同步安装原子文件路径快照。
+
+Dependency security follow-up (2026-11-18): the standalone manifest mirrors the
+root's picky/sspi/winscard path adapters for stable RSA. Their registry versions
+pin the affected RSA prerelease exactly; updating only the root lockfile would
+leave standalone resolution behind. See `../AUTH-SECURITY.md`. No protocol code
+is changed by this manifest adjustment.

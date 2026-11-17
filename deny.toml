@@ -31,29 +31,11 @@ yanked = "deny"
 # review, not by blocking unrelated work. Flip to "all" if you want the
 # maintenance signal to gate too.
 unmaintained = "none"
-# Suppress a specific advisory ONLY with a written justification here covering
-# the upgrade constraints, assessed exposure, and conditions for removing it.
-# Format: "RUSTSEC-XXXX-NNNN". cargo-deny still prints an ignored advisory as a
-# note, so it stays visible; ignoring keeps the daily gate GREEN so it still
-# fires on every OTHER (new) advisory instead of being permanently red on a
-# known-and-triaged one. Re-review these whenever the IronRDP pin is bumped.
-ignore = [
-  # RUSTSEC-2023-0071 — "Marvin Attack": potential RSA private-key recovery
-  # through timing sidechannels. Reviewed 2026-11-18: upstream released the
-  # fixed stable rsa 0.10.0 on 2026-11-08; RustSec lists patched >=0.10.0.
-  # https://rustsec.org/advisories/RUSTSEC-2023-0071.html
-  # Our picky 7.0.0-rc.25, sspi 0.21.3 and winscard 0.3.3 each require exactly
-  # rsa =0.10.0-rc.18. That prerelease does not meet the patched range, and a
-  # lockfile-only rsa update cannot satisfy those pins. Temporarily retain this
-  # exception pending a coordinated dependency upgrade and auth regression tests.
-  # The inspected server path uses CredSSP/NTLM, with TLS handled by rustls;
-  # no reachable rsa-crate private-key decryption was identified on that path.
-  # This is an exposure assessment, not proof of non-exploitability across all
-  # auth/smart-card paths. VPN/trusted-LAN access limits exposure but does not
-  # prevent a reachable peer from measuring timing. Revisit on each auth-stack
-  # or IronRDP update; remove this exception once the resolved rsa is patched.
-  "RUSTSEC-2023-0071",
-]
+# No accepted advisory exceptions. Stable RSA 0.10.0 replaces the old
+# RUSTSEC-2023-0071 exception via narrow auth-stack adapters; see
+# vendor/AUTH-SECURITY.md. Do not reintroduce that ignore to hide a resolver
+# regression. Any future exception needs an explicit, current justification.
+ignore = []
 
 [bans]
 # Duplicate versions are normal in a large Rust tree — surface them but don't

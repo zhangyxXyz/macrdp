@@ -50,6 +50,16 @@ the new process; newly installed LaunchAgents allow 60 seconds for cleanup.
 See the [review and verification record](docs/release-review-2026-11-17.md) for
 source references, completed tests and remaining manual checks.
 
+The subsequent dependency-security source update selects `libz-sys 1.1.33`
+and official stable `rsa 0.10.0`, removing the old RSA advisory exception.
+Three narrow [authentication adapters](vendor/AUTH-SECURITY.md) preserve the
+current protocol stack while replacing exact prerelease pins. This source update
+has not replaced the installed `3bea2b7` release. Stable RSA rejects public keys
+below 1024 bits; weak-key compatibility is not restored.
+Dependency regression tests also caught an upstream EC coordinate-padding bug;
+its fix and upstream JWE error masking are backported. Clipboard fallback staging
+now uses atomic private directories to avoid concurrent timestamp collisions.
+
 On 2026-11-18, the user confirmed Directory Opus file copying and normal screen
 locking/unlocking with the installed build from `3bea2b7`. This covers those tested
 paths; monitor-free operation, rapid reconnect/resize and relocking after abandoned

@@ -7,8 +7,15 @@ Only implemented behavior and completed checks are recorded here. Client-side ma
 
 ### 2026-11-18 dependency audit / 依赖安全检查
 
-- Update the development lockfile from `libz-sys 1.1.31` to `1.1.33` for RUSTSEC-2026-0544, which failed the scheduled `security` workflow. No other dependency versions or application settings change. Local root/standalone audits passed under the existing policy; native Rust tests: 528 passed, 8 ignored. This source update has not replaced the installed release.
-- 定时 `security` 检查发现 RUSTSEC-2026-0544，将开发分支锁定的 `libz-sys` 从 `1.1.31` 更新为 `1.1.33`；其他依赖版本及应用设置不变。根依赖树／独立库在现有策略下审计通过，原生 Rust 测试 528 通过、8 跳过。这次源码更新尚未替换已安装版本。
+- Follow up with official stable `rsa 0.10.0` and remove the RUSTSEC-2023-0071 ignore. Vendor narrow picky/sspi/winscard compatibility adapters because even their current published versions pin the prerelease; keep IronRDP unchanged. Use OS randomness to blind raw PIV private-key operations and retain stable RSA's 1024-bit public-key minimum. Expand independent dependency audits and distinguish successful/failed FreeRDP authentication per connection.
+- 后续采用官方稳定 `rsa 0.10.0`，移除 RUSTSEC-2023-0071 忽略项。上层已发布版本仍精确绑定候选版，因此增加 picky／sspi／winscard 的小范围本地兼容适配，IronRDP 不变。PIV 私钥运算使用系统随机源盲化，保留稳定 RSA 的 1024 位公钥下限；补齐独立依赖审计，FreeRDP 冒烟按连接分别验证正确／错误密码。
+- Backport Picky upstream [#557](https://github.com/Devolutions/picky-rs/pull/557) for leading-zero EC key coordinates, caught by the integrated dependency tests, and [#563](https://github.com/Devolutions/picky-rs/pull/563) for uniform RSA JWE decryption failure handling. These library fixes do not establish that a JWE attack was reachable through macrdp.
+- 回移 Picky 上游 [#557](https://github.com/Devolutions/picky-rs/pull/557) 的 EC 密钥前导零修复（集成依赖测试发现），以及 [#563](https://github.com/Devolutions/picky-rs/pull/563) 的 RSA JWE 解密失败统一处理。这些依赖库修复不等于已证明 macrdp 存在可达的 JWE 攻击路径。
+- Fix a staging-directory collision found by the full macOS suite: replace PID-plus-time naming with atomic private `mkdtemp` creation. Keep the existing owner-PID cleanup policy and add concurrent creation, permission and read/write coverage.
+- macOS 全量回归发现文件暂存目录撞名；改用原子私有 `mkdtemp` 创建，保留按所属 PID 清理的规则，并增加并发、权限和读写回归。
+
+- The first fix (`fcaeb63`) updated only `libz-sys 1.1.31 → 1.1.33` for RUSTSEC-2026-0544, which failed the scheduled `security` workflow. Its local root/standalone audits and subsequent security workflow passed under the then-existing policy; native Rust tests: 528 passed, 8 ignored. Application settings and the installed release remain unchanged by these source updates.
+- 第一阶段 `fcaeb63` 仅将 `libz-sys 1.1.31 → 1.1.33`，修正定时 `security` 发现的 RUSTSEC-2026-0544；当时策略下的本地根依赖树／独立库审计及后续云端 security 通过，原生 Rust 测试 528 通过、8 跳过。这些源码更新未更改应用设置或已安装版本。
 
 ### 2026-11-18 installed-build feedback / 安装版实测反馈
 

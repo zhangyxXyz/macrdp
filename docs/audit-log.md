@@ -233,8 +233,19 @@ path end-to-end with no real password and no GUI: it starts a loopback macrdp
 (`--skip-auth` against a throwaway credential), drives one correct- and one
 wrong-password `sdl-freerdp +auth-only` connection, and asserts the JSON audit
 stream recorded `auth` `success` / `did_not_complete` (with a clean `reason`) plus
-the `accept`/`disconnect` correlation. Needs `sdl-freerdp` (`brew install
-freerdp`); exit 0 = pass.
+the `accept`/`disconnect` correlation **within each attempt**. The correct-password
+client must report `ERRBASE_SUCCESS` and exit with code 0 or 1:
+[FreeRDP SDL 3.33.1](https://github.com/FreeRDP/FreeRDP/blob/3.33.1/client/SDL/SDL3/sdl_freerdp.cpp#L753-L761)
+can return 1 from its outer event loop even when its authentication thread succeeds.
+The wrong-password client must report `ERRCONNECT_AUTHENTICATION_FAILED`, exit
+with code 132, and have no client or server authentication success. Both verdicts
+must agree with the corresponding server audit events; exit codes alone do not
+establish authentication success or failure. A client timeout, signal termination or
+missing audit event fails the test. Listener readiness uses `lsof` without making
+extra connections. Needs `sdl-freerdp` (`brew install freerdp`), Python 3 and `lsof`
+(included with macOS); exit 0 = pass. This checks TLS/CredSSP/NTLM interoperability
+with throwaway credentials; it does not exercise macOS account validation, the
+desktop, clipboard channels or File Provider materialization.
 
 ## See also
 - [`siem-forwarding.md`](siem-forwarding.md) — forwarding the JSON stream to a SIEM (Vector / Fluent Bit / rsyslog).

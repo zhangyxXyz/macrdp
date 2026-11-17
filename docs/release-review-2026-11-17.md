@@ -65,7 +65,7 @@ failed its dependency audit because the lockfile selected `libz-sys 1.1.31`, whi
 matches [RUSTSEC-2026-0544](https://rustsec.org/advisories/RUSTSEC-2026-0544.html)
 (CVE-2026-85091). The advisory describes a heap overflow in zlib 1.3.1.2–1.3.2
 when a stalled non-blocking `gzwrite()` is followed by `gzprintf()`/`gzvprintf()`;
-it lists `libz-sys >= 1.1.33` as patched. The lockfile now selects `1.1.33` without
+it lists `libz-sys >= 1.1.33` as patched. The first fix, `fcaeb63`, selected `1.1.33` without
 changing other dependency versions or adding an advisory exception. Local
 `cargo-deny 0.19.9` checks of the root and standalone RDPEUDP trees passed under
 the existing policy; the native Rust suite passed **528 tests, with 8 ignored**.
@@ -76,7 +76,7 @@ These checks do not publish a release or replace the installed `3bea2b7` build.
 [RUSTSEC-2026-0544](https://rustsec.org/advisories/RUSTSEC-2026-0544.html)
 （CVE-2026-85091）而未通过依赖审计。公告描述 zlib 1.3.1.2–1.3.2 中，非阻塞
 `gzwrite()` 写入停滞后调用 `gzprintf()`／`gzvprintf()` 可导致堆溢出；修复版本为
-`libz-sys >= 1.1.33`。锁文件已更新为 `1.1.33`，未变更其他依赖版本，也未新增漏洞
+`libz-sys >= 1.1.33`。第一阶段 `fcaeb63` 更新为 `1.1.33`，未变更其他依赖版本，也未新增漏洞
 忽略项。本地 `cargo-deny 0.19.9` 在现有策略下对根依赖树及独立 RDPEUDP 库的检查均
 通过；原生 Rust 测试 **528 通过、8 跳过**。这些检查不会发布或替换本机 `3bea2b7`。
 
@@ -90,20 +90,65 @@ of other vulnerabilities. Other build targets must not inherit this local conclu
 调用。这两项证据不符合本次公告列出的受影响版本及调用路径，但不会令锁文件审计自动
 通过，也不代表应用或系统 zlib 没有其他漏洞；其他构建目标不能直接套用本机结论。
 
-The existing RUSTSEC-2023-0071 exception remains separate: RustSec now lists
-stable `rsa >= 0.10.0` as patched, while the current picky/sspi/winscard versions
-pin `=0.10.0-rc.18`. The outdated "no fix exists" justification in `deny.toml`
-was corrected. Removing this exception needs a coordinated authentication-stack
-upgrade and regression checks; a passing policy scan is not a claim of zero
-advisories. A diagnostic scan with only this exception removed failed on
-RUSTSEC-2023-0071, confirming the retained exception is active in the root tree.
-No reachable rsa-crate private-key decryption was identified in the
-inspected CredSSP/NTLM server path; other authentication/smart-card paths are not
-proven safe by that observation.
+## Stable RSA follow-up / RSA 稳定版跟进
 
-现有 RUSTSEC-2023-0071 例外仍单独保留：RustSec 已列出稳定版 `rsa >= 0.10.0`
-为修复版本，而当前 picky／sspi／winscard 精确依赖 `=0.10.0-rc.18`。
-已修正 `deny.toml` 里“没有修复版”的过期说明；移除此例外需要协调认证依赖升级及回归，
-策略检查通过不等于零漏洞公告。仅临时移除此例外的诊断扫描确实因 RUSTSEC-2023-0071
-失败，确认根依赖树仍依赖此例外。已检查的 CredSSP／NTLM 服务端路径未发现可达的
-rsa crate 私钥解密调用，这不构成其他认证／智能卡路径安全的证明。
+The first fix retained the existing RUSTSEC-2023-0071 exception. A diagnostic
+scan with only that exception removed failed on `rsa 0.10.0-rc.18`, confirming
+it was still active. RustSec now lists stable `rsa >= 0.10.0` as patched, while
+picky/sspi/winscard published manifests still pin the prerelease exactly.
+
+At the user's request, the follow-up uses narrow local adapters for the existing
+authentication dependencies and official crates.io `rsa 0.10.0`. It removes the
+advisory exception, updates only the necessary companion crypto dependencies and
+keeps the IronRDP revision unchanged. Root and standalone server/acceptor resolve
+the same adapters. See [source provenance and maintenance](../vendor/AUTH-SECURITY.md).
+
+Private-key export adapts stable RSA's odd-prime types; raw PIV operations use OS
+randomness for blinding. Public-key parsing keeps the stable 1024-bit minimum,
+so weaker historical keys are now rejected. No custom RSA algorithm is added.
+The FreeRDP smoke now validates each client's exit status and its own complete
+audit lifecycle; a timeout, wrong-password success or incomplete phase fails.
+This remains a disposable-credential TLS/CredSSP/NTLM test, not system PAM, a
+trusted certificate-chain check or a real Windows desktop session.
+
+第一阶段保留了已有 RSA 例外；仅临时去掉它的诊断扫描确实命中 `rsa 0.10.0-rc.18`。
+按用户后续要求，对精确绑定候选版的认证依赖做小范围本地适配，采用官方 `rsa 0.10.0`，
+移除漏洞忽略项，仅升级必要的配套密码学依赖，IronRDP 保持不变。根目录和独立
+server／acceptor 采用同组补丁，来源、偏差和退出条件见[维护记录](../vendor/AUTH-SECURITY.md)。
+
+适配包括私钥导出的奇素数类型、PIV 运算的系统随机盲化；保留稳定 RSA 的 1024 位
+公钥下限，更弱的历史密钥将被拒绝。不新增自定义 RSA 算法。FreeRDP 冒烟按每次连接
+分别核对退出状态和完整审计，超时、错误密码成功或缺少事件均不能通过。它只验证
+临时凭证的 TLS／CredSSP／NTLM，不等同系统 PAM、受信任证书链或真实 Windows 桌面。
+
+The integrated dependency suite exposed an existing EC leading-zero defect,
+reproduced deterministically with an official P-521 fixture. Backport Picky
+[#557](https://github.com/Devolutions/picky-rs/commit/122303e05e692b083e01834805fe5fdab87cdac3)
+and the independent JWE error-masking fix
+[#563](https://github.com/Devolutions/picky-rs/commit/2e5b128850facd91ee8eb3994fe05f2883239faf).
+The inspected default server chain selects CredSSP/NTLM; no JWE call was found
+in macrdp, its connector/acceptor/server, SSPI or winscard. Library presence is
+not evidence of a remotely reachable JWE attack.
+
+A subsequent native-suite failure identified a separate clipboard staging
+collision: concurrent calls could share the same PID and timestamp. Replace
+that name allocation with system `mkdtemp`, retaining private `0700` permissions
+and the existing PID-based reaper. A new test keeps 256 concurrently created
+directories alive and checks uniqueness, permissions, read/write and PID parsing.
+
+集成依赖回归发现原有 EC 前导零缺陷，使用官方固定 P-521 样本稳定复现；已回移
+Picky #557 以及独立的 JWE 错误统一处理修复 #563。已检查的默认服务端链选择
+CredSSP／NTLM，macrdp、connector／acceptor／server、SSPI 和 winscard 中未发现
+JWE 调用；依赖存在不等同已证明可被远程调用攻击。
+
+原生全量回归还发现剪贴板暂存目录的 PID＋时间戳并发撞名；改用系统 `mkdtemp`
+原子创建，保留 `0700` 私有权限及 PID 清理。新增回归让 256 个并发创建的目录同时
+存活，核对唯一性、权限、读写及 PID 解析。
+
+Final local checks / 最终本地检查：
+
+- Main native Rust suite: **529 passed, 8 intentionally ignored**; strict all-target Clippy and formatting passed. / 主程序原生测试 **529 通过、8 按设计跳过**，严格 Clippy 与格式通过。
+- Picky default: **173 passed, 3 upstream ignored**; Picky with SSH/PuTTY: **261 passed, 3 upstream ignored**; winscard simulated card/signing: **16 passed**. These suites overlap and must not be summed as distinct tests. Tested crypto versions match the production root lock. / Picky 默认 **173 通过、3 跳过**，SSH／PuTTY 配置 **261 通过、3 跳过**，winscard 模拟卡及签名 **16 通过**；存在重叠，不相加为独立用例数。测试使用的密码学版本与生产锁一致。
+- Root, independent server, acceptor, RDPEUDP and IFD dependency scans passed with **no advisory ignores**. / 五个依赖入口在**没有漏洞忽略项**的策略下均通过。
+- Workflow maintenance: **48 passed**; `actionlint` and shell syntax passed. / 工作流维护 **48 通过**，工作流与 shell 语法通过。
+- The freshly built debug binary passed the strengthened real FreeRDP smoke with disposable credentials: correct-password client/server success and wrong-password client/server rejection. SDL's documented outer event loop can return `1` after auth-only success, so the script accepts only `0/1` plus an explicit success result and matching server audit; wrong-password rejection requires code `132`, the explicit authentication-failure result and the matching server failure. Timeouts/signals never pass. / 新编译 debug 程序的真实 FreeRDP 临时凭证正反认证通过；SDL 外层循环可能在认证成功后返回 `1`，因此须同时检查限定退出码、客户端明确结果与对应服务端审计，超时／信号终止均不通过。

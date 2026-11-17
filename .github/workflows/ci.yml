@@ -66,6 +66,13 @@ jobs:
           RUSTFLAGS: ''
         run: cargo test --locked
 
+      # Root tests do not run dependencies' own unit tests. Exercise the RSA
+      # adapters with root-seeded locks and reject production crypto drift.
+      - name: Test auth dependencies (RSA adapters)
+        env:
+          RUSTFLAGS: ''
+        run: bash scripts/test-auth-dependencies.sh
+
       # vendor/macrdp-rdpeudp is a STANDALONE crate (not a workspace member, so
       # the root cargo test/fmt don't reach it). It's platform-independent
       # (sans-I/O wire codecs + reliability state machine), so test + fmt-check

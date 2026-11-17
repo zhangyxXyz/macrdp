@@ -17,6 +17,11 @@ doesn't lint path dependencies. Don't "fix" upstream code here.
 
 ## Testing
 
+Dependency security follow-up (2026-11-18): standalone `[patch.crates-io]` also
+mirrors the root's picky/sspi/winscard adapters for stable RSA. See
+`../AUTH-SECURITY.md`; these dependency patches do not change the acceptor state
+machine and must stay aligned with the root and standalone server manifests.
+
 The lib is `test = false`, and the useful harness lives upstream in
 `ironrdp-testsuite-core/tests/server/acceptor.rs`. To test a change, copy
 `connection.rs` into the IronRDP clone (`~/Documents/Projects/Misc/IronRDP`) at the
