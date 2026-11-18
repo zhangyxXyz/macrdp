@@ -318,10 +318,9 @@ struct Args {
     #[arg(long, short = 'v')]
     verbose: bool,
 
-    /// Don't prevent the Mac from going to sleep / auto-locking while macrdp
-    /// is running. By default we spawn `caffeinate` so an idle Mac doesn't
-    /// tear down the connection mid-session. Pass this to keep normal power
-    /// management on.
+    /// Allow system sleep while macrdp is running. By default we keep the
+    /// Mac awake so idle sleep doesn't tear down the connection, while
+    /// display sleep and screen locking follow the normal macOS settings.
     #[arg(long)]
     allow_sleep: bool,
 
@@ -937,21 +936,24 @@ struct Args {
     usb_spike: bool,
 }
 
-/// Prevent macOS from going to sleep, dimming/sleeping the display, idle-
-/// locking, or spinning down disks while macrdp is running. `caffeinate
-/// -w PID` exits automatically when the supplied PID exits, so there's
-/// nothing to clean up on shutdown.
+/// Keep the system and disks awake while allowing normal display sleep and
+/// screen locking. Don't use caffeinate's `-d` (prevent display sleep) or `-u`
+/// (declare user activity / wake the display). `-w PID` releases the assertions
+/// automatically when macrdp exits.
 #[cfg(target_os = "macos")]
 fn prevent_sleep() {
     let pid = std::process::id().to_string();
     let res = std::process::Command::new("caffeinate")
-        .args(["-dimsu", "-w", &pid])
+        .args(["-ims", "-w", &pid])
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .spawn();
     match res {
-        Ok(child) => info!(caffeinate_pid = child.id(), "preventing sleep / auto-lock"),
+        Ok(child) => info!(
+            caffeinate_pid = child.id(),
+            "preventing system sleep; display sleep follows macOS settings"
+        ),
         Err(e) => warn!("could not spawn caffeinate to prevent sleep: {e}"),
     }
 }

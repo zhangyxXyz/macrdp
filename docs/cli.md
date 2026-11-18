@@ -27,6 +27,9 @@ Useful CLI flags (see `src/main.rs::Args` for the full set):
                           #   Config key PASSWORD_FILE (turns the USE_KEYCHAIN default off;
                           #   an explicit USE_KEYCHAIN=1 with it is an error)
 --skip-auth               # bypass PAM (also skips password validation)
+--allow-sleep             # allow system sleep (default: keep the host awake
+                          #   with caffeinate -ims; display sleep and screen
+                          #   locking follow macOS settings either way)
 --width  / --height       # override autodetected display size
 --hidpi                   # capture the primary display at backing (Retina) pixels
                           #   instead of logical points (~4x pixels; crisp; best

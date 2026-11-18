@@ -19,9 +19,9 @@ packaging side, see [../packaging/README.md](../packaging/README.md).
 --skip-auth               Bypass PAM (testing only)
 --keychain                Read password from macOS Keychain (service=macrdp)
 -v, --verbose             Show all the noisy logs the default filter hides
---allow-sleep             Let the Mac sleep / auto-lock normally (default
-                          is to spawn `caffeinate` so an idle Mac doesn't
-                          drop the connection mid-session)
+--allow-sleep             Allow system sleep (default: `caffeinate -ims`
+                          keeps the host awake; display sleep and screen
+                          locking follow macOS settings either way)
 --width / --height        Override autodetected display size
 --hidpi                   Capture the primary display at backing (Retina) pixel
                           resolution instead of logical points (e.g. 3024×1964

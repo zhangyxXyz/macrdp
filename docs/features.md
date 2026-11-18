@@ -1,5 +1,10 @@
 # Features / status — what works today
 
+**Power policy:** macrdp keeps the host awake by default with `caffeinate -ims`,
+while physical displays can sleep and the screen can lock according to macOS
+settings. `--allow-sleep` also allows system sleep. Laptop battery and closed-lid
+limitations still apply; see [macOS gotchas](macos-gotchas.md).
+
 **Fork update (2026-11-16):** Windows clipboard files now use a bundled macOS 15+ File Provider for flat-file dataless reads, with a complete-file fallback for folders/unsupported providers. Historical sparse-presenter descriptions below do not describe this dev branch. See [current behavior](../native/file-provider/README.md).
 
 
