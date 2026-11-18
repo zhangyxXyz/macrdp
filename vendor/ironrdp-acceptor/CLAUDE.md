@@ -73,6 +73,16 @@ Both divergences were mutation-checked.
     (`scale_factors_are_reported_only_as_a_valid_pair`, `scale_factors_survive_reactivation`).
     **Drop it at the next pin bump** (any rev at or after `335d6712`).
 
+(7) **Optional connect-time network detection** (clintcan/macrdp#235).
+    `accept_begin_network_detection` advances through Client Info, stopping before
+    licensing. It yields the initiator and negotiated message channel only for clients
+    advertising SUPPORT_NET_CHAR_AUTODETECT. Capabilities and finalization also
+    accept delayed auto-detect replies on that channel when detection was activated.
+    The existing finalize driver retains UDP bootstrap and its late-response handling.
+    When a previous activation negotiated legacy markers, reactivation also tolerates
+    delayed frame ACKs strictly on the I/O channel. Tests in `late_frame_ack_tests`
+    exercise both Confirm Active and finalization (`cargo test --lib` in this crate).
+
 ## Retired
 
 (1) Honor the client's requested desktop size — upstream #1373 + #1404

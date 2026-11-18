@@ -31,6 +31,11 @@ has no effect without H.264. The sync also includes #268's late-S_OK lossy-audio
 regression test and records #230's already-integrated startup fix in the merge
 history. Existing fork lock/display/clipboard policies remain in place.
 
+This fork also adapts three open upstream PRs:
+
+- When WindowServer changes a virtual display’s ID, capture and input follow the owned display. A sleeping display can be woken before capture or a failed display reconfiguration is retried. [#231](https://github.com/clintcan/macrdp/pull/231) · [#232](https://github.com/clintcan/macrdp/pull/232)
+- **Settings → Connection → Report connection quality to the client** enables a login bandwidth estimate and a latency update every five seconds for compatible clients. The same switch enables negotiated frame markers for legacy surface updates. It defaults off. Set `NETWORK_AUTODETECT=1` in the server configuration or pass `--network-autodetect` on the command line. mstsc can use the estimate to adjust visual quality. FreeRDP 3.33.1 received the login report and two periodic updates on an isolated legacy desktop, including a run with a desktop resize. [#235](https://github.com/clintcan/macrdp/pull/235)
+
 ## Current release
 
 **Latest: `v0.10.8`.** Subsequent builds keep this application version and

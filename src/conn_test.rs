@@ -1981,3 +1981,415 @@ async fn the_soft_sync_moves_lossy_audio_onto_the_lossy_tunnel() -> anyhow::Resu
         })
         .await
 }
+
+#[tokio::test]
+async fn network_autodetect_is_opt_in_and_resets_between_clients() -> Result<()> {
+    let mut server = build_test_server(1024, 768, false, None, crate::bitmap_codecs());
+    for connection in 0..3 {
+        if connection == 1 {
+            server.enable_network_autodetect();
+        }
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let (_, client) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            tokio::task::LocalSet::new()
+                .run_until(async {
+                    tokio::join!(
+                        server.run_connection(server_io),
+                        drive_client(client_io, 1024, 768)
+                    )
+                })
+                .await
+        })
+        .await?;
+        assert_eq!(client?, (1024, 768));
+        assert_eq!(
+            server.rtt_snapshot().map(|s| s.sample_count),
+            (connection != 0).then_some(1)
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn network_autodetect_refreshes_during_a_live_session() -> Result<()> {
+    use ironrdp_core::{decode, encode_vec};
+    use ironrdp_pdu::mcs::{SendDataIndication, SendDataRequest};
+    use ironrdp_pdu::rdp::autodetect::{
+        AutoDetectReqPdu, AutoDetectRequest, AutoDetectResponse, AutoDetectRspPdu,
+        RTT_REQUEST_CONTINUOUS,
+    };
+    use ironrdp_pdu::x224::X224;
+    use ironrdp_tokio::FramedWrite as _;
+
+    let mut server =
+        build_test_server_full(3389, 1024, 768, false, None, crate::bitmap_codecs(), true);
+    server.enable_network_autodetect();
+    let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+    let client = async {
+        let (_, mut framed) = connect_client(client_io, 1024, 768).await?;
+        let mut probes = 0;
+        let mut channel = None;
+        loop {
+            let (_, bytes) = framed.read_pdu().await?;
+            let Ok(X224(data)) = decode::<X224<SendDataIndication<'_>>>(&bytes) else {
+                continue;
+            };
+            let Ok(pdu) = decode::<AutoDetectReqPdu>(&data.user_data) else {
+                continue;
+            };
+            assert_eq!(*channel.get_or_insert(data.channel_id), data.channel_id);
+            let response = match pdu.request {
+                AutoDetectRequest::RttRequest {
+                    sequence_number,
+                    request_type: RTT_REQUEST_CONTINUOUS,
+                } => {
+                    probes += 1;
+                    // Omit a reply. The next probe and report must still arrive.
+                    (probes > 1).then_some(AutoDetectResponse::RttResponse { sequence_number })
+                }
+                AutoDetectRequest::NetworkCharacteristicsResult { .. } => {
+                    assert!(probes >= 2);
+                    break;
+                }
+                AutoDetectRequest::BandwidthMeasurePayload { .. } => {
+                    panic!("repeated the login bandwidth burst during the session")
+                }
+                _ => None,
+            };
+            if let Some(response) = response {
+                let reply = encode_vec(&X224(SendDataRequest {
+                    initiator_id: data.initiator_id,
+                    channel_id: data.channel_id,
+                    user_data: encode_vec(&AutoDetectRspPdu::new(response))?.into(),
+                }))?;
+                framed.write_all(&reply).await?;
+            }
+        }
+        Ok::<_, anyhow::Error>(())
+    };
+    let (_, result) = tokio::time::timeout(std::time::Duration::from_secs(18), async {
+        tokio::task::LocalSet::new()
+            .run_until(async { tokio::join!(server.run_connection(server_io), client) })
+            .await
+    })
+    .await?;
+    result?;
+    assert!(server.rtt_snapshot().unwrap().sample_count >= 2);
+    Ok(())
+}
+
+mod network_autodetect {
+    //! Wire-level coverage of the network metrics sent to the Windows client.
+
+    use anyhow::Result;
+    use ironrdp_core::{decode, encode_vec};
+    use ironrdp_pdu::mcs::{SendDataIndication, SendDataRequest};
+    use ironrdp_pdu::rdp::autodetect::{
+        AutoDetectReqPdu, AutoDetectRequest, AutoDetectResponse, AutoDetectRspPdu,
+        BW_RESULTS_CONNECT_TIME, BW_START_CONNECT_TIME, BW_STOP_CONNECT_TIME, NETCHAR_RESULT_ALL,
+        NETCHAR_RESULT_RTT, RTT_REQUEST_CONNECT_TIME,
+    };
+    use ironrdp_pdu::x224::X224;
+    use ironrdp_server::autodetect::AutoDetectManager;
+    use ironrdp_tokio::{FramedWrite, TokioFramed};
+
+    const USER_CHANNEL: u16 = 1002;
+    const MESSAGE_CHANNEL: u16 = 1004;
+
+    async fn measure_with_client(
+        manager: &mut AutoDetectManager,
+        server: &mut TokioFramed<tokio::io::DuplexStream>,
+        client: impl std::future::Future<Output = Result<()>>,
+    ) -> Result<bool> {
+        let (measured, ()) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            tokio::try_join!(
+                async {
+                    Ok::<_, anyhow::Error>(
+                        manager
+                            .measure_connect_time(server, USER_CHANNEL, MESSAGE_CHANNEL)
+                            .await?,
+                    )
+                },
+                client
+            )
+        })
+        .await??;
+        Ok(measured)
+    }
+
+    async fn read_request(
+        client: &mut TokioFramed<tokio::io::DuplexStream>,
+    ) -> Result<AutoDetectRequest> {
+        let frame = client.read_by_hint(&ironrdp_pdu::X224_HINT).await?;
+        let data = decode::<X224<SendDataIndication<'_>>>(&frame)?.0;
+        assert_eq!(data.initiator_id, USER_CHANNEL);
+        assert_eq!(
+            data.channel_id, MESSAGE_CHANNEL,
+            "auto-detect must use the message channel"
+        );
+        // X.691 10.9: an unfragmented two-octet PER length has the prefix
+        // 10 and at most 14 value bits. IronRDP round-trips 0xC0xx lengths too,
+        // so decoding with the same codec alone misses an oversized MCS payload.
+        assert!(
+            data.user_data.len() < 16 * 1024,
+            "auto-detect must fit an unfragmented MCS userData field"
+        );
+        if data.user_data.len() > 127 {
+            assert_eq!(frame[13] & 0xC0, 0x80, "PER length must use the 10 prefix");
+        }
+        Ok(decode::<AutoDetectReqPdu>(data.user_data.as_ref())?.request)
+    }
+
+    async fn respond(
+        client: &mut TokioFramed<tokio::io::DuplexStream>,
+        response: AutoDetectResponse,
+    ) -> Result<()> {
+        let frame = encode_vec(&X224(SendDataRequest {
+            initiator_id: USER_CHANNEL,
+            channel_id: MESSAGE_CHANNEL,
+            user_data: encode_vec(&AutoDetectRspPdu::new(response))?.into(),
+        }))?;
+        client.write_all(&frame).await?;
+        Ok(())
+    }
+
+    async fn answer_rtt(client: &mut TokioFramed<tokio::io::DuplexStream>) -> Result<()> {
+        let request = read_request(client).await?;
+        assert!(matches!(
+            request,
+            AutoDetectRequest::RttRequest {
+                request_type: RTT_REQUEST_CONNECT_TIME,
+                ..
+            }
+        ));
+        let sequence_number = request.sequence_number();
+        // A matching sequence on a different MCS channel and an unrelated
+        // message on the right channel must both be ignored before licensing.
+        for (channel_id, payload) in [
+            (
+                MESSAGE_CHANNEL + 1,
+                encode_vec(&AutoDetectRspPdu::new(
+                    AutoDetectResponse::NetworkCharacteristicsSync {
+                        sequence_number,
+                        bandwidth_kbps: 42,
+                        rtt_ms: 321,
+                    },
+                ))?,
+            ),
+            (MESSAGE_CHANNEL, vec![0, 0, 0, 0]),
+        ] {
+            client
+                .write_all(&encode_vec(&X224(SendDataRequest {
+                    initiator_id: USER_CHANNEL,
+                    channel_id,
+                    user_data: payload.into(),
+                }))?)
+                .await?;
+        }
+        // An old response must not finish the current probe.
+        respond(
+            client,
+            AutoDetectResponse::RttResponse {
+                sequence_number: sequence_number.wrapping_sub(1),
+            },
+        )
+        .await?;
+        respond(client, AutoDetectResponse::RttResponse { sequence_number }).await
+    }
+
+    async fn receive_bandwidth_burst(
+        client: &mut TokioFramed<tokio::io::DuplexStream>,
+    ) -> Result<(u16, u32)> {
+        let start = read_request(client).await?;
+        assert!(matches!(
+            start,
+            AutoDetectRequest::BandwidthMeasureStart {
+                request_type: BW_START_CONNECT_TIME,
+                ..
+            }
+        ));
+        let sequence = start.sequence_number();
+        let mut bytes = 0;
+        loop {
+            let request = read_request(client).await?;
+            assert_eq!(request.sequence_number(), sequence);
+            match request {
+                AutoDetectRequest::BandwidthMeasurePayload { payload, .. } => {
+                    bytes += u32::try_from(payload.len())? + 8;
+                }
+                AutoDetectRequest::BandwidthMeasureStop {
+                    request_type: BW_STOP_CONNECT_TIME,
+                    payload: Some(payload),
+                    ..
+                } => {
+                    assert!(!payload.is_empty(), "connect-time stop requires a payload");
+                    bytes += u32::try_from(payload.len())? + 8;
+                    assert!(bytes <= 257 * 1024, "probe traffic must stay bounded");
+                    return Ok((sequence, bytes));
+                }
+                other => panic!("unexpected bandwidth request: {other:?}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn network_autodetect_reports_measured_bandwidth_on_message_channel() -> Result<()> {
+        let (client_io, server_io) = tokio::io::duplex(32 * 1024);
+        let mut server = TokioFramed::new(server_io);
+        let mut manager = AutoDetectManager::new();
+        let client = async {
+            let mut client = TokioFramed::new(client_io);
+            answer_rtt(&mut client).await?;
+            let (sequence_number, byte_count) = receive_bandwidth_burst(&mut client).await?;
+            respond(
+                &mut client,
+                AutoDetectResponse::BandwidthMeasureResults {
+                    sequence_number,
+                    response_type: BW_RESULTS_CONNECT_TIME,
+                    time_delta_ms: 100,
+                    byte_count,
+                },
+            )
+            .await?;
+            match read_request(&mut client).await? {
+                AutoDetectRequest::NetworkCharacteristicsResult {
+                    request_type,
+                    bandwidth_kbps,
+                    base_rtt_ms,
+                    average_rtt_ms,
+                    ..
+                } => {
+                    assert_eq!(request_type, NETCHAR_RESULT_ALL);
+                    assert_eq!(bandwidth_kbps, Some(byte_count * 8 / 100));
+                    assert_eq!(base_rtt_ms, Some(average_rtt_ms));
+                }
+                other => panic!("expected network characteristics, got {other:?}"),
+            }
+            Ok::<_, anyhow::Error>(())
+        };
+        assert!(measure_with_client(&mut manager, &mut server, client).await?);
+        assert_eq!(manager.snapshot().unwrap().sample_count, 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn network_autodetect_reports_only_rtt_for_missing_or_zero_duration_bandwidth(
+    ) -> Result<()> {
+        for zero_duration_reply in [true, false] {
+            let (client_io, server_io) = tokio::io::duplex(32 * 1024);
+            let mut server = TokioFramed::new(server_io);
+            let mut manager = AutoDetectManager::new();
+            let client = async {
+                let mut client = TokioFramed::new(client_io);
+                answer_rtt(&mut client).await?;
+                let (sequence_number, byte_count) = receive_bandwidth_burst(&mut client).await?;
+                if zero_duration_reply {
+                    respond(
+                        &mut client,
+                        AutoDetectResponse::BandwidthMeasureResults {
+                            sequence_number,
+                            response_type: BW_RESULTS_CONNECT_TIME,
+                            time_delta_ms: 0,
+                            byte_count,
+                        },
+                    )
+                    .await?;
+                }
+                assert!(matches!(
+                    read_request(&mut client).await?,
+                    AutoDetectRequest::NetworkCharacteristicsResult {
+                        request_type: NETCHAR_RESULT_RTT,
+                        bandwidth_kbps: None,
+                        ..
+                    }
+                ));
+                Ok::<_, anyhow::Error>(())
+            };
+            assert_eq!(
+                measure_with_client(&mut manager, &mut server, client).await?,
+                zero_duration_reply
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn network_autodetect_uses_cached_metrics_on_auto_reconnect() -> Result<()> {
+        let (client_io, server_io) = tokio::io::duplex(1024);
+        let mut server = TokioFramed::new(server_io);
+        let mut manager = AutoDetectManager::new();
+        let client = async {
+            let mut client = TokioFramed::new(client_io);
+            let sequence = read_request(&mut client).await?.sequence_number();
+            respond(
+                &mut client,
+                AutoDetectResponse::NetworkCharacteristicsSync {
+                    sequence_number: sequence,
+                    bandwidth_kbps: 7470,
+                    rtt_ms: 24,
+                },
+            )
+            .await?;
+            // A cached sync ends probing: the next message must be the result.
+            assert_eq!(
+                read_request(&mut client).await?,
+                AutoDetectRequest::netchar_result(sequence, 24, 7470, 24)
+            );
+            Ok::<_, anyhow::Error>(())
+        };
+        assert!(measure_with_client(&mut manager, &mut server, client).await?);
+        assert_eq!(manager.snapshot().unwrap().avg_ms, 24);
+        assert_eq!(manager.pending_count(), 0);
+        let probe = manager.send_rtt_request(1000);
+        assert!(matches!(
+            manager.handle_continuous_response(
+                &AutoDetectResponse::RttResponse {
+                    sequence_number: probe.sequence_number(),
+                },
+                1024
+            ),
+            Some(AutoDetectRequest::NetworkCharacteristicsResult {
+                bandwidth_kbps: Some(7470),
+                ..
+            })
+        ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn network_autodetect_missing_rtt_reply_does_not_block_login() -> Result<()> {
+        let (_client, server_io) = tokio::io::duplex(1024);
+        let mut server = TokioFramed::new(server_io);
+        let mut manager = AutoDetectManager::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            manager.measure_connect_time(&mut server, USER_CHANNEL, MESSAGE_CHANNEL),
+        )
+        .await??;
+        assert!(manager.snapshot().is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn continuous_network_results_refresh_rtt() {
+        let mut manager = AutoDetectManager::new();
+        for _ in 0..2 {
+            let probe = manager.send_rtt_request(1000);
+            let response = AutoDetectResponse::RttResponse {
+                sequence_number: probe.sequence_number(),
+            };
+            assert!(matches!(
+                manager.handle_continuous_response(&response, 1024),
+                Some(AutoDetectRequest::NetworkCharacteristicsResult {
+                    request_type: NETCHAR_RESULT_RTT,
+                    bandwidth_kbps: None,
+                    ..
+                })
+            ));
+            assert!(manager
+                .handle_continuous_response(&response, 1024)
+                .is_none());
+        }
+        assert_eq!(manager.snapshot().unwrap().sample_count, 2);
+    }
+}

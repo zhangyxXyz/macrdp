@@ -12,7 +12,9 @@ use ironrdp_pdu::pointer::{
     PointerPositionAttribute,
 };
 use ironrdp_pdu::rdp::capability_sets::{CmdFlags, EntropyBits, LargePointerSupportFlags};
-use ironrdp_pdu::surface_commands::{ExtendedBitmapDataPdu, SurfaceBitsPdu, SurfaceCommand};
+use ironrdp_pdu::surface_commands::{
+    ExtendedBitmapDataPdu, FrameAction, FrameMarkerPdu, SurfaceBitsPdu, SurfaceCommand,
+};
 use tracing::{debug, warn};
 
 use self::bitmap::BitmapEncoder;
@@ -133,6 +135,7 @@ pub(crate) struct UpdateEncoder {
     /// oversized bitmaps into strips that fit within the limit when sent as
     /// uncompressed surface commands.
     max_request_size: usize,
+    next_frame_id: Option<u32>,
     /// Client's advertised New Pointer Update cache size (MS-RDPBCGR 2.2.7.1.5
     /// `pointerCacheSize`). Zero means the client did not advertise support for the
     /// New Pointer Update; `RGBAPointer`/`CachedPointer` emission is skipped in that
@@ -199,6 +202,9 @@ impl UpdateEncoder {
             desktop_size,
             framebuffer: None,
             bitmap_updater: Some(bitmap_updater),
+            next_frame_id: surface_flags
+                .contains(CmdFlags::SET_SURFACE_BITS | CmdFlags::FRAME_MARKER)
+                .then_some(0),
             max_request_size: usize::try_from(max_request_size)
                 .map_err(|e| ServerError::custom("max_request_size", e))?,
             pointer_cache_size,
@@ -337,6 +343,17 @@ impl UpdateEncoder {
         Ok(UpdateFragmenter::new(
             UpdateCode::PositionPointer,
             encode_vec(&pos).map_err(ServerError::encode)?,
+        ))
+    }
+
+    fn frame_marker(frame_id: u32, frame_action: FrameAction) -> ServerResult<UpdateFragmenter> {
+        let command = SurfaceCommand::FrameMarker(FrameMarkerPdu {
+            frame_action,
+            frame_id: Some(frame_id),
+        });
+        Ok(UpdateFragmenter::new(
+            UpdateCode::SurfaceCommands,
+            encode_vec(&command).map_err(ServerError::encode)?,
         ))
     }
 
@@ -489,7 +506,11 @@ impl EncoderIter<'_> {
                             continue;
                         }
                         let diffs = encoder.bitmap_diffs(&bitmap);
+                        let frame_id = encoder.next_frame_id.filter(|_| !diffs.is_empty());
                         self.state = State::BitmapDiffs { diffs, bitmap, pos: 0 };
+                        if let Some(id) = frame_id {
+                            return Some(UpdateEncoder::frame_marker(id, FrameAction::Begin));
+                        }
                         continue;
                     }
                     DisplayUpdate::PointerPosition(pos) => UpdateEncoder::pointer_position(pos),
@@ -547,6 +568,10 @@ impl EncoderIter<'_> {
                     let Some(rect) = diffs.get(pos) else {
                         encoder.bitmap_update_framebuffer(bitmap, &diffs);
                         self.state = State::Ended;
+                        if let Some(id) = encoder.next_frame_id.filter(|_| !diffs.is_empty()) {
+                            encoder.next_frame_id = Some(id.wrapping_add(1));
+                            return Some(UpdateEncoder::frame_marker(id, FrameAction::End));
+                        }
                         return None;
                     };
                     let Rect { x, y, width, height } = *rect;
@@ -1146,6 +1171,109 @@ mod surface_command_tests {
         assert_eq!(
             first_command(UpdateEncoderCodecs::new()),
             (CMDTYPE_SET_SURFACE_BITS, CodecId::None.as_u8())
+        );
+    }
+}
+
+#[cfg(test)]
+mod frame_tests {
+    use core::num::NonZeroUsize;
+
+    use ironrdp_core::{ReadCursor, decode_cursor};
+    use ironrdp_graphics::image_processing::PixelFormat;
+    use ironrdp_pdu::fast_path::{FastPathHeader, FastPathUpdatePdu};
+    use ironrdp_pdu::surface_commands::FrameAction;
+
+    use super::*;
+
+    fn bitmap(value: u8) -> DisplayUpdate {
+        DisplayUpdate::Bitmap(BitmapUpdate {
+            x: 0,
+            y: 0,
+            width: NonZeroU16::new(4).unwrap(),
+            height: NonZeroU16::new(2).unwrap(),
+            stride: NonZeroUsize::new(16).unwrap(),
+            format: PixelFormat::BgrA32,
+            data: vec![value; 32].into(),
+        })
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    enum WireUpdate {
+        Mark(FrameAction, u32),
+        Surface,
+        Other(UpdateCode),
+    }
+
+    async fn commands(encoder: &mut UpdateEncoder, update: DisplayUpdate) -> Vec<WireUpdate> {
+        let mut iter = encoder.update(update);
+        let mut commands = Vec::new();
+        while let Some(fragmenter) = iter.next().await {
+            let mut fragmenter = fragmenter.unwrap();
+            let mut buf = vec![0; fragmenter.size_hint()];
+            let size = fragmenter.next(&mut buf).unwrap();
+            let mut cursor = ReadCursor::new(&buf[..size]);
+            let _: FastPathHeader = decode_cursor(&mut cursor).unwrap();
+            let update: FastPathUpdatePdu<'_> = decode_cursor(&mut cursor).unwrap();
+            commands.push(if update.update_code == UpdateCode::SurfaceCommands {
+                match ironrdp_core::decode(update.data).unwrap() {
+                    SurfaceCommand::FrameMarker(marker) => {
+                        WireUpdate::Mark(marker.frame_action, marker.frame_id.unwrap())
+                    }
+                    _ => WireUpdate::Surface,
+                }
+            } else {
+                WireUpdate::Other(update.update_code)
+            });
+        }
+        commands
+    }
+
+    fn encoder(flags: CmdFlags, max_request_size: u32) -> UpdateEncoder {
+        UpdateEncoder::new(
+            DesktopSize { width: 4, height: 2 },
+            flags,
+            UpdateEncoderCodecs::new(),
+            max_request_size,
+            0,
+            LargePointerSupportFlags::empty(),
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn changed_bitmap_has_one_begin_end_pair_across_tiles() {
+        let mut encoder = encoder(CmdFlags::SET_SURFACE_BITS | CmdFlags::FRAME_MARKER, 16);
+        for (value, id) in [(10, 0), (20, 1)] {
+            assert_eq!(
+                commands(&mut encoder, bitmap(value)).await,
+                [
+                    WireUpdate::Mark(FrameAction::Begin, id),
+                    WireUpdate::Surface,
+                    WireUpdate::Surface,
+                    WireUpdate::Mark(FrameAction::End, id),
+                ]
+            );
+            assert!(
+                commands(&mut encoder, bitmap(value)).await.is_empty(),
+                "unchanged pixels"
+            );
+        }
+        assert_eq!(
+            commands(&mut encoder, DisplayUpdate::DefaultPointer).await,
+            [WireUpdate::Other(UpdateCode::DefaultPointer)]
+        );
+    }
+
+    #[tokio::test]
+    async fn markers_require_both_surface_and_marker_capabilities() {
+        assert_eq!(
+            commands(&mut encoder(CmdFlags::SET_SURFACE_BITS, 1024), bitmap(10)).await,
+            [WireUpdate::Surface]
+        );
+        assert_eq!(
+            commands(&mut encoder(CmdFlags::FRAME_MARKER, 1024), bitmap(10)).await,
+            [WireUpdate::Other(UpdateCode::Bitmap)]
         );
     }
 }

@@ -124,7 +124,7 @@ const SERVE_NEGOTIATION_TIMEOUT: Duration = Duration::from_secs(60);
 #[path = "mt/session.rs"]
 mod mt_session;
 
-fn monotonic_now_ms() -> u64 {
+pub(crate) fn monotonic_now_ms() -> u64 {
     static EPOCH: LazyLock<Instant> = LazyLock::new(Instant::now);
     u64::try_from(EPOCH.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
@@ -859,6 +859,8 @@ pub struct RdpServer {
     /// [`Self::set_connection_local_addr`].
     connection_local_addr: Option<SocketAddr>,
     autodetect: Option<AutoDetectManager>,
+    // (macrdp 37) Opt-in connect-time and periodic measurement plus legacy frame markers.
+    network_autodetect: bool,
     heartbeat: Option<HeartbeatConfig>,
     /// Shared, not owned outright: under [`ConnectionPolicy::Preempt`] the live
     /// connection (which borrows `self` for the whole race) and a candidate's
@@ -1812,6 +1814,7 @@ impl RdpServer {
             local_addr: None,
             connection_local_addr: None,
             autodetect: None,
+            network_autodetect: false,
             heartbeat: None,
             connection_handler: connection_handler.map(|h| Rc::new(RefCell::new(h))),
             recently_evicted: None,
@@ -2264,6 +2267,14 @@ impl RdpServer {
     /// query results with [`rtt_snapshot()`](Self::rtt_snapshot).
     pub fn enable_autodetect(&mut self) {
         self.autodetect = Some(AutoDetectManager::new());
+    }
+
+    /// Enable the optional mstsc connection quality report (macrdp 37).
+    /// Negotiate a bounded login measurement, then measure RTT every five seconds.
+    /// Legacy surface updates also gain frame markers if the client accepts them.
+    pub fn enable_network_autodetect(&mut self) {
+        self.network_autodetect = true;
+        self.enable_autodetect();
     }
 
     /// Enable periodic Server Heartbeat PDUs (MS-RDPBCGR 2.2.16.1).
@@ -3875,6 +3886,7 @@ impl RdpServer {
                         self.mt_soft_sync_on_egfx(writer, user_channel_id).await?;
                     }
                 },
+                ServerEvent::AutoDetectRttRequest if self.network_autodetect => { /* The session timer owns pacing. */ }
                 ServerEvent::AutoDetectRttRequest => {
                     // Auto-detect requests ride the MCS message channel
                     // ([MS-RDPBCGR] 2.2.14.3). With none negotiated (the client
@@ -4272,6 +4284,7 @@ impl RdpServer {
         user_channel_id: u16,
         message_channel_id: Option<u16>,
         client_supports_heartbeat: bool,
+        client_supports_network_detection: bool,
         client_supports_error_info: bool,
         mut encoder: UpdateEncoder,
         udp_transport: Rc<RefCell<Option<multitransport::UdpTransportHandle>>>,
@@ -4293,6 +4306,8 @@ impl RdpServer {
         let mut event_writer = writer.clone();
         let mut auto_reconnect_writer = writer.clone();
         let mut heartbeat_writer = writer.clone();
+        let mut probe_writer = writer.clone();
+        let probe_channel = message_channel_id.filter(|_| self.network_autodetect && client_supports_network_detection);
         let mut clipboard_timeout_writer = writer.clone();
         let mut udp_tunnel_writer = writer.clone();
         let mut audio_writer = writer.clone();
@@ -4537,6 +4552,30 @@ impl RdpServer {
             #[allow(unreachable_code)]
             Ok::<RunState, ServerError>(RunState::Continue)
         };
+        let this = Rc::clone(&s);
+        let probe_rtt = async move {
+            let Some(channel) = probe_channel else {
+                return core::future::pending::<ServerResult<RunState>>().await;
+            };
+            let mut timer = tokio::time::interval(Duration::from_secs(5));
+            timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            timer.tick().await;
+            loop {
+                timer.tick().await;
+                let request = {
+                    let mut server = this.lock().await;
+                    let manager = server.autodetect.as_mut().expect("enabled during setup");
+                    let now = monotonic_now_ms();
+                    manager.expire_stale_probes(now, crate::autodetect::RTT_PROBE_MAX_AGE_MS);
+                    manager.send_rtt_request(now)
+                };
+                let bytes = encode_autodetect_request(request, channel, user_channel_id)?;
+                probe_writer
+                    .write_all(&bytes)
+                    .await
+                    .map_err(|e| ServerError::io("write network probe", e))?;
+            }
+        };
         let send_heartbeats = async move {
             let (Some(config), Some(message_channel_id)) = (heartbeat, message_channel_id) else {
                 return core::future::pending::<ServerResult<RunState>>().await;
@@ -4742,6 +4781,7 @@ impl RdpServer {
             state = dispatch_events => state,
             state = refresh_auto_reconnect_cookie => state,
             state = send_heartbeats => state,
+            state = probe_rtt => state,
             state = drive_clipboard_timeouts => state,
             state = dispatch_udp_tunnel => state,
             state = dispatch_audio => state,
@@ -4766,6 +4806,7 @@ impl RdpServer {
         reader: &mut Framed<R>,
         writer: &mut Framed<W>,
         result: AcceptorResult,
+        surface_flags: CmdFlags,
         udp_transport: Rc<RefCell<Option<multitransport::UdpTransportHandle>>>,
         pending_udp_accept: Option<task::JoinHandle<Option<multitransport::UdpTransportHandle>>>,
     ) -> ServerResult<RunState>
@@ -4908,7 +4949,6 @@ impl RdpServer {
         }
 
         let mut update_codecs = UpdateEncoderCodecs::new();
-        let mut surface_flags = CmdFlags::empty();
         let mut pointer_cache_size: u16 = 0;
         // Absence means the client did not send a Large Pointer Capability Set at all,
         // which per MS-RDPBCGR 2.2.7.2.7 leaves the pointer size ceiling at 32x32 (the
@@ -4943,9 +4983,6 @@ impl RdpServer {
                             client_size, display_size
                         );
                     }
-                }
-                CapabilitySet::SurfaceCommands(c) => {
-                    surface_flags = c.flags;
                 }
                 CapabilitySet::BitmapCodecs(BitmapCodecs(codecs)) => {
                     // FIXME: The encoder operates in image mode only.
@@ -5049,6 +5086,9 @@ impl RdpServer {
                 result
                     .client_early_capability_flags
                     .contains(ironrdp_pdu::gcc::ClientEarlyCapabilityFlags::SUPPORT_HEART_BEAT_PDU),
+                result
+                    .client_early_capability_flags
+                    .contains(ironrdp_pdu::gcc::ClientEarlyCapabilityFlags::SUPPORT_NET_CHAR_AUTODETECT),
                 result
                     .client_early_capability_flags
                     .contains(ironrdp_pdu::gcc::ClientEarlyCapabilityFlags::SUPPORT_ERR_INFO_PDU),
@@ -5196,6 +5236,8 @@ impl RdpServer {
                     }
                 }
 
+                rdp::headers::ShareDataPdu::FrameAcknowledge(_) if self.network_autodetect => {}
+
                 unexpected => {
                     warn!(?unexpected, "Unexpected share data pdu");
                 }
@@ -5209,7 +5251,7 @@ impl RdpServer {
         Ok(false)
     }
 
-    fn handle_message_channel_data(&mut self, data: SendDataRequest<'_>) {
+    fn handle_message_channel_data(&mut self, data: SendDataRequest<'_>) -> Option<rdp::autodetect::AutoDetectRequest> {
         match decode::<rdp::message_channel::ClientMessageChannelPdu>(data.user_data.as_ref()) {
             Ok(rdp::message_channel::ClientMessageChannelPdu::AutoDetectResponse(pdu)) => {
                 if let Some(ref mut ad) = self.autodetect {
@@ -5229,6 +5271,10 @@ impl RdpServer {
                                 seq = pdu.response.sequence_number(),
                                 "RTT measured"
                             );
+
+                            if self.network_autodetect {
+                                return ad.continuous_network_result();
+                            }
                         }
                         AutoDetectOutcome::Bandwidth(Some(bandwidth_kbps)) => {
                             self.autodetect_bandwidth.store(bandwidth_kbps, Ordering::Relaxed);
@@ -5290,6 +5336,7 @@ impl RdpServer {
                 warn!(error = format!("{error:#}"), "Unhandled MCS message channel PDU");
             }
         }
+        None
     }
 
     async fn handle_x224(
@@ -5315,7 +5362,14 @@ impl RdpServer {
                 }
 
                 if message_channel_id == Some(data.channel_id) {
-                    self.handle_message_channel_data(data);
+                    let channel = data.channel_id;
+                    if let Some(result) = self.handle_message_channel_data(data) {
+                        let bytes = encode_autodetect_request(result, channel, user_channel_id)?;
+                        writer
+                            .write_all(&bytes)
+                            .await
+                            .map_err(|e| ServerError::io("write network characteristics", e))?;
+                    }
                     #[cfg(feature = "multitransport")]
                     self.mt_send_owed_soft_sync(writer, user_channel_id).await?;
                     return Ok(false);
@@ -5436,6 +5490,13 @@ impl RdpServer {
         // block the RDP handshake finalize itself is driving.
         let mut pending_udp_accept: Option<task::JoinHandle<Option<multitransport::UdpTransportHandle>>> = None;
 
+        let mut measure_login = self.network_autodetect;
+        if measure_login {
+            self.autodetect = Some(AutoDetectManager::new());
+            self.autodetect_rtt.store(u32::MAX, Ordering::Relaxed);
+            self.autodetect_baseline_rtt.store(u32::MAX, Ordering::Relaxed);
+            self.autodetect_bandwidth.store(u32::MAX, Ordering::Relaxed);
+        }
         loop {
             // Bounded: see `FINALIZE_TIMEOUT`. The bound belongs on THIS call
             // and not on `accept_finalize` itself or its callers — the loop
@@ -5451,23 +5512,45 @@ impl RdpServer {
             // called, see `PendingConnection::new`), so the handler below
             // simply never runs and this is exactly `accept_finalize`'s own
             // behavior.
-            let finalize = ironrdp_acceptor::accept_finalize_with_multitransport(
-                framed,
-                &mut acceptor,
-                async |request, _soft_sync| {
-                    // Defensive only: reached only if the acceptor sent a
-                    // request despite one of these being unset, which
-                    // `PendingConnection::new`'s gate should prevent.
-                    let (Some(udp_bind_addr), Some(tls_config)) = (udp_bind_addr, tls_config.clone()) else {
-                        return;
-                    };
-                    // Spawned rather than awaited inline: See the comment on
-                    // `pending_udp_accept`'s declaration above.
-                    pending_udp_accept = Some(task::spawn(async move {
-                        multitransport::accept(udp_bind_addr, tls_config, &request).await
-                    }));
-                },
-            );
+            let finalize = async {
+                if core::mem::take(&mut measure_login)
+                    && let Some((user, channel)) =
+                        ironrdp_acceptor::accept_begin_network_detection(&mut framed, &mut acceptor).await?
+                {
+                    let ad = self.autodetect.as_mut().expect("enabled during setup");
+                    let received_bandwidth = ad
+                        .measure_connect_time(&mut framed, user, channel)
+                        .await
+                        .map_err(|e| ironrdp_connector::custom_err!("connect-time network detection", e))?;
+                    if let Some(rtt) = ad.snapshot() {
+                        self.autodetect_rtt.store(rtt.avg_ms, Ordering::Relaxed);
+                        self.autodetect_baseline_rtt.store(rtt.min_ms, Ordering::Relaxed);
+                    }
+                    if received_bandwidth {
+                        self.autodetect_bandwidth
+                            .store(ad.bandwidth_kbps().unwrap_or(u32::MAX), Ordering::Relaxed);
+                        self.autodetect_bandwidth_generation.fetch_add(1, Ordering::Release);
+                    }
+                }
+                ironrdp_acceptor::accept_finalize_with_multitransport(
+                    framed,
+                    &mut acceptor,
+                    async |request, _soft_sync| {
+                        // Defensive only: reached only if the acceptor sent a
+                        // request despite one of these being unset, which
+                        // `PendingConnection::new`'s gate should prevent.
+                        let (Some(udp_bind_addr), Some(tls_config)) = (udp_bind_addr, tls_config.clone()) else {
+                            return;
+                        };
+                        // Spawned rather than awaited inline: See the comment on
+                        // `pending_udp_accept`'s declaration above.
+                        pending_udp_accept = Some(task::spawn(async move {
+                            multitransport::accept(udp_bind_addr, tls_config, &request).await
+                        }));
+                    },
+                )
+                .await
+            };
             let (new_framed, result) = match tokio::time::timeout(FINALIZE_TIMEOUT, finalize).await {
                 Ok(res) => res.map_err_kind("failed to accept client during finalize", ServerErrorKind::Connector)?,
                 Err(_) => {
@@ -5485,6 +5568,18 @@ impl RdpServer {
             #[cfg(feature = "multitransport")]
             self.mt_on_finalized(&acceptor, result.reactivation);
 
+            let mut surface_flags = result
+                .capabilities
+                .iter()
+                .rev()
+                .find_map(|cap| match cap {
+                    CapabilitySet::SurfaceCommands(surface) => Some(surface.flags),
+                    _ => None,
+                })
+                .unwrap_or_else(CmdFlags::empty);
+            if !self.network_autodetect {
+                surface_flags.remove(CmdFlags::FRAME_MARKER);
+            }
             let (mut reader, mut writer) = split_tokio_framed(new_framed);
 
             match self
@@ -5492,6 +5587,7 @@ impl RdpServer {
                     &mut reader,
                     &mut writer,
                     result,
+                    surface_flags,
                     Rc::clone(&udp_transport),
                     pending_udp_accept.take(),
                 )
@@ -5511,6 +5607,9 @@ impl RdpServer {
                         desktop_size,
                     )
                     .map_err_kind("deactivation-reactivation acceptor", ServerErrorKind::Connector)?;
+                    if surface_flags.contains(CmdFlags::SET_SURFACE_BITS | CmdFlags::FRAME_MARKER) {
+                        acceptor.allow_previous_frame_acks();
+                    }
                     framed = unsplit_tokio_framed(reader, writer);
                     continue;
                 }
@@ -5551,7 +5650,7 @@ impl RdpServer {
 /// The request is framed by a Basic Security Header (SEC_AUTODETECT_REQ) per
 /// [MS-RDPBCGR] 2.2.14.3 and carried in an MCS Send Data Indication on the
 /// negotiated message channel, not as a Share Data PDU on the I/O channel.
-fn encode_autodetect_request(
+pub(crate) fn encode_autodetect_request(
     request: rdp::autodetect::AutoDetectRequest,
     message_channel_id: u16,
     user_channel_id: u16,

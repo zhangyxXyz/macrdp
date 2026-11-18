@@ -64,7 +64,11 @@ jobs:
       - name: Test (Linux stubs)
         env:
           RUSTFLAGS: ''
-        run: cargo test --locked
+        run: |
+          cargo test --locked
+          # Dependency unit tests require explicit selection. Exercise late
+          # legacy frame acknowledgements across desktop reactivation.
+          cargo test --locked -p ironrdp-acceptor --lib
 
       # Root tests do not run dependencies' own unit tests. Exercise the RSA
       # adapters with root-seeded locks and reject production crypto drift.

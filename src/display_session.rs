@@ -6,55 +6,57 @@ use crate::{
 };
 use anyhow::{Context, Result};
 use std::ops::{Deref, DerefMut};
-use std::sync::{
-    atomic::{AtomicU32, Ordering},
-    Arc, Mutex,
-};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-static ACTIVE: AtomicU32 = AtomicU32::new(0);
-static READY: AtomicU32 = AtomicU32::new(0);
-pub fn mark_ready(id: u32) {
-    if ACTIVE.load(Ordering::Acquire) == id {
-        READY.store(id, Ordering::Release);
-    }
+/// Aliases last exactly as long as this display lease. A recycled numeric
+/// ID in a later session must never redirect input or physical restoration.
+#[derive(Default)]
+struct ActiveDisplayIds {
+    id: Option<u32>,
+    aliases: Vec<u32>,
+    ready: bool,
 }
-static ENABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-pub fn enable() {
-    ENABLED.store(true, Ordering::Release);
-}
-pub async fn audio_display(
-    fallback: Option<u32>,
-    is_current: impl Fn() -> bool,
-) -> Result<Option<u32>> {
-    anyhow::ensure!(
-        is_current(),
-        "audio session retired before display readiness"
-    );
-    if fallback.is_some() || !ENABLED.load(Ordering::Acquire) {
-        return Ok(fallback);
-    }
-    let id = tokio::time::timeout(std::time::Duration::from_secs(30), async {
-        loop {
-            anyhow::ensure!(
-                is_current(),
-                "audio session retired while waiting for display"
-            );
-            let id = READY.load(Ordering::Acquire);
-            if id != 0 {
-                return Ok::<u32, anyhow::Error>(id);
+impl ActiveDisplayIds {
+    fn publish(&mut self, id: u32) {
+        if let Some(previous) = self.id.replace(id) {
+            if previous != id && !self.aliases.contains(&previous) {
+                self.aliases.push(previous);
             }
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
-    })
-    .await
-    .context("session virtual display was not available for audio within 30 seconds")??;
-    Ok(Some(id))
+    }
+    fn resolve(&self, saved: u32) -> u32 {
+        self.id
+            .filter(|_| self.aliases.contains(&saved))
+            .unwrap_or(saved)
+    }
+}
+static IDS: Mutex<ActiveDisplayIds> = Mutex::new(ActiveDisplayIds {
+    id: None,
+    aliases: Vec::new(),
+    ready: false,
+});
+pub fn current_id(saved: u32) -> u32 {
+    IDS.lock().unwrap().resolve(saved)
+}
+fn publish(id: u32) {
+    let mut ids = IDS.lock().unwrap();
+    if ids.id == Some(id) {
+        return;
+    }
+    if let Some(old) = ids.id {
+        tracing::info!(old, new = id, "virtual display re-registered");
+    }
+    ids.publish(id);
+    crate::input::invalidate_display_bounds();
+    crate::switcher_hud::set_display_id(id);
+}
+
+#[cfg(target_os = "macos")]
+pub fn audio_ready() -> bool {
+    IDS.lock().unwrap().ready
 }
 pub fn active_display_id() -> Option<u32> {
-    match ACTIVE.load(Ordering::Acquire) {
-        0 => None,
-        id => Some(id),
-    }
+    IDS.lock().unwrap().id
 }
 
 #[derive(Default)]
@@ -83,6 +85,9 @@ impl Lifecycle {
         self.cleanup_not_before = Some(deadline);
         self.leave().map(|generation| (generation, deadline))
     }
+    fn may_replace(&self, physical_restored: impl FnOnce() -> bool) -> bool {
+        self.users == 0 && physical_restored()
+    }
     fn may_release(&self, generation: u64) -> bool {
         self.users == 0 && self.generation == generation
     }
@@ -95,9 +100,11 @@ pub struct Options {
     pub scale: u32,
 }
 pub type SharedDisplay = Arc<Mutex<ManagedDisplay>>;
+pub type WeakDisplay = std::sync::Weak<Mutex<ManagedDisplay>>;
 pub struct ManagedDisplay {
     active: Option<VirtualDisplay>,
     lifecycle: Lifecycle,
+    recreate_unlisted: bool,
     options: Options,
     coordinator: Coordinator,
     idle_safe: Arc<dyn Fn() -> bool + Send + Sync>,
@@ -113,6 +120,7 @@ impl ManagedDisplay {
         Arc::new(Mutex::new(Self {
             active: None,
             lifecycle: Lifecycle::default(),
+            recreate_unlisted: false,
             options,
             coordinator,
             idle_safe: Arc::new(idle_safe),
@@ -120,16 +128,48 @@ impl ManagedDisplay {
         }))
     }
     pub fn scale_if_active(&self) -> Option<u32> {
-        self.active.as_ref().map(VirtualDisplay::ui_scale)
+        self.active
+            .as_ref()
+            .filter(|vd| vd.has_handle())
+            .map(VirtualDisplay::ui_scale)
     }
     pub fn id_if_active(&self) -> Option<u32> {
-        self.active.as_ref().map(VirtualDisplay::display_id)
+        self.active
+            .as_ref()
+            .filter(|vd| vd.has_handle())
+            .map(VirtualDisplay::display_id)
+    }
+    #[cfg(target_os = "macos")]
+    pub fn resolve_listed(&mut self, ids: &[u32]) -> Option<u32> {
+        let id = self.active.as_mut()?.resolve_listed(ids)?;
+        publish(id);
+        Some(id)
+    }
+    #[cfg(target_os = "macos")]
+    pub fn resolve_ready_audio(&mut self, ids: &[u32]) -> Option<u32> {
+        // Audio may have been awaiting SCK while the last video lease was
+        // released or replaced. Recheck readiness under the display lock.
+        if !audio_ready() {
+            return None;
+        }
+        self.resolve_listed(ids)
+    }
+    #[cfg(target_os = "macos")]
+    pub fn mark_unlisted(&mut self) {
+        self.recreate_unlisted = true;
+    }
+    pub fn mark_ready(&mut self) {
+        self.recreate_unlisted = false;
+        let mut ids = IDS.lock().unwrap();
+        if self.id_if_active().is_some() && self.id_if_active() == ids.id {
+            ids.ready = true;
+        }
     }
     /// Keep the already-existing surface alive through disconnect locking.
     /// Never creates a display for an idle server or changes SessionTracker.
     pub fn retain_active(shared: &SharedDisplay) -> Option<Lease> {
         let mut s = shared.lock().unwrap();
-        s.active.as_ref()?;
+        s.id_if_active()?;
         s.lifecycle.enter();
         Some(Lease {
             shared: shared.clone(),
@@ -143,7 +183,33 @@ impl ManagedDisplay {
         let lease = coordinator
             .run(move |_| {
                 let mut s = state.lock().unwrap();
-                if s.active.is_none() {
+                if s.active.is_some() {
+                    let can_replace = s.lifecycle.may_replace(|| (s.idle_safe)());
+                    let force = s.recreate_unlisted && can_replace;
+                    if force || !s.active.as_mut().unwrap().refresh_online()? {
+                        anyhow::ensure!(can_replace, "virtual display unavailable while capture or physical restoration still owns it");
+                        if let Some(primary) = &s.primary {
+                            drop(primary.lock().unwrap().take());
+                        }
+                        // Clear input, audio and HUD state before dropping the live
+                        // handle. A failed replacement leaves no accessible display.
+                        *IDS.lock().unwrap() = ActiveDisplayIds::default();
+                        crate::input::invalidate_display_bounds();
+                        crate::switcher_hud::set_display_id(0);
+                        s.active.as_mut().unwrap().recreate()?;
+                        let id = s.active.as_ref().unwrap().display_id();
+                        if let Some(primary) = s.primary.clone() {
+                            match PrimaryOverride::install(id) {
+                                Ok(guard) => *primary.lock().unwrap() = guard,
+                                Err(error) => {
+                                    drop(s.active.take());
+                                    return Err(error);
+                                }
+                            }
+                        }
+                    }
+                    publish(s.active.as_ref().unwrap().display_id());
+                } else {
                     let o = s.options;
                     let vd = VirtualDisplay::new(o.width, o.height, 60, o.hidpi, o.scale)
                         .context("creating session virtual display")?;
@@ -154,8 +220,8 @@ impl ManagedDisplay {
                     let origin = vd.origin_pts();
                     let points = vd.size_pts();
                     s.active = Some(vd);
-                    ACTIVE.store(id, Ordering::Release);
-                    crate::switcher_hud::set_display_id(id);
+                    s.recreate_unlisted = false;
+                    publish(id);
                     tracing::info!(
                         display_id = id,
                         ?origin,
@@ -239,8 +305,7 @@ impl Drop for Lease {
                             drop(primary.lock().unwrap().take());
                         }
                         crate::switcher_hud::hide();
-                        READY.store(0, Ordering::Release);
-                        ACTIVE.store(0, Ordering::Release);
+                        *IDS.lock().unwrap() = ActiveDisplayIds::default();
                         drop(s.active.take());
                         tracing::info!(
                             "virtual display released after last capture and physical restoration"
@@ -290,6 +355,33 @@ impl ironrdp_server::RdpServerDisplayUpdates for Updates {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn timed_out_sck_cannot_replace_a_capture_or_pending_physical_restore() {
+        let mut lifecycle = Lifecycle::default();
+        lifecycle.enter();
+        assert!(!lifecycle.may_replace(|| panic!("active capture or lock keepalive")));
+        lifecycle.leave();
+        assert!(!lifecycle.may_replace(|| false));
+        assert!(lifecycle.may_replace(|| true));
+    }
+    #[test]
+    fn aliases_follow_re_registration_only_within_the_same_lease() {
+        let mut ids = ActiveDisplayIds::default();
+        ids.publish(22);
+        ids.ready = true;
+        ids.publish(23);
+        ids.publish(24);
+        assert_eq!(ids.resolve(22), 24);
+        assert_eq!(ids.resolve(23), 24);
+        assert_eq!(ids.resolve(4), 4);
+        assert!(ids.ready);
+        ids.publish(22); // WindowServer reused the original ID
+        assert_eq!(ids.resolve(23), 22);
+        ids = ActiveDisplayIds::default();
+        ids.publish(55);
+        assert_eq!(ids.resolve(22), 22);
+        assert!(!ids.ready);
+    }
     #[test]
     fn startup_configuration_does_not_create_a_display() {
         let shared = ManagedDisplay::new(

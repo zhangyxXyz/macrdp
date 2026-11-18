@@ -81,6 +81,27 @@ where
     }
 }
 
+/// (macrdp 7) Drive an initial, post-security accept to the boundary after Client
+/// Info and before licensing. If both GCC prerequisites were negotiated, return
+/// the server initiator and message channel for an optional measurement. Continue
+/// with the normal finalize driver after the measurement. Resizes skip this phase.
+pub async fn accept_begin_network_detection<S>(
+    framed: &mut Framed<S>,
+    acceptor: &mut Acceptor,
+) -> ConnectorResult<Option<(u16, u16)>>
+where
+    S: FramedRead + FramedWrite,
+{
+    let mut buf = WriteBuf::new();
+    loop {
+        match acceptor.state {
+            AcceptorState::LicensingExchange { .. } => return Ok(acceptor.begin_network_detection()),
+            AcceptorState::CapabilitiesSendServer { .. } => return Ok(None), // Reactivation
+            _ => single_sequence_step(framed, acceptor, &mut buf).await?,
+        }
+    }
+}
+
 pub async fn accept_finalize<S>(
     framed: Framed<S>,
     acceptor: &mut Acceptor,

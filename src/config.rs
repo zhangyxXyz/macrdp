@@ -197,6 +197,7 @@ impl Document {
         // disagree. Even equal duplicates are rejected: clap rejects them too.
         for (key, flag) in [
             ("DISPLAY_WAKE_TIMEOUT_SECS", "--display-wake-timeout-secs"),
+            ("NETWORK_AUTODETECT", "--network-autodetect"),
             ("CAPTURE_NV12", "--capture-nv12"),
             ("H264_MAX_UNACKED_FRAMES", "--h264-max-unacked-frames"),
             ("MODIFIER_LAYOUT", "--modifier-layout"),
@@ -409,6 +410,7 @@ pub const SUPPORTED_KEYS: &[&str] = &[
     "MAX_CLIENT_SIZE",
     "MIC_DUMP",
     "MODIFIER_LAYOUT",
+    "NETWORK_AUTODETECT",
     "NO_REMAP_APPS",
     "PASSWORD_FILE",
     "PRIMARY_MODE",
@@ -454,6 +456,7 @@ const BOOL_KEYS: &[&str] = &[
     "HIDPI",
     "LOCK_ON_DISCONNECT",
     "MAP_CTRL_TO_CMD",
+    "NETWORK_AUTODETECT",
     "RESTORE_WINDOWS_ON_DISCONNECT",
     "REVERSE_SCROLL",
     "RICH_CLIPBOARD",

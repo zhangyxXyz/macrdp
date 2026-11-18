@@ -158,15 +158,12 @@ impl DisplayEnabler {
     /// `config` is the `CGDisplayConfigRef` returned by
     /// `CGDisplay::begin_configuration` — its layout is `*mut c_void` in
     /// the core-graphics crate, which is what the FFI expects.
-    pub(super) fn set(&self, config: *mut c_void, display: u32, enabled: bool) -> Result<()> {
+    pub(super) fn set(&self, config: *mut c_void, display: u32, enabled: bool) -> Result<(), i32> {
         let err = unsafe { (self.0)(config, display, enabled) };
         if err == 0 {
             Ok(())
         } else {
-            Err(anyhow!(
-                "CGSConfigureDisplayEnabled(display={display}, enabled={enabled}) \
-                 returned CGError {err}"
-            ))
+            Err(err)
         }
     }
 }
@@ -195,6 +192,10 @@ unsafe impl Send for Handle {}
 impl Handle {
     pub(super) fn display_id(&self) -> u32 {
         self.display_id
+    }
+
+    pub(super) fn live_display_id(&self) -> u32 {
+        unsafe { msg_send![self.raw, displayID] }
     }
 
     /// Re-apply settings with a single new mode — the live-resize primitive.
@@ -391,12 +392,15 @@ pub(super) fn select_mode(display: u32, w: u32, h: u32, px_w: u32) -> Result<boo
     }
 }
 
+#[derive(Debug, thiserror::Error)]
+#[error("CGVirtualDisplay rejected the descriptor (initWithDescriptor: returned nil)")]
+pub(super) struct DescriptorRejected;
+
 /// Allocate a virtual display at the requested pixel size, apply a
 /// single-mode settings object, and return the owning handle.
 ///
-/// Temporary Obj-C objects (descriptor, mode, mode-array, settings)
-/// are intentionally leaked — they're tiny, only allocated once per
-/// process, and avoiding manual `release` calls keeps the code
+/// Temporary Obj-C mode/settings objects
+/// are intentionally leaked — they're tiny, and avoiding manual `release` calls keeps the code
 /// obviously free of double-free hazards.
 ///
 /// `width`/`height` are the mode size: pixels when `hidpi` is false, points
@@ -428,6 +432,13 @@ pub(super) fn create(
         if desc.is_null() {
             return Err(anyhow!("CGVirtualDisplayDescriptor init returned nil"));
         }
+        // Rust worker threads do not pump the main dispatch queue. Give
+        // WindowServer a serviced queue for registration and teardown.
+        extern "C" {
+            fn dispatch_get_global_queue(identifier: isize, flags: usize) -> *mut AnyObject;
+        }
+        let queue = dispatch_get_global_queue(0, 0);
+        let _: () = msg_send![desc, setQueue: queue];
         let _: () = msg_send![desc, setName: &*ns_name];
         // Max dimensions are a CAP fixed for the display's lifetime (the
         // descriptor can't be re-applied), not the active resolution — the
@@ -458,7 +469,7 @@ pub(super) fn create(
             0x6D616372 // "macr"
         };
         let _: () = msg_send![desc, setProductID: product];
-        let _: () = msg_send![desc, setVendorID: 0x6D616372u32];
+        let _: () = msg_send![desc, setVendorID: super::identity::VENDOR];
         // Was hardcoded to 1: a second macrdp process (e.g. two concurrent
         // installs, or dev testing alongside a running instance) registering a
         // display with an identical vendor/product/serial triple gets its
@@ -469,11 +480,9 @@ pub(super) fn create(
         // 2. CGVirtualDisplay instance from the descriptor.
         let display: *mut AnyObject = msg_send![display_class, alloc];
         let display: *mut AnyObject = msg_send![display, initWithDescriptor: desc];
+        let _: () = msg_send![desc, release];
         if display.is_null() {
-            return Err(anyhow!(
-                "[CGVirtualDisplay initWithDescriptor:] returned nil — the \
-                 descriptor was rejected (try different dimensions)"
-            ));
+            return Err(DescriptorRejected.into());
         }
 
         // 3+4. One mode at the requested resolution, applied via settings —

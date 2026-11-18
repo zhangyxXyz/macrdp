@@ -281,6 +281,18 @@ private struct ConnectionTab: View {
                 Text("Off = loopback only (127.0.0.1), reachable from this Mac only.")
                     .font(.caption).foregroundColor(.secondary)
             }
+            if model.capabilities?.keys.contains("NETWORK_AUTODETECT") == true {
+                Section("Connection quality") {
+                    let fromExtraFlags = (try? ExtraFlags(model.string("EXTRA_FLAGS")))?.contains("--network-autodetect") == true
+                    Toggle("Report connection quality to the client",
+                           isOn: fromExtraFlags ? .constant(true) : model.boolBinding("NETWORK_AUTODETECT"))
+                        .disabled(fromExtraFlags)
+                    Text(fromExtraFlags
+                        ? "Remove --network-autodetect from Advanced → Extra flags to edit this setting here."
+                        : "Measures bandwidth at sign-in and latency every five seconds. Windows Remote Desktop may adjust visual quality using the estimate.")
+                        .font(.caption).foregroundColor(.secondary)
+                }
+            }
             Section("Account") {
                 Button(model.controller.hasKeychainPassword()
                     ? "Change Account Password…" : "Set Account Password…") {

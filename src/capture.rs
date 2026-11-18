@@ -8,7 +8,7 @@ use std::num::{NonZeroU16, NonZeroUsize};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::Arc;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use bytes::Bytes;
 use ironrdp_server::{
     BitmapUpdate, DesktopSize, DisplayUpdate, PixelFormat, RdpServerDisplay,
@@ -553,40 +553,6 @@ fn mirror_display_index(display_ids: &[u32], main_id: u32) -> Option<usize> {
     )
 }
 
-/// Vendor id on every macrdp virtual display descriptor ("macr").
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-const VIRTUAL_DISPLAY_VENDOR: u32 = 0x6D616372;
-
-/// One display SCK lists, as the capture reopen sees it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-struct OnlineDisplay {
-    id: u32,
-    vendor: u32,
-    builtin: bool,
-    size_px: (u32, u32),
-}
-
-/// The id a lost virtual display came back under: the same id, else the only
-/// display with our vendor id, else the only external display of the session's
-/// size. `None` while it is not back. Waking can make WindowServer re-register
-/// the virtual display under a new id, and the old one never returns.
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-fn pick_reopened_display(old: u32, online: &[OnlineDisplay], size_px: (u32, u32)) -> Option<u32> {
-    if online.iter().any(|d| d.id == old) {
-        return Some(old);
-    }
-    let unique = |f: &dyn Fn(&OnlineDisplay) -> bool| {
-        let mut it = online.iter().filter(|d| f(d));
-        match (it.next(), it.next()) {
-            (Some(d), None) => Some(d.id),
-            _ => None,
-        }
-    };
-    unique(&|d| d.vendor == VIRTUAL_DISPLAY_VENDOR)
-        .or_else(|| unique(&|d| !d.builtin && d.size_px == size_px))
-}
-
 #[cfg(any(target_os = "macos", test))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CaptureStop {
@@ -930,13 +896,14 @@ impl RdpServerDisplay for CaptureDisplay {
         let result = async {
             // An Esc-sleep reconnect must wake the display before waiting on
             // topology, virtual display acquisition, or the unlock surface.
-            let bootstrap = if self.preparation.is_some() {
-                crate::session_lock::wake_for_capture(
-                    self.display_wake_timeout,
-                    self.virtual_display.is_some(),
-                )
-                .await?
+            let wake = crate::session_lock::wake_for_capture(self.display_wake_timeout, self.virtual_display.is_some()).await;
+            let bootstrap = if self.preparation.is_some() || self.virtual_display.is_some() {
+                wake?
             } else {
+                // Mirroring may work even if IOKit did not confirm a wake.
+                if let Err(error) = wake {
+                    tracing::warn!(%error, "mirror display wake not confirmed; trying ScreenCaptureKit");
+                }
                 false
             };
             let early_lease = if bootstrap {
@@ -945,12 +912,7 @@ impl RdpServerDisplay for CaptureDisplay {
                     .as_ref()
                     .expect("virtual display bootstrap");
                 let lease = crate::display_session::ManagedDisplay::acquire(vd).await?;
-                let id = vd
-                    .lock()
-                    .unwrap()
-                    .id_if_active()
-                    .context("bootstrap display missing")?;
-                crate::session_lock::wait_for_unlock_surface(id).await?;
+                crate::session_lock::wait_for_unlock_surface(vd).await?;
                 Some(lease)
             } else {
                 None
@@ -978,15 +940,13 @@ impl RdpServerDisplay for CaptureDisplay {
             let (width, height) = self.sync_virtual_display();
             self.desktop_size.commit_input_size(width, height);
             crate::input::invalidate_display_bounds();
-            if unlocked || lease.is_some() {
+            if unlocked && lease.is_none() {
                 crate::session_lock::wait_for_display(self.display_id).await?;
             }
-            if lease.is_some() {
-                if let Some(id) = self.display_id {
-                    crate::display_session::mark_ready(id);
-                }
-            }
             let inner = self.build_updates(width, height).await?;
+            if let Some(vd) = &self.virtual_display {
+                vd.lock().unwrap().mark_ready();
+            }
             Ok(match lease {
                 Some(lease) => Box::new(crate::display_session::Updates::new(inner, lease))
                     as Box<dyn RdpServerDisplayUpdates>,
@@ -1233,13 +1193,17 @@ impl CaptureDisplay {
                         if !lifecycle.is_current(generation) {
                             return;
                         }
-                        let first = crate::input::gather_windows_onto_display(vd_id);
+                        let first = crate::input::gather_windows_onto_display(
+                            crate::display_session::current_id(vd_id),
+                        );
                         reblank();
                         std::thread::sleep(std::time::Duration::from_millis(1000));
                         if !lifecycle.is_current(generation) {
                             return;
                         }
-                        let second = crate::input::gather_windows_onto_display(vd_id);
+                        let second = crate::input::gather_windows_onto_display(
+                            crate::display_session::current_id(vd_id),
+                        );
                         reblank();
                         // One more after the relayout has fully settled, in case
                         // the second sweep's relayout also trails.
@@ -1300,7 +1264,7 @@ impl CaptureDisplay {
                 width,
                 height,
                 self.fps,
-                self.display_id,
+                self.virtual_display.clone(),
                 self.screen_size_pts,
                 self.cursor_scale * self.pointer_scale(width),
                 self.warp_cursor_home,
@@ -1599,9 +1563,7 @@ mod macos {
         stream: DisplayStream,
         /// What `stream` captures, kept to reopen it after SCK stops it.
         display_id: u32,
-        /// Whether `display_id` is the virtual display, which can come back under a new id.
-        follows_virtual_display: bool,
-        size_px: (u32, u32),
+        virtual_display: Option<crate::display_session::SharedDisplay>,
         stream_config: SCStreamConfiguration,
         pending: std::collections::VecDeque<DisplayUpdate>,
         // Force a full-frame seed on the first sample so the client's
@@ -1872,12 +1834,41 @@ mod macos {
             }
         }
 
+        async fn select_display(
+            virtual_display: Option<&crate::display_session::SharedDisplay>,
+        ) -> Result<SCDisplay> {
+            let timeout = Duration::from_secs(8);
+            let deadline = tokio::time::Instant::now() + timeout;
+            loop {
+                let content = tokio::time::timeout_at(deadline, AsyncSCShareableContent::get())
+                    .await.context("ScreenCaptureKit display enumeration exceeded 8 seconds")?
+                    .map_err(|e| anyhow!("ScreenCaptureKit display enumeration failed (check Screen Recording permission): {e:?}"))?;
+                let displays = content.displays();
+                let ids: Vec<_> = displays.iter().map(|d| d.display_id()).collect();
+                let Some(shared) = virtual_display else {
+                    let main = core_graphics::display::CGDisplay::main().id;
+                    let index =
+                        super::mirror_display_index(&ids, main).context("no displays available")?;
+                    return Ok(displays[index].clone());
+                };
+                if let Some(id) = shared.lock().unwrap().resolve_listed(&ids) {
+                    return Ok(displays.into_iter().find(|d| d.display_id() == id).unwrap());
+                }
+                let next = tokio::time::Instant::now() + Duration::from_millis(200);
+                if next >= deadline {
+                    shared.lock().unwrap().mark_unlisted();
+                    anyhow::bail!("ScreenCaptureKit did not expose the owned virtual display within 8 seconds; listed: {ids:?}");
+                }
+                tokio::time::sleep_until(next).await;
+            }
+        }
+
         #[allow(clippy::too_many_arguments)]
         pub async fn start(
             width: u16,
             height: u16,
             fps: u32,
-            target_display_id: Option<u32>,
+            virtual_display: Option<crate::display_session::SharedDisplay>,
             screen_size_pts: (f64, f64),
             cursor_scale_multiplier: f64,
             warp_cursor_home: bool,
@@ -1894,50 +1885,7 @@ mod macos {
             suppress_next_adopt: Arc<AtomicBool>,
             live_pointer_scale: Option<(Arc<std::sync::atomic::AtomicU32>, f64)>,
         ) -> Result<Self> {
-            let content = AsyncSCShareableContent::get()
-                .await
-                .map_err(|e| anyhow!("AsyncSCShareableContent::get failed (likely Screen Recording permission denied): {e:?}"))?;
-
-            let displays = content.displays();
-            let display = match target_display_id {
-                Some(id) => displays
-                    .iter()
-                    .find(|d| d.display_id() == id)
-                    .with_context(|| {
-                        format!(
-                            "SCK enumeration has no display with id={id} — the \
-                             virtual display didn't register, or the WindowServer \
-                             hasn't picked it up yet. SCK sees: [{}]",
-                            displays
-                                .iter()
-                                .map(|d| format!(
-                                    "id={} {}x{}",
-                                    d.display_id(),
-                                    d.width(),
-                                    d.height()
-                                ))
-                                .collect::<Vec<_>>()
-                                .join(", ")
-                        )
-                    })?,
-                None => {
-                    // Mirror mode: follow the main display, as input does.
-                    let ids: Vec<u32> = displays.iter().map(|d| d.display_id()).collect();
-                    let main_id = core_graphics::display::CGDisplay::main().id;
-                    let index = super::mirror_display_index(&ids, main_id)
-                        .context("no displays available")?;
-                    if ids.len() > 1 {
-                        tracing::info!(
-                            mirrored = ids[index],
-                            main = main_id,
-                            sck_displays = ?ids,
-                            "multiple displays: mirroring the main display"
-                        );
-                    }
-                    &displays[index]
-                }
-            };
-
+            let display = Self::select_display(virtual_display.as_ref()).await?;
             let native_w = u16::try_from(display.width()).context("display width > u16")?;
             let native_h = u16::try_from(display.height()).context("display height > u16")?;
             // Backing (Retina) pixel size of this display. Capturing at EITHER
@@ -2048,7 +1996,7 @@ mod macos {
                 tracing::debug!(color_matrix = ?config.color_matrix(), "capture: NV12 colour matrix");
             }
 
-            let stream = DisplayStream::start(display, &config)
+            let stream = DisplayStream::start(&display, &config)
                 .map_err(|e| anyhow!("SCStream::start_capture failed: {e:?}"))?;
 
             // Cursor scale = session framebuffer px ÷ display backing px.
@@ -2095,8 +2043,7 @@ mod macos {
             Ok(Self {
                 stream,
                 display_id: display.display_id(),
-                follows_virtual_display: target_display_id.is_some(),
-                size_px: (u32::from(width), u32::from(height)),
+                virtual_display,
                 stream_config: config,
                 pending: std::collections::VecDeque::new(),
                 seeded: false,
@@ -2133,20 +2080,16 @@ mod macos {
 
         async fn try_reopen_stream(
             display_id: u32,
-            follows_virtual_display: bool,
-            size_px: (u32, u32),
+            virtual_display: Option<&crate::display_session::SharedDisplay>,
             config: SCStreamConfiguration,
         ) -> Result<Option<(u32, DisplayStream, CMSampleBuffer)>, CaptureStop> {
             let Ok(content) = AsyncSCShareableContent::get().await else {
                 return Ok(None);
             };
             let displays = content.displays();
-            let id = if follows_virtual_display {
-                let online: Vec<_> = displays
-                    .iter()
-                    .map(|d| online_display(d.display_id()))
-                    .collect();
-                let Some(id) = super::pick_reopened_display(display_id, &online, size_px) else {
+            let id = if let Some(shared) = virtual_display {
+                let ids: Vec<_> = displays.iter().map(|d| d.display_id()).collect();
+                let Some(id) = shared.lock().unwrap().resolve_listed(&ids) else {
                     return Ok(None);
                 };
                 id
@@ -2191,8 +2134,7 @@ mod macos {
                 || {
                     Self::try_reopen_stream(
                         display_id,
-                        self.follows_virtual_display,
-                        self.size_px,
+                        self.virtual_display.as_ref(),
                         self.stream_config.clone(),
                     )
                 },
@@ -2236,22 +2178,6 @@ mod macos {
                     None
                 }
             }
-        }
-    }
-
-    fn online_display(id: u32) -> super::OnlineDisplay {
-        extern "C" {
-            fn CGDisplayVendorNumber(display: u32) -> u32;
-        }
-        let d = core_graphics::display::CGDisplay::new(id);
-        let size_px = d.display_mode().map_or((0, 0), |m| {
-            (m.pixel_width() as u32, m.pixel_height() as u32)
-        });
-        super::OnlineDisplay {
-            id,
-            vendor: unsafe { CGDisplayVendorNumber(id) },
-            builtin: d.is_builtin(),
-            size_px,
         }
     }
 
@@ -3049,42 +2975,6 @@ mod tests {
         .await;
         assert_eq!(result, CaptureRecovery::TimedOut);
         assert_eq!(now.elapsed(), CAPTURE_RECOVERY_WINDOW);
-    }
-
-    fn online(id: u32, vendor: u32, builtin: bool, size_px: (u32, u32)) -> OnlineDisplay {
-        OnlineDisplay {
-            id,
-            vendor,
-            builtin,
-            size_px,
-        }
-    }
-
-    #[test]
-    fn a_reregistered_virtual_display_is_found_by_vendor_then_by_size() {
-        const PANEL: u32 = 0x610;
-        const ODD: u32 = 1;
-        let ours = VIRTUAL_DISPLAY_VENDOR;
-        let session = (3024, 1898);
-        let same = [online(22, ours, false, session)];
-        assert_eq!(pick_reopened_display(22, &same, session), Some(22));
-        let by_vendor = [
-            online(1, PANEL, true, (3024, 1964)),
-            online(23, ours, false, session),
-        ];
-        assert_eq!(pick_reopened_display(22, &by_vendor, session), Some(23));
-        let by_size = [
-            online(1, PANEL, true, session),
-            online(23, ODD, false, session),
-        ];
-        assert_eq!(pick_reopened_display(22, &by_size, session), Some(23));
-        let ambiguous = [
-            online(23, ODD, false, session),
-            online(24, ODD, false, session),
-        ];
-        assert_eq!(pick_reopened_display(22, &ambiguous, session), None);
-        let gone = [online(1, PANEL, true, (3024, 1964))];
-        assert_eq!(pick_reopened_display(22, &gone, session), None);
     }
 
     /// #205: mirror the main display even when SCK lists another first.

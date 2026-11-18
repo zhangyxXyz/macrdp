@@ -5,10 +5,12 @@ The package’s `SOURCE_COMMIT` identifies the source of each same-version rebui
 
 ## v0.10.8
 
+- Follow a re-registered virtual display and retry sleep-related display setup. Add opt-in RDP connection quality reporting under **Connection**. [#231](https://github.com/clintcan/macrdp/pull/231) · [#232](https://github.com/clintcan/macrdp/pull/232) · [#235](https://github.com/clintcan/macrdp/pull/235)
 - Configure the display wake timeout under **Display → Lock while away** (1–15 seconds, default 3). Monitor-free reconnects use the virtual display’s wake state to decide when auto-unlock can start.
 - When a locked display sleeps and ScreenCaptureKit loses its source, macrdp disconnects and cleans up the virtual display. Other explicit capture stops get up to three seconds to recover. Empty capture samples can no longer evict the first usable frame.
 - Update to stable `rsa 0.10.0` and `libz-sys 1.1.33`, remove the RSA audit exception, and backport Picky’s EC and JWE fixes. Clipboard transfers use atomically created private staging directories. [Dependency details](vendor/AUTH-SECURITY.md)
 
+- 虚拟屏 ID 变化后跟随新 ID；显示器休眠导致配置失败时唤醒并重试。**Connection** 新增可选的 RDP 连接质量上报，默认关闭。
 - 可在 **Display → Lock while away** 设置显示器唤醒等待上限（1～15 秒，默认 3 秒）。无屏重连通过认证后，服务会等虚拟屏就绪再自动解锁。
 - 锁屏熄屏且 ScreenCaptureKit 丢失采集源时，服务断开会话并清理虚拟屏。其他明确的采集中断最多尝试恢复三秒。空采集样本会跳过，保留首个有效画面。
 - 升级到稳定版 `rsa 0.10.0` 和 `libz-sys 1.1.33`，移除 RSA 审计例外，回移 Picky 的 EC 与 JWE 修复。剪贴板传输改为原子创建私有暂存目录。[依赖说明](vendor/AUTH-SECURITY.md)

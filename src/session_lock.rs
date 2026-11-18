@@ -60,7 +60,10 @@ pub async fn wake_for_capture(timeout: Duration, virtual_configured: bool) -> Re
     wake_for_surface(
         timeout,
         virtual_configured,
-        || display_asleep(None),
+        || {
+            display_asleep(None)
+                || CGDisplay::active_displays().is_ok_and(|active| active.is_empty())
+        },
         || {
             if virtual_configured {
                 let id = crate::display_session::active_display_id();
@@ -115,6 +118,27 @@ fn declare_display_activity() -> Result<()> {
         "display wake request failed (IOReturn {status:#x})"
     );
     Ok(())
+}
+
+/// Blocking display coordinator only. This is invoked after a native
+/// configuration operation actually fails with WindowServer's sleep error.
+/// An intentional lock + Esc must still be able to end a live capture.
+#[cfg(target_os = "macos")]
+pub fn wake_after_configuration_error(id: u32, restoring: bool) -> bool {
+    if !display_asleep(Some(id))
+        || (!restoring && crate::virtual_display::screen_authentication_is_required() == Some(true))
+    {
+        return false;
+    }
+    if let Err(error) = declare_display_activity() {
+        tracing::warn!(%error, "could not wake displays for reconfiguration");
+        return false;
+    }
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    while display_asleep(Some(id)) && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    true
 }
 
 #[cfg(any(target_os = "macos", test))]
@@ -225,17 +249,20 @@ impl CapturePreparation {
 /// wake the lock screen. ScreenCaptureKit enumeration is deliberately not used
 /// here: it can hide the desktop while locked, which would invert the dependency.
 #[cfg(target_os = "macos")]
-pub async fn wait_for_unlock_surface(id: u32) -> Result<()> {
+pub async fn wait_for_unlock_surface(shared: &crate::display_session::SharedDisplay) -> Result<()> {
     use core_graphics::display::CGDisplay;
     use std::time::Duration;
     tokio::time::timeout(Duration::from_secs(8), async {
         loop {
             let active = CGDisplay::active_displays().unwrap_or_default();
-            let bounds = CGDisplay::new(id).bounds();
-            if !CGDisplay::new(id).is_asleep()
-                && unlock_surface_ready(&active, id, bounds.size.width, bounds.size.height)
-            {
-                return;
+            let id = shared.lock().unwrap().resolve_listed(&active);
+            if let Some(id) = id {
+                let bounds = CGDisplay::new(id).bounds();
+                if !CGDisplay::new(id).is_asleep()
+                    && unlock_surface_ready(&active, id, bounds.size.width, bounds.size.height)
+                {
+                    return;
+                }
             }
             tokio::time::sleep(Duration::from_millis(200)).await;
         }
@@ -243,12 +270,12 @@ pub async fn wait_for_unlock_surface(id: u32) -> Result<()> {
     .await
     .map_err(|_| {
         anyhow::anyhow!(
-            "WindowServer did not activate virtual display {id} within 8 seconds before unlock"
+            "WindowServer did not activate the owned virtual display within 8 seconds before unlock"
         )
     })
 }
 #[cfg(not(target_os = "macos"))]
-pub async fn wait_for_unlock_surface(_: u32) -> Result<()> {
+pub async fn wait_for_unlock_surface(_: &crate::display_session::SharedDisplay) -> Result<()> {
     Ok(())
 }
 

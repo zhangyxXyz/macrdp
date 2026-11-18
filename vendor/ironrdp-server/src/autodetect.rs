@@ -9,6 +9,8 @@
 //!
 //! [MS-RDPBCGR 2.2.14]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpbcgr/dc672839-4f4e-40b1-a71c-cd6a959baa38
 
+mod connect_time;
+
 use std::collections::VecDeque;
 
 use ironrdp_pdu::rdp::autodetect::{AutoDetectRequest, AutoDetectResponse};

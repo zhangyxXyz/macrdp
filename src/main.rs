@@ -461,6 +461,12 @@ struct Args {
     #[arg(long)]
     stats_endpoint: bool,
 
+    /// Report network quality to compatible RDP clients. Estimate bandwidth
+    /// at login, refresh latency every five seconds, and mark legacy surface
+    /// frames when supported. Clients may use the estimate to adjust quality.
+    #[arg(long)]
+    network_autodetect: bool,
+
     /// Serve the display as H.264 video over the EGFX virtual channel
     /// (MS-RDPEGFX, AVC420) instead of legacy RemoteFx/QOI BitmapUpdates.
     /// Hardware-encoded via VideoToolbox. Falls back to the legacy path
@@ -2240,7 +2246,7 @@ fn spawn_primary_overlay_watcher<T: Send + 'static>(
                             if worker_tracker.count.load(Ordering::SeqCst) == 0 {
                                 return Ok(false);
                             }
-                            let ovr = install(vd_id)?;
+                            let ovr = install(display_session::current_id(vd_id))?;
                             if stopping.load(Ordering::Acquire) {
                                 // Shutdown began while CoreGraphics was busy. Restore
                                 // on this blocking worker; never publish a late guard.
@@ -2291,7 +2297,8 @@ fn spawn_primary_overlay_watcher<T: Send + 'static>(
                                     {
                                         return;
                                     }
-                                    let moved = restore_gather_windows(vd_id);
+                                    let moved =
+                                        restore_gather_windows(display_session::current_id(vd_id));
                                     if moved > 0 {
                                         info!(
                                             label,
@@ -2868,6 +2875,7 @@ fn effective_config(args: &Args, document: &config::Document) -> serde_json::Val
         "capture_nv12": args.capture_nv12 && args.enable_h264,
         "max_client_size": args.max_client_size.map(|(w,h)| format!("{w}x{h}")),
         "stats_endpoint": args.stats_endpoint,
+        "network_autodetect": args.network_autodetect,
         "display_wake_timeout_secs": args.display_wake_timeout_secs,
         "stats_port": document.values.get("STATS_PORT").and_then(|v| v.parse::<u16>().ok()).unwrap_or(40245),
     })
@@ -3032,6 +3040,9 @@ fn args_from_config_values(path: &Path, document: &config::Document) -> Result<A
     }
     if on("STATS_ENDPOINT", false) {
         argv.push("--stats-endpoint".into());
+    }
+    if on("NETWORK_AUTODETECT", false) {
+        argv.push("--network-autodetect".into());
     }
     if on("CAPTURE_NV12", false) {
         argv.push("--capture-nv12".into());
@@ -3577,7 +3588,6 @@ async fn async_main(mut args: Args, document: Option<config::Document>) -> Resul
         Some(VdHidpiArg::Auto) => virtual_display::HidpiPolicy::Auto(client_scale_factor.clone()),
     };
     let virtual_display = if args.virtual_display {
-        display_session::enable();
         let width = args.width.context("--virtual-display requires --width")?;
         let height = args.height.context("--virtual-display requires --height")?;
         let (detached, captured, shielded) = (
@@ -4037,7 +4047,7 @@ async fn async_main(mut args: Args, document: Option<config::Document>) -> Resul
         // Bind audio to the same display the video captures so --detach-primary
         // / --capture-primary (which disable/capture the physical panel) don't
         // kill the audio stream's content source.
-        capture_display_id,
+        virtual_display.as_ref().map(std::sync::Arc::downgrade),
     ));
 
     // with_hybrid advertises HYBRID | HYBRID_EX so clients run CredSSP/NLA
@@ -4217,6 +4227,9 @@ async fn async_main(mut args: Args, document: Option<config::Document>) -> Resul
     // connection (divergence 15) into this cell; the H.264 pipeline reads it
     // for link-aware blank-recovery gating + adaptive-bitrate seeding.
     server.set_link_rtt_handle(link_rtt_ms.clone());
+    if args.network_autodetect {
+        server.enable_network_autodetect();
+    }
 
     // EXPERIMENTAL UDP multitransport (MS-RDPEMT). When enabled, install the
     // provider so the server offers reliable UDP to clients that advertise it,
@@ -4670,6 +4683,34 @@ mod config_tests {
         assert!(args.keychain);
         // EXTRA_FLAGS is parsed as real CLI tokens.
         assert_eq!(args.fps, Some(30));
+    }
+
+    #[test]
+    fn network_autodetect_is_opt_in_from_cli_or_config() {
+        assert!(!Args::try_parse_from(["macrdp"]).unwrap().network_autodetect);
+        assert!(
+            Args::try_parse_from(["macrdp", "--network-autodetect"])
+                .unwrap()
+                .network_autodetect
+        );
+        for (config, enabled) in [
+            ("", false),
+            ("NETWORK_AUTODETECT=0", false),
+            ("NETWORK_AUTODETECT=1", true),
+            ("EXTRA_FLAGS=--network-autodetect", true),
+        ] {
+            let path = write_temp("network-autodetect", config);
+            let report = check_config_report(&path);
+            fs::remove_file(path).unwrap();
+            assert_eq!(report["ok"], true, "{report}");
+            assert_eq!(report["effective"]["network_autodetect"], enabled);
+        }
+        for config in [
+            "NETWORK_AUTODETECT=true",
+            "NETWORK_AUTODETECT=0\nEXTRA_FLAGS=--network-autodetect",
+        ] {
+            assert!(config::Document::parse(config).ensure_valid().is_err());
+        }
     }
 
     #[test]

@@ -9,6 +9,8 @@
 //! private API-related is in `private_api.rs`; nothing outside this
 //! module should touch that file.
 
+#[cfg(any(target_os = "macos", test))]
+mod identity;
 #[cfg(target_os = "macos")]
 mod private_api;
 
@@ -29,6 +31,19 @@ pub use stub::{
 #[cfg(any(target_os = "macos", test))]
 fn shield_ack_sufficient(ack: Option<u16>, targets: usize) -> bool {
     ack.is_some_and(|n| usize::from(n) >= targets)
+}
+
+/// 1014 is the WindowServer result observed when reconfiguring a sleeping
+/// display in #232. Retry only that transaction and only after a targeted wake.
+#[cfg(any(target_os = "macos", test))]
+fn retry_sleeping_transaction<T>(
+    mut transaction: impl FnMut() -> Result<T, i32>,
+    wake: impl FnOnce() -> bool,
+) -> Result<T, i32> {
+    match transaction() {
+        Err(1014) if wake() => transaction(),
+        outcome => outcome,
+    }
 }
 
 /// Disabled displays can disappear from CG's online list. The saved detach
@@ -230,6 +245,53 @@ mod macos {
     // race and reject the second with CGError 1001.
     const TX_SETTLE: Duration = Duration::from_millis(200);
 
+    /// On a queue failure cancel the open transaction before retrying. A
+    /// later operation cannot replay an already committed layout change.
+    fn install_transaction(
+        vd: &CGDisplay,
+        scope: CGConfigureOption,
+        operation: &str,
+        mut queue: impl FnMut(core_graphics::display::CGDisplayConfigRef) -> Result<(), CGError>,
+    ) -> Result<()> {
+        super::retry_sleeping_transaction(
+            || {
+                let config = vd.begin_configuration()?;
+                if let Err(error) = queue(config) {
+                    let _ = vd.cancel_configuration(&config);
+                    return Err(error);
+                }
+                vd.complete_configuration(&config, scope)
+            },
+            || crate::session_lock::wake_after_configuration_error(vd.id, false),
+        )
+        .map_err(|e| anyhow!("{operation}: CGError {e}"))
+    }
+
+    fn move_for_overlay(
+        vd: &CGDisplay,
+        vd_width: i32,
+        physical: &[(u32, (i32, i32))],
+        scope: CGConfigureOption,
+    ) -> Result<()> {
+        install_transaction(
+            vd,
+            scope,
+            "positioning displays for headless overlay",
+            |config| {
+                vd.configure_display_origin(&config, 0, 0)?;
+                let mut x = vd_width;
+                for (id, _) in physical {
+                    let d = CGDisplay::new(*id);
+                    if d.is_active() {
+                        d.configure_display_origin(&config, x, 0)?;
+                        x += d.bounds().size.width.round() as i32;
+                    }
+                }
+                Ok(())
+            },
+        )
+    }
+
     /// Set true by `DetachedPrimary::drop` when bounded re-enable attempts fail
     /// to confirm every saved display active. The overlay watcher consumes this
     /// result and can request a launchd restart after disconnect locking (#168).
@@ -398,7 +460,9 @@ mod macos {
     pub struct VirtualDisplay {
         // RAII: dropped last so the CG handle is released after we've
         // logged anything we want to log about it.
-        _handle: private_api::Handle,
+        handle: Option<private_api::Handle>,
+        refresh_hz: u32,
+        requested_px: (u32, u32),
         display_id: u32,
         origin_pts: (f64, f64),
         size_pts: (f64, f64),
@@ -416,6 +480,21 @@ mod macos {
         /// separately from `size_pts × ui_scale` because an odd pixel count
         /// can't be halved exactly.
         mode_px: (u32, u32),
+    }
+
+    fn forget_scale(id: u32) {
+        let _ = HIDPI_DISPLAY_ID.compare_exchange(
+            id,
+            0,
+            std::sync::atomic::Ordering::Relaxed,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+
+    impl Drop for VirtualDisplay {
+        fn drop(&mut self) {
+            forget_scale(self.display_id);
+        }
     }
 
     /// How long a reading that matches the pre-resize bounds is treated as
@@ -519,15 +598,17 @@ mod macos {
         ) -> Result<Self> {
             let ui_scale = if hidpi { ui_scale.max(1) } else { 1 };
             let (mode_w, mode_h) = (mode_points(width, ui_scale), mode_points(height, ui_scale));
-            let handle = private_api::create(
-                mode_w,
-                mode_h,
-                refresh_hz,
-                "macrdp",
-                hidpi,
-                hidpi,
-                super::panel_size_mm(width, height, hidpi),
-            )
+            let handle = objc2::rc::autoreleasepool(|_| {
+                private_api::create(
+                    mode_w,
+                    mode_h,
+                    refresh_hz,
+                    "macrdp",
+                    hidpi,
+                    hidpi,
+                    super::panel_size_mm(width, height, hidpi),
+                )
+            })
             .context("creating virtual display")?;
 
             // CGDisplayBounds gives both the origin (in global point space)
@@ -557,7 +638,9 @@ mod macos {
             };
 
             let mut vd = Self {
-                _handle: handle,
+                handle: Some(handle),
+                refresh_hz,
+                requested_px: (width, height),
                 display_id: id,
                 origin_pts: (bounds.origin.x, bounds.origin.y),
                 size_pts: (bounds.size.width, bounds.size.height),
@@ -607,12 +690,7 @@ mod macos {
                 HIDPI_DISPLAY_ID.store(self.display_id, std::sync::atomic::Ordering::Relaxed);
                 return;
             }
-            let _ = HIDPI_DISPLAY_ID.compare_exchange(
-                self.display_id,
-                0,
-                std::sync::atomic::Ordering::Relaxed,
-                std::sync::atomic::Ordering::Relaxed,
-            );
+            HIDPI_DISPLAY_ID.store(0, std::sync::atomic::Ordering::Relaxed);
             if self.hidpi {
                 tracing::warn!(
                     requested_points = ?(mode_w, self.size_pts.1),
@@ -636,6 +714,79 @@ mod macos {
 
         pub fn display_id(&self) -> u32 {
             self.display_id
+        }
+
+        pub fn resolve_listed(&mut self, ids: &[u32]) -> Option<u32> {
+            let live = self.handle.as_ref()?.live_display_id();
+            let id = super::identity::resolve(live, ids)?;
+            if id != self.display_id {
+                let bounds = CGDisplay::new(id).bounds();
+                if bounds.size.width <= 0.0 || bounds.size.height <= 0.0 {
+                    return None;
+                }
+                self.display_id = id;
+                self.origin_pts = (bounds.origin.x, bounds.origin.y);
+                self.size_pts = (bounds.size.width, bounds.size.height);
+                self.mode_px = (0, 0);
+                self.record_scale(mode_points(self.requested_px.0, self.ui_scale));
+            }
+            Some(id)
+        }
+
+        /// Capture acquisition runs on the serialized blocking display worker.
+        /// Allow a transient CG enumeration gap to settle before releasing the
+        /// descriptor. A query failure is not evidence that the display is gone.
+        pub fn refresh_online(&mut self) -> Result<bool> {
+            for attempt in 0..4 {
+                let ids = online_displays()
+                    .map_err(|e| anyhow!("CGGetOnlineDisplayList: CGError {e}"))?;
+                if self.resolve_listed(&ids).is_some() {
+                    return Ok(true);
+                }
+                if attempt < 3 {
+                    std::thread::sleep(Duration::from_millis(150));
+                }
+            }
+            Ok(false)
+        }
+
+        pub fn has_handle(&self) -> bool {
+            self.handle.is_some()
+        }
+
+        pub fn recreate(&mut self) -> Result<()> {
+            let (width, height) = self.requested_px;
+            tracing::warn!(
+                old_id = self.display_id,
+                width,
+                height,
+                hidpi = self.hidpi,
+                scale = self.ui_scale,
+                "recreating unavailable virtual display"
+            );
+            forget_scale(self.display_id);
+            drop(self.handle.take());
+            // WindowServer can reject the identical descriptor briefly after
+            // release. Retry only that error, never a mode failure or TCC.
+            let deadline = std::time::Instant::now() + Duration::from_secs(3);
+            *self = loop {
+                match Self::new(width, height, self.refresh_hz, self.hidpi, self.ui_scale) {
+                    Err(e)
+                        if e.is::<private_api::DescriptorRejected>()
+                            && std::time::Instant::now() < deadline =>
+                    {
+                        std::thread::sleep(Duration::from_millis(100));
+                    }
+                    result => break result?,
+                }
+            };
+            // If CG reused the same numeric ID, dropping the replaced object
+            // cleared the prior scale registration. Republish the new reading.
+            self.record_scale(mode_points(width, self.ui_scale));
+            // WindowServer may have restored a different preferred mode; let
+            // the next synchronization apply the newly negotiated pixel size.
+            self.mode_px = (0, 0);
+            Ok(())
         }
 
         pub fn origin_pts(&self) -> (f64, f64) {
@@ -662,6 +813,7 @@ mod macos {
             // below), so forget the last size. Otherwise a later request for
             // that same size would look already applied and skip the re-mode.
             self.mode_px = (0, 0);
+            self.requested_px = (width, height);
             // After `applySettings:` macOS can keep the display on another
             // mode instead of the one applied: it stores a preferred mode per
             // display and restores it whenever the new mode list still has
@@ -751,7 +903,9 @@ mod macos {
         fn apply_and_wait(&mut self, mode_w: u32, mode_h: u32) -> Result<Landed> {
             let before = CGDisplay::new(self.display_id).bounds().size;
             let before = (before.width as u32, before.height as u32);
-            self._handle
+            self.handle
+                .as_ref()
+                .context("virtual display handle unavailable")?
                 .apply_mode(mode_w, mode_h, 60, self.hidpi)
                 .context("re-applying virtual display mode")?;
             self.wait_landed(before, mode_w, mode_h)
@@ -924,7 +1078,7 @@ mod macos {
                 self.primary_old_origin.0,
                 self.primary_old_origin.1,
             );
-            let vd = CGDisplay::new(self.virtual_id);
+            let vd = CGDisplay::new(crate::display_session::current_id(self.virtual_id));
             let _ = vd.configure_display_origin(
                 &config,
                 self.virtual_old_origin.0,
@@ -1038,23 +1192,12 @@ mod macos {
             // which then refused to re-enable on Drop (CGError 1001 at
             // complete-time). Keep each transaction single-purpose so the
             // display's state machine stays consistent.
-            let config = any
-                .begin_configuration()
-                .map_err(|e| anyhow!("CGBeginDisplayConfiguration (move-tx): CGError {e}"))?;
-            vd.configure_display_origin(&config, 0, 0)
-                .map_err(|e| anyhow!("CGConfigureDisplayOrigin(vd, 0, 0): CGError {e}"))?;
-            let mut x_off = vd_width;
-            for (id, _) in &detached {
-                let d = CGDisplay::new(*id);
-                if d.is_active() {
-                    d.configure_display_origin(&config, x_off, 0).map_err(|e| {
-                        anyhow!("CGConfigureDisplayOrigin(physical {id}, {x_off}, 0): CGError {e}")
-                    })?;
-                    x_off += d.bounds().size.width.round() as i32;
-                }
-            }
-            any.complete_configuration(&config, CGConfigureOption::ConfigureForAppOnly)
-                .map_err(|e| anyhow!("CGCompleteDisplayConfiguration (move-tx): CGError {e}"))?;
+            move_for_overlay(
+                &any,
+                vd_width,
+                &detached,
+                CGConfigureOption::ConfigureForAppOnly,
+            )?;
 
             std::thread::sleep(TX_SETTLE);
 
@@ -1062,28 +1205,33 @@ mod macos {
             // applies cleanly and the display's last-known position is the
             // shifted one — important because that's what SkyLight will
             // validate against on the eventual re-enable.
-            let config = any
-                .begin_configuration()
-                .map_err(|e| anyhow!("CGBeginDisplayConfiguration (disable-tx): CGError {e}"))?;
-            for (id, _) in &detached {
-                if CGDisplay::new(*id).is_active() {
-                    enabler.set(config, *id, false)?;
-                }
-            }
-            any.complete_configuration(&config, CGConfigureOption::ConfigureForAppOnly)
-                .map_err(|e| anyhow!("CGCompleteDisplayConfiguration (disable-tx): CGError {e}"))?;
-
-            tracing::info!(
-                detached_count = detached.len(),
-                "physical displays detached"
-            );
-
-            Ok(Self {
+            let guard = Self {
                 virtual_id: virtual_display_id,
                 virtual_old_origin,
                 detached,
                 enabler: Some(enabler),
-            })
+            };
+            // The positioning transaction already committed. Its guard will
+            // restore the original layout if disabling fails at any point.
+            let enabler = guard.enabler.as_ref().unwrap();
+            install_transaction(
+                &any,
+                CGConfigureOption::ConfigureForAppOnly,
+                "disabling physical displays",
+                |config| {
+                    for (id, _) in &guard.detached {
+                        if CGDisplay::new(*id).is_active() {
+                            enabler.set(config, *id, false)?;
+                        }
+                    }
+                    Ok(())
+                },
+            )?;
+            tracing::info!(
+                detached_count = guard.detached.len(),
+                "physical displays detached"
+            );
+            Ok(guard)
         }
     }
 
@@ -1102,7 +1250,7 @@ mod macos {
                 detached_count = self.detached.len(),
                 "DetachedPrimary::drop running — re-enabling physical displays"
             );
-            let any = CGDisplay::new(self.virtual_id);
+            let any = CGDisplay::new(crate::display_session::current_id(self.virtual_id));
 
             // Two transactions: re-enable in tx 1, reposition in tx 2.
             // Mixing both in a single transaction trips CGError 1001
@@ -1131,7 +1279,12 @@ mod macos {
                             begin_ms = begin_started.elapsed().as_millis() as u64,
                             "could not begin enable-tx during detach restore (CGError {e})"
                         );
-                        if attempt < MAX_ENABLE_ATTEMPTS {
+                        if attempt < MAX_ENABLE_ATTEMPTS
+                            && (e != 1014
+                                || !crate::session_lock::wake_after_configuration_error(
+                                    any.id, true,
+                                ))
+                        {
                             std::thread::sleep(ENABLE_RETRY_BACKOFF);
                         }
                         continue;
@@ -1203,7 +1356,12 @@ mod macos {
                     }
                     Err(e) => {
                         tracing::warn!(attempt, "enable-tx complete failed (CGError {e})");
-                        if attempt < MAX_ENABLE_ATTEMPTS {
+                        if attempt < MAX_ENABLE_ATTEMPTS
+                            && (e != 1014
+                                || !crate::session_lock::wake_after_configuration_error(
+                                    any.id, true,
+                                ))
+                        {
                             std::thread::sleep(ENABLE_RETRY_BACKOFF);
                         }
                     }
@@ -1245,11 +1403,12 @@ mod macos {
             for (id, origin) in &self.detached {
                 let _ = CGDisplay::new(*id).configure_display_origin(&config, origin.0, origin.1);
             }
-            let _ = CGDisplay::new(self.virtual_id).configure_display_origin(
-                &config,
-                self.virtual_old_origin.0,
-                self.virtual_old_origin.1,
-            );
+            let _ = CGDisplay::new(crate::display_session::current_id(self.virtual_id))
+                .configure_display_origin(
+                    &config,
+                    self.virtual_old_origin.0,
+                    self.virtual_old_origin.1,
+                );
             let queue_ms = queue_started.elapsed().as_millis() as u64;
             let complete_started = std::time::Instant::now();
             let completion =
@@ -1408,23 +1567,12 @@ mod macos {
             // (0,0) again (a lone display always anchors the arrangement);
             // logout clears the session store as a backstop.
             let any = CGDisplay::new(virtual_display_id);
-            let config = any
-                .begin_configuration()
-                .map_err(|e| anyhow!("CGBeginDisplayConfiguration (move-tx): CGError {e}"))?;
-            vd.configure_display_origin(&config, 0, 0)
-                .map_err(|e| anyhow!("CGConfigureDisplayOrigin(vd, 0, 0): CGError {e}"))?;
-            let mut x_off = vd_width;
-            for (id, _) in &targets {
-                let d = CGDisplay::new(*id);
-                if d.is_active() {
-                    d.configure_display_origin(&config, x_off, 0).map_err(|e| {
-                        anyhow!("CGConfigureDisplayOrigin(physical {id}, {x_off}, 0): CGError {e}")
-                    })?;
-                    x_off += d.bounds().size.width.round() as i32;
-                }
-            }
-            any.complete_configuration(&config, CGConfigureOption::ConfigureForSession)
-                .map_err(|e| anyhow!("CGCompleteDisplayConfiguration (move-tx): CGError {e}"))?;
+            move_for_overlay(
+                &any,
+                vd_width,
+                &targets,
+                CGConfigureOption::ConfigureForSession,
+            )?;
 
             std::thread::sleep(TX_SETTLE);
 
@@ -1565,7 +1713,7 @@ mod macos {
             std::thread::sleep(TX_SETTLE);
 
             // Best-effort restore of the pre-install origins.
-            let any = CGDisplay::new(self.virtual_id);
+            let any = CGDisplay::new(crate::display_session::current_id(self.virtual_id));
             let config = match any.begin_configuration() {
                 Ok(c) => c,
                 Err(e) => {
@@ -1579,11 +1727,12 @@ mod macos {
             for (id, origin) in &self.captured {
                 let _ = CGDisplay::new(*id).configure_display_origin(&config, origin.0, origin.1);
             }
-            let _ = CGDisplay::new(self.virtual_id).configure_display_origin(
-                &config,
-                self.virtual_old_origin.0,
-                self.virtual_old_origin.1,
-            );
+            let _ = CGDisplay::new(crate::display_session::current_id(self.virtual_id))
+                .configure_display_origin(
+                    &config,
+                    self.virtual_old_origin.0,
+                    self.virtual_old_origin.1,
+                );
             // ConfigureForSession (NOT ForAppOnly) — MUST match `install`'s
             // ConfigureForSession. `install` persists "vd@(0,0) is main" into the
             // WindowServer's session store; if this restore reverts the origins
@@ -1657,6 +1806,8 @@ mod macos {
         /// default keep-physical-main mode, in which case `Drop` has no
         /// arrangement to restore (it only lowers the shields).
         moved_arrangement: bool,
+        /// Delayed work must complete before this overlay restores its panels.
+        live: std::sync::Arc<std::sync::Mutex<bool>>,
         /// Physical displays whose vd-mirror `install` broke (single-panel
         /// auto-mirror hardware). `Drop` re-mirrors them so the built-in panel
         /// shows the desktop again between sessions. Empty on hardware where
@@ -1836,23 +1987,19 @@ mod macos {
                 // kCGNullDirectDisplay (id 0) as the mirror master = "mirror
                 // nothing" = break the mirror.
                 let null_master = CGDisplay::new(0);
-                let unmirror = || -> Result<()> {
-                    let config = any.begin_configuration().map_err(|e| {
-                        anyhow!("CGBeginDisplayConfiguration (unmirror-tx): CGError {e}")
-                    })?;
-                    for id in &broke_mirror {
-                        CGDisplay::new(*id)
-                            .configure_display_mirror_of_display(&config, &null_master)
-                            .map_err(|e| {
-                                anyhow!(
-                                    "CGConfigureDisplayMirrorOfDisplay(break {id}): CGError {e}"
-                                )
-                            })?;
-                    }
-                    any.complete_configuration(&config, CGConfigureOption::ConfigureForAppOnly)
-                        .map_err(|e| {
-                            anyhow!("CGCompleteDisplayConfiguration (unmirror-tx): CGError {e}")
-                        })
+                let unmirror = || {
+                    install_transaction(
+                        &any,
+                        CGConfigureOption::ConfigureForAppOnly,
+                        "breaking display mirror",
+                        |config| {
+                            for id in &broke_mirror {
+                                CGDisplay::new(*id)
+                                    .configure_display_mirror_of_display(&config, &null_master)?;
+                            }
+                            Ok(())
+                        },
+                    )
                 };
                 unmirror().context(
                     "could not break the vd↔physical mirror — refusing to engage \
@@ -1900,44 +2047,37 @@ mod macos {
                 // if it matters for a deployment, test ⌃⌘Q on a live shielded
                 // session before relying on it (see the shield notes in
                 // docs/known-quirks.md).
-                let displace = || -> Result<()> {
-                    let any = CGDisplay::new(virtual_display_id);
-                    let config = any.begin_configuration().map_err(|e| {
-                        anyhow!("CGBeginDisplayConfiguration (displace-tx): CGError {e}")
-                    })?;
-                    // Pin the vd at (0,0) so it owns the origin the client sees…
-                    vd.configure_display_origin(&config, 0, 0)
-                        .map_err(|e| anyhow!("CGConfigureDisplayOrigin(vd, 0, 0): CGError {e}"))?;
-                    // …and push each unmirrored physical to the right of it.
-                    let mut x_off = vd_width;
-                    for id in &broke_mirror {
-                        let d = CGDisplay::new(*id);
-                        d.configure_display_origin(&config, x_off, 0).map_err(|e| {
-                            anyhow!(
-                                "CGConfigureDisplayOrigin(physical {id}, {x_off}, 0): CGError {e}"
-                            )
-                        })?;
-                        x_off += d.bounds().size.width.round().max(1.0) as i32;
-                    }
-                    // ConfigureForSession, NOT ForAppOnly — the #161/#162 lesson
-                    // replayed on this path, from a live re-strand (2026-07-22):
-                    // with ForAppOnly the WindowServer's session store never
-                    // learns the displaced arrangement, and a TRAILING relayout
-                    // re-derives window placement from the stale store — a
-                    // window the connect-time gather had already parked on the
-                    // vd was observed re-stranded onto the physical's region
-                    // minutes later ("chrome window is not showing"), exactly
-                    // the whack-a-mole `CapturedPrimary` hit before its
-                    // ForSession fix. Crash-safety holds by the same #162
-                    // argument: if macrdp dies, the vd vanishes and the lone
-                    // physical auto-anchors at (0,0) regardless of the store (a
-                    // single display always anchors the arrangement), and Drop's
-                    // re-mirror makes the stored origin moot on a clean
-                    // disconnect (a mirrored panel has no independent origin).
-                    any.complete_configuration(&config, CGConfigureOption::ConfigureForSession)
-                        .map_err(|e| {
-                            anyhow!("CGCompleteDisplayConfiguration (displace-tx): CGError {e}")
-                        })
+                // ConfigureForSession, NOT ForAppOnly — the #161/#162 lesson
+                // replayed on this path, from a live re-strand (2026-07-22):
+                // with ForAppOnly the WindowServer's session store never
+                // learns the displaced arrangement, and a TRAILING relayout
+                // re-derives window placement from the stale store — a
+                // window the connect-time gather had already parked on the
+                // vd was observed re-stranded onto the physical's region
+                // minutes later ("chrome window is not showing"), exactly
+                // the whack-a-mole `CapturedPrimary` hit before its
+                // ForSession fix. Crash-safety holds by the same #162
+                // argument: if macrdp dies, the vd vanishes and the lone
+                // physical auto-anchors at (0,0) regardless of the store (a
+                // single display always anchors the arrangement), and Drop's
+                // re-mirror makes the stored origin moot on a clean
+                // disconnect (a mirrored panel has no independent origin).
+                let displace = || {
+                    install_transaction(
+                        &vd,
+                        CGConfigureOption::ConfigureForSession,
+                        "displacing unmirrored displays",
+                        |config| {
+                            vd.configure_display_origin(&config, 0, 0)?;
+                            let mut x = vd_width;
+                            for id in &broke_mirror {
+                                let d = CGDisplay::new(*id);
+                                d.configure_display_origin(&config, x, 0)?;
+                                x += d.bounds().size.width.round().max(1.0) as i32;
+                            }
+                            Ok(())
+                        },
+                    )
                 };
                 // Non-fatal: if the displace fails the shield still covers the
                 // panel (privacy intact); the only loss is the client seeing an
@@ -2092,30 +2232,13 @@ mod macos {
                 // (macrdp keeps running; the watcher just logs the failed install).
                 // So the fallible remainder runs in a closure whose `Err` we
                 // intercept to lower the shields before propagating.
-                let arrange = || -> Result<()> {
-                    let any = CGDisplay::new(virtual_display_id);
-                    let config = any.begin_configuration().map_err(|e| {
-                        anyhow!("CGBeginDisplayConfiguration (move-tx): CGError {e}")
-                    })?;
-                    vd.configure_display_origin(&config, 0, 0)
-                        .map_err(|e| anyhow!("CGConfigureDisplayOrigin(vd, 0, 0): CGError {e}"))?;
-                    let mut x_off = vd_width;
-                    for (id, _) in &targets {
-                        let d = CGDisplay::new(*id);
-                        if d.is_active() {
-                            d.configure_display_origin(&config, x_off, 0).map_err(|e| {
-                                anyhow!(
-                                    "CGConfigureDisplayOrigin(physical {id}, {x_off}, 0): CGError {e}"
-                                )
-                            })?;
-                            x_off += d.bounds().size.width.round() as i32;
-                        }
-                    }
-                    any.complete_configuration(&config, CGConfigureOption::ConfigureForSession)
-                        .map_err(|e| {
-                            anyhow!("CGCompleteDisplayConfiguration (move-tx): CGError {e}")
-                        })?;
-                    Ok(())
+                let arrange = || {
+                    move_for_overlay(
+                        &vd,
+                        vd_width,
+                        &targets,
+                        CGConfigureOption::ConfigureForSession,
+                    )
                 };
                 if let Err(e) = arrange() {
                     tracing::warn!(
@@ -2160,6 +2283,7 @@ mod macos {
                  which disturbs the remote cursor; their clicks are swallowed."
             );
 
+            let live = std::sync::Arc::new(std::sync::Mutex::new(true));
             if displaced {
                 // The displace pushed the user's windows OFF the vd (they
                 // travelled with the physical). Now pull them back onto the vd —
@@ -2174,11 +2298,22 @@ mod macos {
                 // displace has variable timing and can trail the first sweep.
                 // A no-op second sweep is cheap.
                 let vd_for_gather = virtual_display_id;
+                let gather_live = live.clone();
                 std::thread::spawn(move || {
+                    let gather = || {
+                        let active = gather_live.lock().unwrap();
+                        if *active {
+                            crate::input::gather_windows_onto_display(
+                                crate::display_session::current_id(vd_for_gather),
+                            )
+                        } else {
+                            0
+                        }
+                    };
                     std::thread::sleep(Duration::from_millis(900));
-                    let first = crate::input::gather_windows_onto_display(vd_for_gather);
+                    let first = gather();
                     std::thread::sleep(Duration::from_millis(1000));
-                    let second = crate::input::gather_windows_onto_display(vd_for_gather);
+                    let second = gather();
                     if first > 0 || second > 0 {
                         tracing::info!(
                             first,
@@ -2193,6 +2328,7 @@ mod macos {
             Ok(Self {
                 virtual_id: virtual_display_id,
                 virtual_old_origin,
+                live,
                 shielded: targets,
                 moved_arrangement: !keep_physical_main,
                 broke_mirror,
@@ -2219,8 +2355,14 @@ mod macos {
         /// Always returns 0 (nothing to report synchronously); failures are
         /// logged from the thread.
         pub fn reassert_blanking(&self) -> usize {
-            let vd = self.virtual_id;
+            let id = self.virtual_id;
+            let live = self.live.clone();
             std::thread::spawn(move || {
+                let active = live.lock().unwrap();
+                if !*active {
+                    return;
+                }
+                let vd = crate::display_session::current_id(id);
                 if let Err(e) = crate::shield::show(&[vd]) {
                     tracing::warn!("could not re-fit shields after a display change: {e:#}");
                 }
@@ -2231,6 +2373,7 @@ mod macos {
 
     impl Drop for ShieldedPrimary {
         fn drop(&mut self) {
+            *self.live.lock().unwrap() = false;
             tracing::info!(
                 shielded_count = self.shielded.len(),
                 "ShieldedPrimary::drop running — lowering shields + restoring layout"
@@ -2251,7 +2394,10 @@ mod macos {
             // process EXIT — a clean disconnect keeps the process alive, so we
             // must re-mirror explicitly here or the built-in is left a separate,
             // empty extended desktop.
-            remirror_onto_vd(self.virtual_id, &self.broke_mirror);
+            remirror_onto_vd(
+                crate::display_session::current_id(self.virtual_id),
+                &self.broke_mirror,
+            );
 
             // In keep-physical-main mode `install` never moved the arrangement,
             // so there is nothing to restore — lowering the shields (and any
@@ -2261,7 +2407,7 @@ mod macos {
                 return;
             }
 
-            let any = CGDisplay::new(self.virtual_id);
+            let any = CGDisplay::new(crate::display_session::current_id(self.virtual_id));
             let config = match any.begin_configuration() {
                 Ok(c) => c,
                 Err(e) => {
@@ -2275,11 +2421,12 @@ mod macos {
             for (id, origin) in &self.shielded {
                 let _ = CGDisplay::new(*id).configure_display_origin(&config, origin.0, origin.1);
             }
-            let _ = CGDisplay::new(self.virtual_id).configure_display_origin(
-                &config,
-                self.virtual_old_origin.0,
-                self.virtual_old_origin.1,
-            );
+            let _ = CGDisplay::new(crate::display_session::current_id(self.virtual_id))
+                .configure_display_origin(
+                    &config,
+                    self.virtual_old_origin.0,
+                    self.virtual_old_origin.1,
+                );
             // ConfigureForSession — MUST match `install`, for exactly the reason
             // spelled out in `CapturedPrimary`'s Drop (a ForAppOnly restore
             // leaves the persisted store saying "vd is main" and the Dock
@@ -2342,6 +2489,15 @@ mod stub {
         }
         pub fn display_id(&self) -> u32 {
             0
+        }
+        pub fn has_handle(&self) -> bool {
+            false
+        }
+        pub fn refresh_online(&mut self) -> Result<bool> {
+            Ok(false)
+        }
+        pub fn recreate(&mut self) -> Result<()> {
+            Err(anyhow!("virtual display is macOS-only"))
         }
         pub fn origin_pts(&self) -> (f64, f64) {
             (0.0, 0.0)
@@ -2411,6 +2567,55 @@ mod stub {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn sleeping_transaction_retries_once_only_for_1014_and_a_successful_wake() {
+        for (error, wake_ok, attempts, wakes) in
+            [(1014, true, 2, 1), (1014, false, 1, 1), (1001, true, 1, 0)]
+        {
+            let mut n = 0;
+            let mut w = 0;
+            let result = super::retry_sleeping_transaction(
+                || {
+                    n += 1;
+                    Err::<(), _>(error)
+                },
+                || {
+                    w += 1;
+                    wake_ok
+                },
+            );
+            assert_eq!(result, Err(error));
+            assert_eq!((n, w), (attempts, wakes));
+        }
+        assert_eq!(
+            super::retry_sleeping_transaction(|| Ok(5), || panic!("awake")),
+            Ok(5)
+        );
+    }
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "creates and recreates a real test virtual display"]
+    fn registered_display_is_identifiable_and_recreates_at_4k_hidpi() {
+        let mut vd = VirtualDisplay::new(3840, 2160, 60, true, 2).unwrap();
+        let id = vd.display_id();
+        assert_eq!(
+            vd.resolve_listed(&macos::online_displays().unwrap()),
+            Some(id)
+        );
+        vd.recreate().unwrap();
+        let id = vd.display_id();
+        assert_eq!(
+            vd.resolve_listed(&macos::online_displays().unwrap()),
+            Some(id)
+        );
+        assert_eq!(vd.mode_px(), (0, 0));
+        vd.resize(3840, 2160, 2).unwrap();
+        assert_eq!(vd.mode_px(), (3840, 2160));
+        assert_eq!(vd.ui_scale(), 2);
+        assert_eq!(vd.size_pts(), (1920.0, 1080.0));
+        assert!(is_hidpi_virtual_display(id));
+    }
+
     #[test]
     fn two_detached_monitors_missing_from_topology_are_still_reenabled() {
         // Live regression: both attached monitors vanished from the online

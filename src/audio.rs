@@ -165,14 +165,9 @@ pub struct MacRdpsnd {
     /// Target AAC bitrate in bits/sec (`--aac-bitrate`, default 128_000).
     /// Used both to size the advertised format and to configure the encoder.
     aac_bitrate: u32,
-    /// Display the audio SCStream binds its content filter to — the SAME
-    /// display the video path captures. `Some(id)` for a virtual display,
-    /// `None` for the primary panel. Critical for `--detach-primary` /
-    /// `--capture-primary`: binding to a physical display that those modes
-    /// then disable/capture kills the audio stream's content source. The
-    /// virtual display survives both, so audio must follow it, not
-    /// `displays.first()` (which is the physical primary).
-    target_display_id: Option<u32>,
+    /// Weak ownership lets audio follow the video surface without extending
+    /// its lifetime through disconnect or a pending physical restore.
+    virtual_display: Option<crate::display_session::WeakDisplay>,
 }
 
 impl MacRdpsnd {
@@ -182,7 +177,7 @@ impl MacRdpsnd {
         remote_only: bool,
         enable_aac: bool,
         aac_bitrate: u32,
-        target_display_id: Option<u32>,
+        virtual_display: Option<crate::display_session::WeakDisplay>,
     ) -> Self {
         Self {
             sender: Arc::new(Mutex::new(None)),
@@ -193,7 +188,7 @@ impl MacRdpsnd {
             remote_only,
             enable_aac,
             aac_bitrate,
-            target_display_id,
+            virtual_display,
         }
     }
 }
@@ -220,7 +215,7 @@ impl SoundServerFactory for MacRdpsnd {
             mute_on_minimize: self.mute_on_minimize,
             remote_only: self.remote_only,
             aac_bitrate: self.aac_bitrate,
-            target_display_id: self.target_display_id,
+            virtual_display: self.virtual_display.clone(),
         })
     }
 
@@ -291,8 +286,8 @@ struct MacRdpsndBackend {
     /// Target AAC bitrate (bits/sec); only consulted when the negotiated
     /// format is `WAVE_FORMAT_AAC_MS`.
     aac_bitrate: u32,
-    /// Display the audio SCStream binds to — see [`MacRdpsnd::target_display_id`].
-    target_display_id: Option<u32>,
+    /// Display the audio SCStream binds to — see [`MacRdpsnd::virtual_display`].
+    virtual_display: Option<crate::display_session::WeakDisplay>,
 }
 
 // Note: format negotiation (server-preference selection + the client-list
@@ -354,7 +349,7 @@ impl RdpsndServerHandler for MacRdpsndBackend {
         let aac_bitrate = self.aac_bitrate;
         // A virtual display may exist before SCK can enumerate it. Resolve
         // READY in capture_loop instead of capturing its provisional ID here.
-        let target_display_id = self.target_display_id;
+        let virtual_display = self.virtual_display.clone();
         // Dedicated OS thread at USER_INTERACTIVE QoS for the entire
         // capture / resample / channel-send pipeline. Tokio workers ride
         // USER_INITIATED (see main.rs::boost_thread_qos) which a cargo
@@ -394,7 +389,7 @@ impl RdpsndServerHandler for MacRdpsndBackend {
                         remote_only,
                         use_aac,
                         aac_bitrate,
-                        target_display_id,
+                        virtual_display,
                     )
                     .await
                     {
@@ -496,6 +491,75 @@ impl Drop for CaptureStream {
     }
 }
 
+/// Re-enumerate on each SCStream open, including restarts after a display
+/// renumber. If video owns a virtual display, audio requires that same source.
+#[cfg(target_os = "macos")]
+async fn open_screen_audio(
+    virtual_display: Option<&crate::display_session::WeakDisplay>,
+    is_current: impl Fn() -> bool,
+) -> anyhow::Result<(CaptureStream, usize)> {
+    use anyhow::{anyhow, Context};
+    use screencapturekit::async_api::{AsyncSCShareableContent, AsyncSCStream};
+    use screencapturekit::prelude::{SCContentFilter, SCStreamConfiguration, SCStreamOutputType};
+    let display = if let Some(weak) = virtual_display {
+        let shared = weak.upgrade().context("video display manager retired")?;
+        tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            loop {
+                anyhow::ensure!(is_current(), "audio session retired");
+                if crate::display_session::audio_ready() {
+                    let content = AsyncSCShareableContent::get()
+                        .await
+                        .map_err(|e| anyhow!("SCShareableContent for audio: {e:?}"))?;
+                    let displays = content.displays();
+                    let ids: Vec<_> = displays.iter().map(|d| d.display_id()).collect();
+                    let id = shared.lock().unwrap().resolve_ready_audio(&ids);
+                    if let Some(d) = displays.into_iter().find(|d| Some(d.display_id()) == id) {
+                        return Ok::<_, anyhow::Error>(d);
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+        })
+        .await
+        .context("owned virtual display unavailable for audio within 30 seconds")??
+    } else {
+        let content = tokio::time::timeout(
+            std::time::Duration::from_secs(8),
+            AsyncSCShareableContent::get(),
+        )
+        .await
+        .context("audio display enumeration exceeded 8 seconds")?
+        .map_err(|e| anyhow!("SCShareableContent for audio: {e:?}"))?;
+        content
+            .displays()
+            .into_iter()
+            .next()
+            .context("no displays for audio capture")?
+    };
+    anyhow::ensure!(is_current(), "audio session retired");
+    let bound_display_id = display.display_id();
+    tracing::debug!(
+        bound_display_id,
+        "audio: SCStream content filter bound to display"
+    );
+    let filter = SCContentFilter::create()
+        .with_display(&display)
+        .with_excluding_windows(&[])
+        .build();
+    let config = SCStreamConfiguration::new()
+        .with_captures_audio(true)
+        .with_sample_rate(SCK_SAMPLE_RATE as i32)
+        .with_channel_count(CHANNELS as i32);
+    let stream = AsyncSCStream::new(&filter, &config, 2, SCStreamOutputType::Audio);
+    stream
+        .start_capture()
+        .map_err(|e| anyhow!("ScreenCaptureKit start_capture: {e:?}"))?;
+    Ok((
+        CaptureStream::Screen(stream, false),
+        SCK_SAMPLE_RATE as usize,
+    ))
+}
+
 #[cfg(target_os = "macos")]
 #[allow(clippy::too_many_arguments)]
 async fn capture_loop(
@@ -508,63 +572,11 @@ async fn capture_loop(
     remote_only: bool,
     use_aac: bool,
     aac_bitrate: u32,
-    target_display_id: Option<u32>,
+    virtual_display: Option<crate::display_session::WeakDisplay>,
 ) -> anyhow::Result<()> {
     use anyhow::{anyhow, Context};
     use rubato::Resampler;
-    use screencapturekit::async_api::{AsyncSCShareableContent, AsyncSCStream};
-    use screencapturekit::prelude::{SCContentFilter, SCStreamConfiguration, SCStreamOutputType};
 
-    let screen_setup = if !remote_only {
-        let target_display_id = crate::display_session::audio_display(target_display_id, || {
-            capture_is_current(&generation, my_gen)
-        })
-        .await?;
-        let content = AsyncSCShareableContent::get()
-            .await
-            .map_err(|e| anyhow!("SCShareableContent for audio: {e:?}"))?;
-        let displays = content.displays();
-        // Bind to the SAME display the video path captures. With --detach-primary /
-        // --capture-primary the physical primary is disabled/captured once a client
-        // connects, so binding the audio stream to it (the old `displays.first()`)
-        // killed the stream's content source — audio cut out, or the restart loop
-        // thrashed it in and out. The virtual display survives both, so follow it.
-        // Falls back to the first display if the id isn't enumerated (transient).
-        let display = match target_display_id {
-            Some(id) => displays
-                .iter()
-                .find(|d| d.display_id() == id)
-                .or_else(|| {
-                    warn!(
-                        target_id = id,
-                        "audio: no SCK display with that id; using the first display"
-                    );
-                    displays.first()
-                })
-                .context("no displays for audio capture")?,
-            None => displays.first().context("no displays for audio capture")?,
-        };
-        let bound_display_id = display.display_id();
-        tracing::debug!(
-            bound_display_id,
-            requested = ?target_display_id,
-            "audio: SCStream content filter bound to display"
-        );
-
-        let filter = SCContentFilter::create()
-            .with_display(display)
-            .with_excluding_windows(&[])
-            .build();
-
-        let config = SCStreamConfiguration::new()
-            .with_captures_audio(true)
-            .with_sample_rate(SCK_SAMPLE_RATE as i32)
-            .with_channel_count(CHANNELS as i32);
-
-        Some((filter, config))
-    } else {
-        None
-    };
     // SCK captures at 48 kHz; the optional tap reports its actual input rate.
     // Both resample to the negotiated SAMPLE_RATE (44.1 kHz). Chunk size matches a typical SCK audio
     // buffer (~21 ms at 48 kHz) — input is buffered until we have a full
@@ -667,17 +679,10 @@ async fn capture_loop(
                 (CaptureStream::Tap(tap), rate)
             })
         } else {
-            let (filter, config) = screen_setup.as_ref().expect("SCK configuration");
-            let stream = AsyncSCStream::new(filter, config, 2, SCStreamOutputType::Audio);
-            stream
-                .start_capture()
-                .map(|()| {
-                    (
-                        CaptureStream::Screen(stream, false),
-                        SCK_SAMPLE_RATE as usize,
-                    )
-                })
-                .map_err(|e| anyhow!("ScreenCaptureKit start_capture: {e:?}"))
+            open_screen_audio(virtual_display.as_ref(), || {
+                capture_is_current(&generation, my_gen)
+            })
+            .await
         };
         let (mut stream, input_rate) = match opened {
             Ok(opened) => {
@@ -1017,7 +1022,7 @@ async fn capture_loop(
     _remote_only: bool,
     _use_aac: bool,
     _aac_bitrate: u32,
-    _target_display_id: Option<u32>,
+    _virtual_display: Option<crate::display_session::WeakDisplay>,
 ) -> anyhow::Result<()> {
     Ok(())
 }
@@ -1140,7 +1145,7 @@ mod tests {
             mute_on_minimize: true,
             remote_only: false,
             aac_bitrate: 128_000,
-            target_display_id: None,
+            virtual_display: None,
         };
         factory.generation.store(2, Ordering::SeqCst);
         backend.stop();

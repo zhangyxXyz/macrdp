@@ -26,6 +26,11 @@
 有效值，未启用 H.264 时不生效。此次还纳入 #268 的迟到 S_OK 有损音频回归测试，
 并在合并历史中统一此前已移植的 #230 启动画面修复。保留本 fork 的锁屏、显示和剪贴板策略。
 
+本 fork 另行移植了三个尚未合入上游的 PR：
+
+- WindowServer 为虚拟屏重新分配 ID 后，采集和输入会跟随 macrdp 创建的显示器。遇到显示器休眠，可以在采集或重试显示配置前唤醒。 [#231](https://github.com/clintcan/macrdp/pull/231) · [#232](https://github.com/clintcan/macrdp/pull/232)
+- **Settings → Connection → Report connection quality to the client** 默认关闭。开启后，支持的客户端可在登录时获取带宽估值，会话中每 5 秒更新延迟；传统画面通道会按协商结果添加帧标记。也可设置 `NETWORK_AUTODETECT=1` 或使用命令行参数 `--network-autodetect`。mstsc 可能依据测量结果调整画质。独立的 FreeRDP 3.33.1 传统桌面测试收到登录上报及随后两次更新，测试也覆盖了调整分辨率。 [#235](https://github.com/clintcan/macrdp/pull/235)
+
 ## 当前版本
 
 **最新版 `v0.10.8`。** 后续构建沿用这一应用版本和发布标签，安装包内的

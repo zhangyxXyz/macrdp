@@ -36,6 +36,9 @@ pub struct Acceptor {
     io_channel_id: u16,
     user_channel_id: u16,
     message_channel_id: Option<u16>,
+    // (macrdp 7) Accept delayed probe replies during capabilities/finalization.
+    network_detection_started: bool,
+    previous_frame_markers: bool,
     desktop_size: DesktopSize,
     keyboard_layout: u32,
     keyboard_type: gcc::KeyboardType,
@@ -283,6 +286,8 @@ impl Acceptor {
             user_channel_id: USER_CHANNEL_ID,
             io_channel_id: IO_CHANNEL_ID,
             message_channel_id: None,
+            network_detection_started: false,
+            previous_frame_markers: false,
             desktop_size,
             keyboard_layout: 0,
             keyboard_type: gcc::KeyboardType(0),
@@ -507,6 +512,48 @@ impl Acceptor {
         true
     }
 
+    pub(crate) fn begin_network_detection(&mut self) -> Option<(u16, u16)> {
+        let channel = self.message_channel_id?;
+        if self.reactivation
+            || !self
+                .early_capability_flags
+                .contains(gcc::ClientEarlyCapabilityFlags::SUPPORT_NET_CHAR_AUTODETECT)
+        {
+            return None;
+        }
+        self.network_detection_started = true;
+        Some((self.user_channel_id, channel))
+    }
+
+    fn is_late_autodetect_response(&self, data: &mcs::SendDataRequest<'_>) -> bool {
+        self.network_detection_started
+            && Some(data.channel_id) == self.message_channel_id
+            && decode::<rdp::autodetect::AutoDetectRspPdu>(data.user_data.as_ref()).is_ok()
+    }
+
+    /// During reactivation, an ACK for a frame from the old surface can arrive
+    /// before Confirm Active, or interleave with the following finalization PDUs.
+    /// Enable only if that activation actually negotiated and enabled markers.
+    pub fn allow_previous_frame_acks(&mut self) {
+        self.previous_frame_markers = self.reactivation;
+    }
+
+    fn is_late_activation_reply(&mut self, data: &mcs::SendDataRequest<'_>) -> bool {
+        if self.previous_frame_markers && data.channel_id == self.io_channel_id {
+            return matches!(
+                decode::<rdp::headers::ShareControlHeader>(data.user_data.as_ref()),
+                Ok(rdp::headers::ShareControlHeader {
+                    share_control_pdu: ShareControlPdu::Data(rdp::headers::ShareDataHeader {
+                        share_data_pdu: rdp::headers::ShareDataPdu::FrameAcknowledge(_),
+                        ..
+                    }),
+                    ..
+                })
+            );
+        }
+        self.is_late_autodetect_response(data) || self.is_late_multitransport_response(data)
+    }
+
     pub fn new_deactivation_reactivation(
         mut consumed: Acceptor,
         static_channels: StaticChannelSet,
@@ -535,6 +582,8 @@ impl Acceptor {
             user_channel_id: consumed.user_channel_id,
             io_channel_id: consumed.io_channel_id,
             message_channel_id: consumed.message_channel_id,
+            network_detection_started: consumed.network_detection_started,
+            previous_frame_markers: false,
             desktop_size,
             keyboard_layout: consumed.keyboard_layout,
             keyboard_type: consumed.keyboard_type,
@@ -1397,7 +1446,7 @@ impl Sequence for Acceptor {
                         // response at all (Auto-Detect Response, Heartbeat), so it
                         // falls through to the Confirm Active handling below
                         // instead.
-                        if self.is_late_multitransport_response(&data) {
+                        if self.is_late_activation_reply(&data) {
                             self.state = prev_state;
                             return Ok(Written::Nothing);
                         }
@@ -1460,12 +1509,12 @@ impl Sequence for Acceptor {
                 // application as a raw input event. Check for it here, before
                 // finalization ever sees the bytes, mirroring
                 // `CapabilitiesWaitConfirm`'s handling.
-                let is_late_multitransport_response = match decode::<X224<mcs::McsMessage<'_>>>(input) {
-                    Ok(X224(mcs::McsMessage::SendDataRequest(data))) => self.is_late_multitransport_response(&data),
+                let late_message = match decode::<X224<mcs::McsMessage<'_>>>(input) {
+                    Ok(X224(mcs::McsMessage::SendDataRequest(data))) => self.is_late_activation_reply(&data),
                     _ => false,
                 };
 
-                if is_late_multitransport_response {
+                if late_message {
                     (
                         Written::Nothing,
                         AcceptorState::ConnectionFinalization {
@@ -1536,5 +1585,87 @@ fn create_gcc_blocks(
         multi_transport_channel: message_channel_id
             .and(offer_multitransport)
             .map(|flags| gcc::MultiTransportChannelData { flags }),
+    }
+}
+
+#[cfg(test)]
+mod late_frame_ack_tests {
+    use super::*;
+
+    fn acceptor(reactivation: bool, markers: bool) -> Acceptor {
+        let mut acceptor = Acceptor::new(
+            SecurityProtocol::empty(),
+            DesktopSize {
+                width: 640,
+                height: 480,
+            },
+            vec![],
+            None,
+        );
+        acceptor.reactivation = reactivation;
+        if markers {
+            acceptor.allow_previous_frame_acks();
+        }
+        acceptor.state = AcceptorState::CapabilitiesWaitConfirm { channels: vec![] };
+        acceptor
+    }
+
+    fn frame(channel: u16, pdu: rdp::headers::ShareDataPdu) -> Vec<u8> {
+        ironrdp_core::encode_vec(&X224(mcs::SendDataRequest {
+            initiator_id: USER_CHANNEL_ID,
+            channel_id: channel,
+            user_data: ironrdp_core::encode_vec(&wrap_share_data(pdu, IO_CHANNEL_ID))
+                .unwrap()
+                .into(),
+        }))
+        .unwrap()
+    }
+
+    fn ack(channel: u16) -> Vec<u8> {
+        frame(
+            channel,
+            rdp::headers::ShareDataPdu::FrameAcknowledge(pdu::codecs::rfx::FrameAcknowledgePdu { frame_id: 5 }),
+        )
+    }
+
+    #[test]
+    fn old_frame_ack_does_not_replace_confirm_active_or_synchronize() {
+        let mut acceptor = acceptor(true, true);
+        let mut output = WriteBuf::new();
+        let bytes = ack(IO_CHANNEL_ID);
+        assert_eq!(acceptor.step(&bytes, None, &mut output).unwrap(), Written::Nothing);
+        assert!(matches!(acceptor.state, AcceptorState::CapabilitiesWaitConfirm { .. }));
+
+        acceptor.state = AcceptorState::ConnectionFinalization {
+            finalization: FinalizationSequence::new(USER_CHANNEL_ID, IO_CHANNEL_ID),
+            channels: vec![],
+            client_capabilities: vec![],
+        };
+        assert_eq!(acceptor.step(&bytes, None, &mut output).unwrap(), Written::Nothing);
+        let AcceptorState::ConnectionFinalization { finalization, .. } = &acceptor.state else {
+            panic!("lost finalization")
+        };
+        assert_eq!(finalization.state().name(), "WaitSynchronize");
+    }
+
+    #[test]
+    fn only_negotiated_previous_frame_acks_on_io_are_tolerated() {
+        for (reactivation, markers, channel) in [
+            (false, true, IO_CHANNEL_ID),
+            (true, false, IO_CHANNEL_ID),
+            (true, true, IO_CHANNEL_ID + 1),
+        ] {
+            assert!(
+                acceptor(reactivation, markers)
+                    .step(&ack(channel), None, &mut WriteBuf::new())
+                    .is_err()
+            );
+        }
+        let unrelated = frame(IO_CHANNEL_ID, rdp::headers::ShareDataPdu::ShutdownRequest);
+        assert!(
+            acceptor(true, true)
+                .step(&unrelated, None, &mut WriteBuf::new())
+                .is_err()
+        );
     }
 }
