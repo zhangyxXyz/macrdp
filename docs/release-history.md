@@ -6,6 +6,12 @@ tags, dates, and downloadable artifacts.)
 
 ## Fork v0.10.8 — dependency security and clipboard staging
 
+**Power-policy rebuild (2026-11-19):** the default sleep blocker changes from
+`caffeinate -dimsu` to `-ims`: the host remains awake, while display sleep and
+screen locking follow macOS settings. `--allow-sleep` still opts out of the
+system-sleep blocker. The version remains v0.10.8; `SOURCE_COMMIT` identifies
+the rebuilt package. Laptop battery and closed-lid limitations still apply.
+
 The fork adopts patched zlib and stable RSA, removes the RSA audit exception,
 and includes upstream Picky fixes and atomic clipboard staging. See the
 [bilingual changelog](../CHANGELOG.md#v0108) for the exact changes and
