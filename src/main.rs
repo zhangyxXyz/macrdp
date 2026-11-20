@@ -714,7 +714,7 @@ struct Args {
     #[arg(long)]
     enable_microphone_redirection: bool,
 
-    /// EXPERIMENTAL, opt-in (default OFF). Offer RDP UDP multitransport
+    /// Opt-in (default OFF). Offer RDP UDP multitransport
     /// (MS-RDPEMT over reliable RDPEUDP) to clients that advertise it, and bind a
     /// UDP listener on the same address/port as TCP. On its own, EGFX stays on TCP
     /// (the proven safe spike) — pass --udp-migrate-egfx to actually move the
@@ -754,7 +754,7 @@ struct Args {
     #[arg(long)]
     adaptive_bitrate: bool,
 
-    /// EXPERIMENTAL, opt-in (default OFF; implies --enable-udp-multitransport,
+    /// Opt-in (default OFF; implies --enable-udp-multitransport,
     /// requires --enable-aac and --enable-h264). Stream RDPSND audio over a LOSSY
     /// UDP/DTLS tunnel with 1+1 redundancy instead of TCP — the loss-resilient audio
     /// path. The MS-RDPEA format handshake runs on a reliable DVC over TCP; AAC Wave2
@@ -4233,7 +4233,7 @@ async fn async_main(mut args: Args, document: Option<config::Document>) -> Resul
         server.enable_network_autodetect();
     }
 
-    // EXPERIMENTAL UDP multitransport (MS-RDPEMT). When enabled, install the
+    // UDP multitransport (MS-RDPEMT). When enabled, install the
     // provider so the server offers reliable UDP to clients that advertise it,
     // and (M3) bind a real UDP listener on the same address/port as TCP — the
     // client reuses the server address for the auxiliary UDP flow. The handle is
