@@ -656,7 +656,7 @@ private struct AdvancedTab: View {
                     .disabled(!model.bool("ENABLE_UDP_MULTITRANSPORT"))
                 Text("Moving video onto the reliable UDP tunnel helps on a clean, low-latency link. "
                     + "Under packet loss the picture can stall for a few seconds until it moves back "
-                    + "to TCP. Auto-enables H.264. High-latency links never get UDP.")
+                    + "to TCP. Auto-enables H.264. Defaults to TCP on high-latency links.")
                     .font(.caption).foregroundColor(.secondary)
             }
             Section("Diagnostics") {

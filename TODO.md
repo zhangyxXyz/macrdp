@@ -23,11 +23,13 @@ then delete; promote a parked item to *In flight* when work actually starts.
     on it. #231 has one picker now and records id changes mid-session; its rebase must make `recreate()`
     keep HiDPI, the pixel size, and clear the recorded mode. Neither has said what was tested live; #232
     also owes answers on `--allow-sleep` and the 3 s wait in `DetachedPrimary::drop`.
-  - **#235** (@JulyStar-Lv, connect-time network autodetect) — asked to rebase and make it opt-in.
+  - **#235** (@JulyStar-Lv, connect-time network autodetect) — adapted on `dev`
+    in `3b960ba`. Upstream #274 covers the same feature with different pacing.
   - **Divergences (33)/(34)** are #201's (scale factors on `ConnectionInfo`) and #228's (RemoteFX surface
     command, = upstream #2229 `e20a2147`, so (34) also drops at a pin bump past it).
-  - **#225** (vendor move onto `clintcan/IronRDP`): accepted; branch `macrdp` created at `e258f6a0`; waiting
-    for rophy's PR into it.
+  - **#225** (vendor move onto `clintcan/IronRDP`): upstream #271 migrated the
+    dependencies. The fork has deferred that migration and its #272 pin check
+    and cleanup fix pending a review of local protocol and authentication patches.
   - **#186 upstream:** fixed by Devolutions/IronRDP#2432, merged 2026-11-14 as `e482e340`. Vendored
     divergence (32) drops out at the next pin bump to any rev at or after it.
   - **Next pin bump drops these vendored `ironrdp-server` divergences** (all merged upstream; keep
@@ -35,9 +37,9 @@ then delete; promote a parked item to *In flight* when work actually starts.
     pointer updates (≥ `904a7da6`), (32) negotiation timeout (≥ `e482e340`), (34) RemoteFX surface command
     (≥ `e20a2147`).
 
-- [ ] **Before the next release: smoke-test #230 on Windows 11 mstsc and Windows App.** The legacy hold
-  is on by default (3 s) for every H.264 connection; only Windows 10 was tested live. Add the hold to the
-  Windows 10 note in `docs/known-quirks.md`.
+- [ ] **Fork: smoke-test #230 on Windows 11 mstsc and Windows App.** Upstream
+  v0.10.7 records live checks for Windows 10 and 11 mstsc, Windows App for macOS,
+  and FreeRDP. The fork still needs a real-client retest.
 
 - [ ] **Watch: connect-time A/V desync (picture behind sound until a minimize/restore).** Correlates with
   video on TCP. Not reproduced on v0.10.5 (queue 2–60 ms in two sessions); the mini logs

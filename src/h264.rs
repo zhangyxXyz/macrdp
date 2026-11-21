@@ -2323,8 +2323,7 @@ impl Gfx {
                             info!(
                                 "blank recovery DISARMED for this connection — the client advertises EGFX \
                                  capability sets newer than Windows App for macOS does (Windows App on \
-                                 Windows or iOS), and reports zero decode+render time while presenting, so \
-                                 the zero-render-time signal can't tell a blank from a working session (#269)"
+                                 Windows or iOS). Zero render time is unreliable for this client family (#269)"
                             );
                         }
                         None => {

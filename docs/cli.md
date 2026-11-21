@@ -669,8 +669,10 @@ reactivate and then disconnect such a healthy session. See
 and [server processing guidance](https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpegfx/06a92ec4-1048-4e5f-b2f9-bc114da00d88).
 
 If explicitly enabled for an experiment, the historical heuristic first tries
-core Deactivation–Reactivation, then may drop the connection. Its thresholds
-below do not turn QoE timing into reliable presentation evidence. With recovery
+core Deactivation–Reactivation, then may drop the connection. It skips clients
+advertising EGFX capabilities newer than `0x000B0101`, including observed
+Windows and iOS versions of Windows App. Its thresholds do not turn QoE timing
+into reliable presentation evidence. With recovery
 disabled, the manual **Ctrl+Alt+Shift+R** resync remains available; for a genuinely
 blank mstsc surface, fully close and reopen its window. Auto-reconnect cookies
 are independent of this heuristic and remain enabled by default.

@@ -3,6 +3,14 @@
 The package’s `SOURCE_COMMIT` identifies the source of each same-version rebuild.
 同版本重构建可通过安装包内的 `SOURCE_COMMIT` 区分。[完整变更明细 / Detailed rebuild history](https://github.com/zhangyxXyz/macrdp/blob/e30641fea377b7599922d65d39df781c844dfa6b/CHANGELOG.md)
 
+## Unreleased / 未发布
+
+- Skip experimental black-screen recovery for Windows App clients with newer EGFX capabilities while keeping recovery opt-in. [#273](https://github.com/clintcan/macrdp/pull/273)
+- Update the UDP multitransport and lossy audio labels. Both remain opt-in, and moving video to UDP remains experimental. [#270](https://github.com/clintcan/macrdp/pull/270)
+
+- 对通告较新 EGFX 能力的 Windows App 客户端跳过实验性黑屏恢复。自动恢复仍需手动启用。[#273](https://github.com/clintcan/macrdp/pull/273)
+- 更新 UDP 多传输和有损音频的说明。两者仍需手动启用，视频迁移到 UDP 仍属实验功能。[#270](https://github.com/clintcan/macrdp/pull/270)
+
 ## v0.10.8
 
 - Keep the host awake while allowing displays to sleep according to macOS settings. The default `caffeinate` process no longer blocks display sleep or declares user activity; `--allow-sleep` still permits system sleep.
